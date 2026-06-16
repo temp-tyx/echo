@@ -1069,6 +1069,53 @@ class NPUModelRunner(GPUModelRunner):
             total_num_scheduled_tokens,
         )
 
+    def _apply_echo_scheduler_trim(self, scheduler_output: "SchedulerOutput") -> None:
+        """Trim scheduler spec-decode schedule using per-request ECHO keep counts.
+
+        echo_cu_draft_tokens is indexed by input_batch.req_ids order from the
+        previous step. Do not zip with scheduler_output dict key order.
+        """
+        if not envs.VLLM_ECHO_ENABLED:
+            return
+        if not self.echo_cu_draft_tokens:
+            return
+        if len(self.echo_cu_draft_tokens) != len(self.input_batch.req_ids):
+            return
+
+        for req_idx, req_id in enumerate(self.input_batch.req_ids):
+            if req_id not in scheduler_output.num_scheduled_tokens:
+                continue
+            draft_token_num = self.echo_cu_draft_tokens[req_idx]
+            if req_id in scheduler_output.scheduled_spec_decode_tokens:
+                scheduler_output.scheduled_spec_decode_tokens[req_id] = (
+                    scheduler_output.scheduled_spec_decode_tokens[req_id][:draft_token_num]
+                )
+            old_num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            new_num_scheduled_tokens = draft_token_num + 1
+            scheduler_output.num_scheduled_tokens[req_id] = new_num_scheduled_tokens
+            scheduler_output.total_num_scheduled_tokens -= (
+                old_num_scheduled_tokens - new_num_scheduled_tokens
+            )
+
+    def _sync_echo_uniform_decode_len(self) -> None:
+        """Align uniform-decode metadata with post-pruning draft counts."""
+        if not envs.VLLM_ECHO_ENABLED or not self.echo_cu_draft_tokens:
+            return
+        max_kept_drafts = max(self.echo_cu_draft_tokens)
+        query_len = 1 + max_kept_drafts
+        self.uniform_decode_query_len = query_len
+        self.decode_token_per_req = query_len
+
+    def _get_draft_token_ids_cpu(self) -> tuple[list[list[int]], list[str]]:
+        if envs.VLLM_ECHO_ENABLED and isinstance(self._draft_token_ids, torch.Tensor):
+            req_ids = self._draft_token_req_ids
+            if req_ids is None:
+                req_ids = self.input_batch.req_ids
+            num_reqs = len(req_ids)
+            draft_rows = self._draft_token_ids[:num_reqs].detach().cpu().tolist()
+            filtered_rows = [[tok for tok in row if tok != -1] for row in draft_rows]
+            return filtered_rows, req_ids
+        return super()._get_draft_token_ids_cpu()
 
     def _preprocess(
         self,
@@ -1462,13 +1509,7 @@ class NPUModelRunner(GPUModelRunner):
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if len(scheduler_output.num_scheduled_tokens) != 0 and len(self.input_batch.req_ids) != 0:
-            if len(self.echo_cu_draft_tokens) == len(self.input_batch.req_ids):
-                req_ids = scheduler_output.num_scheduled_tokens.keys()
-                for req_id, draft_token_num in zip(req_ids, self.echo_cu_draft_tokens):
-                    scheduler_output.scheduled_spec_decode_tokens[req_id] = scheduler_output.scheduled_spec_decode_tokens[req_id][:draft_token_num]
-                    old_num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
-                    scheduler_output.num_scheduled_tokens[req_id] = draft_token_num + 1
-                    scheduler_output.total_num_scheduled_tokens -= (old_num_scheduled_tokens - (draft_token_num + 1))
+            self._apply_echo_scheduler_trim(scheduler_output)
         if self.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
@@ -1901,6 +1942,7 @@ class NPUModelRunner(GPUModelRunner):
             )
             mask = (self._draft_token_ids != -1)
             self.echo_cu_draft_tokens = mask.int().sum(dim=1).cpu().tolist()
+            self._sync_echo_uniform_decode_len()
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         (
