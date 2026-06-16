@@ -1830,13 +1830,27 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             log_probs_per_step.append(step_log_probs)
 
         cond_log_probs = torch.stack(log_probs_per_step, dim=1)
+        cond_log_probs = torch.where(
+            torch.isfinite(cond_log_probs),
+            cond_log_probs,
+            torch.tensor(
+                float("-inf"),
+                device=cond_log_probs.device,
+                dtype=cond_log_probs.dtype,
+            ),
+        )
         cum_log_probs = torch.cumsum(cond_log_probs, dim=1)
 
         k_max = envs.VLLM_ECHO_K_MAX
-        k_max = min(k_max, cum_log_probs.numel())
-
         flat_log_probs = cum_log_probs.flatten()
-        _, top_flat_indices = torch.topk(flat_log_probs, k=k_max)
+        num_finite = int(torch.isfinite(flat_log_probs).sum().item())
+        if num_finite == 0:
+            return torch.full_like(draft_token_ids, -1)
+        k_max = min(k_max, num_finite)
+
+        flat_for_topk = flat_log_probs.clone()
+        flat_for_topk[~torch.isfinite(flat_for_topk)] = float("-inf")
+        _, top_flat_indices = torch.topk(flat_for_topk, k=k_max)
 
         mask = torch.zeros_like(flat_log_probs, dtype=torch.bool)
         mask[top_flat_indices] = True

@@ -1157,6 +1157,54 @@ class NPUModelRunner(GPUModelRunner):
                 trim_details,
             )
 
+    def _prepare_input_ids(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_reqs: int,
+        total_num_scheduled_tokens: int,
+        cu_num_tokens: np.ndarray,
+    ) -> None:
+        super()._prepare_input_ids(
+            scheduler_output,
+            num_reqs,
+            total_num_scheduled_tokens,
+            cu_num_tokens,
+        )
+        if not envs.VLLM_ECHO_ENABLED:
+            return
+
+        scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        if not scheduled_spec_tokens:
+            return
+
+        # Async spec-decode scatter can miss ECHO-trimmed drafts; write the
+        # scheduler spec tokens (populated by _apply_echo_scheduler_trim) and
+        # the per-request sampled token directly into input_ids.
+        input_ids_cpu = self.input_ids.cpu[:total_num_scheduled_tokens]
+        for cur_index in range(num_reqs):
+            req_id = self.input_batch.req_ids[cur_index]
+            spec_tokens = scheduled_spec_tokens.get(req_id)
+            if not spec_tokens:
+                continue
+
+            flat_end = int(cu_num_tokens[cur_index]) - 1
+            draft_len = len(spec_tokens)
+            sample_idx = flat_end - draft_len
+            spec_start = sample_idx + 1
+
+            input_ids_cpu[spec_start : flat_end + 1] = np.asarray(
+                spec_tokens, dtype=np.int32
+            )
+
+            if self.input_batch.prev_sampled_token_ids is not None:
+                prev_index = self.prev_positions.np[cur_index]
+                if prev_index >= 0:
+                    input_ids_cpu[sample_idx] = int(
+                        self.input_batch.prev_sampled_token_ids[prev_index, 0].item()
+                    )
+
+        self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
+
     def _get_draft_token_ids_cpu(self) -> tuple[list[list[int]], list[str]]:
         if envs.VLLM_ECHO_ENABLED and isinstance(self._draft_token_ids, torch.Tensor):
             req_ids = self._draft_token_req_ids
