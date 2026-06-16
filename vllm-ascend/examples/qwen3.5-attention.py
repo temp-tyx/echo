@@ -71,7 +71,7 @@ def main():
         },
     )
 
-    sampling_params = SamplingParams(max_tokens=128,temperature=0)
+    sampling_params = SamplingParams(max_tokens=20,temperature=0)
     processor = AutoProcessor.from_pretrained(MODEL_PATH)
 
     send_request(processor, llm, sampling_params, 2)

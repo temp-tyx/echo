@@ -472,6 +472,7 @@ class NPUModelRunner(GPUModelRunner):
                 block_size=self.block_size, device=self.device, vllm_config=self.vllm_config,
                 parallel_config=self.parallel_config, dtype=self.dtype)
         self.echo_cu_draft_tokens: dict[str, int] = {}
+        self.echo_draft_tokens: dict[str, list[int]] = {}
 
     @property
     def use_cp(self) -> bool:
@@ -1099,16 +1100,18 @@ class NPUModelRunner(GPUModelRunner):
         """Trim scheduler spec-decode schedule using per-request ECHO keep counts.
 
         echo_cu_draft_tokens maps req_id -> number of kept drafts from the
-        previous propose step. Also strip scheduler -1 placeholders that can
-        be reintroduced by update_draft_token_ids_in_output padding.
+        previous propose step. echo_draft_tokens holds the actual filtered
+        draft token ids (scheduler spec may be padded with -1 placeholders).
         """
         if not envs.VLLM_ECHO_ENABLED or not self.echo_cu_draft_tokens:
             return
 
         if envs.VLLM_ECHO_DEBUG:
             logger.info(
-                "ECHO [trim] before echo_cu_draft_tokens=%s total=%s schedule=%s spec=%s",
+                "ECHO [trim] before echo_cu_draft_tokens=%s echo_draft_tokens=%s "
+                "total=%s schedule=%s spec=%s",
                 self.echo_cu_draft_tokens,
+                self.echo_draft_tokens,
                 scheduler_output.total_num_scheduled_tokens,
                 dict(scheduler_output.num_scheduled_tokens),
                 dict(scheduler_output.scheduled_spec_decode_tokens),
@@ -1120,9 +1123,9 @@ class NPUModelRunner(GPUModelRunner):
             scheduler_output.num_scheduled_tokens.items()
         ):
             draft_token_num = self.echo_cu_draft_tokens.get(req_id, 0)
+            proposed_drafts = self.echo_draft_tokens.get(req_id, [])
             spec_tokens = scheduler_output.scheduled_spec_decode_tokens.get(req_id, [])
-            valid_spec_tokens = [tok for tok in spec_tokens if tok != -1]
-            kept_spec_tokens = valid_spec_tokens[:draft_token_num]
+            kept_spec_tokens = proposed_drafts[:draft_token_num]
             if kept_spec_tokens:
                 scheduler_output.scheduled_spec_decode_tokens[req_id] = kept_spec_tokens
             elif req_id in scheduler_output.scheduled_spec_decode_tokens:
@@ -1138,7 +1141,7 @@ class NPUModelRunner(GPUModelRunner):
                         "echo_keep": draft_token_num,
                         "old_sched": old_num_scheduled_tokens,
                         "raw_spec": spec_tokens,
-                        "valid_spec": valid_spec_tokens,
+                        "proposed_drafts": proposed_drafts,
                         "kept_spec": kept_spec_tokens,
                         "new_sched": new_num_scheduled_tokens,
                     }
@@ -2040,16 +2043,18 @@ class NPUModelRunner(GPUModelRunner):
             )
             mask = (self._draft_token_ids != -1)
             kept_counts = mask.int().sum(dim=1).cpu().tolist()
-            self.echo_cu_draft_tokens = dict(
-                zip(self.input_batch.req_ids, kept_counts)
+            filtered_drafts, draft_req_ids = self._get_draft_token_ids_cpu()
+            req_ids_for_echo = (
+                draft_req_ids if draft_req_ids else self.input_batch.req_ids
             )
+            self.echo_cu_draft_tokens = dict(zip(req_ids_for_echo, kept_counts))
+            self.echo_draft_tokens = dict(zip(req_ids_for_echo, filtered_drafts))
             if envs.VLLM_ECHO_DEBUG and envs.VLLM_ECHO_ENABLED:
-                filtered_drafts, _ = self._get_draft_token_ids_cpu()
                 logger.info(
                     "ECHO [draft_result] echo_cu_draft_tokens=%s "
-                    "filtered_drafts=%s raw_drafts=%s",
+                    "echo_draft_tokens=%s raw_drafts=%s",
                     self.echo_cu_draft_tokens,
-                    dict(zip(self.input_batch.req_ids, filtered_drafts)),
+                    self.echo_draft_tokens,
                     self._draft_token_ids.detach().cpu().tolist()
                     if torch.is_tensor(self._draft_token_ids)
                     else self._draft_token_ids,
