@@ -1842,8 +1842,42 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         mask[top_flat_indices] = True
         mask = mask.view(actual_batch_size, total_steps)
 
+        if envs.VLLM_ECHO_DEBUG:
+            if total_steps > 1:
+                monotonic = (cum_log_probs[:, 1:] <= cum_log_probs[:, :-1] + 1e-5).all().item()
+                if not monotonic:
+                    logger.warning(
+                        "ECHO [prune] cum_log_probs not monotonic per request: %s",
+                        cum_log_probs.detach().cpu().tolist(),
+                    )
+            req_ids = self.runner.input_batch.req_ids[:actual_batch_size]
+            kept_per_req = mask.int().sum(dim=1).cpu().tolist()
+            top_cells = [
+                (req_ids[idx // total_steps], idx % total_steps, float(flat_log_probs[idx].item()))
+                for idx in top_flat_indices.detach().cpu().tolist()
+            ]
+            logger.info(
+                "ECHO [prune] k_max=%s steps=%s req_ids=%s "
+                "cum_log_probs=%s mask=%s kept=%s top_cells=%s "
+                "draft_before=%s",
+                k_max,
+                total_steps,
+                req_ids,
+                cum_log_probs.detach().cpu().tolist(),
+                mask.detach().cpu().tolist(),
+                kept_per_req,
+                top_cells,
+                draft_token_ids.detach().cpu().tolist(),
+            )
+
         pruned_draft_ids = draft_token_ids.clone()
         pruned_draft_ids[~mask] = -1
+
+        if envs.VLLM_ECHO_DEBUG:
+            logger.info(
+                "ECHO [prune] draft_after=%s",
+                pruned_draft_ids.detach().cpu().tolist(),
+            )
 
         return pruned_draft_ids
 

@@ -125,6 +125,8 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Maximum number of speculative steps in ECHO draft generation.
     # Used to pre-allocate slot_mapping_group buffers for extended draft length.
     "VLLM_ECHO_MAX_SPEC_NUM": lambda: int(os.getenv("VLLM_ECHO_MAX_SPEC_NUM", "7")),
+    # Enable verbose ECHO debug logging (pruning, scheduler trim, verify metadata).
+    "VLLM_ECHO_DEBUG": lambda: bool(int(os.getenv("VLLM_ECHO_DEBUG", "0"))),
 }
 
 # end-env-vars-definition
