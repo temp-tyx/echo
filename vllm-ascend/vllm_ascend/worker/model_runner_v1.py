@@ -471,7 +471,7 @@ class NPUModelRunner(GPUModelRunner):
             self.kvcomp_meta_data = initialize_kvcomp_metadata(max_num_reqs=self.max_num_reqs,
                 block_size=self.block_size, device=self.device, vllm_config=self.vllm_config,
                 parallel_config=self.parallel_config, dtype=self.dtype)
-        self.echo_cu_draft_tokens = []
+        self.echo_cu_draft_tokens: dict[str, int] = {}
 
     @property
     def use_cp(self) -> bool:
@@ -1072,39 +1072,30 @@ class NPUModelRunner(GPUModelRunner):
     def _apply_echo_scheduler_trim(self, scheduler_output: "SchedulerOutput") -> None:
         """Trim scheduler spec-decode schedule using per-request ECHO keep counts.
 
-        echo_cu_draft_tokens is indexed by input_batch.req_ids order from the
-        previous step. Do not zip with scheduler_output dict key order.
+        echo_cu_draft_tokens maps req_id -> number of kept drafts from the
+        previous propose step. Also strip scheduler -1 placeholders that can
+        be reintroduced by update_draft_token_ids_in_output padding.
         """
-        if not envs.VLLM_ECHO_ENABLED:
-            return
-        if not self.echo_cu_draft_tokens:
-            return
-        if len(self.echo_cu_draft_tokens) != len(self.input_batch.req_ids):
-            return
-
-        for req_idx, req_id in enumerate(self.input_batch.req_ids):
-            if req_id not in scheduler_output.num_scheduled_tokens:
-                continue
-            draft_token_num = self.echo_cu_draft_tokens[req_idx]
-            if req_id in scheduler_output.scheduled_spec_decode_tokens:
-                scheduler_output.scheduled_spec_decode_tokens[req_id] = (
-                    scheduler_output.scheduled_spec_decode_tokens[req_id][:draft_token_num]
-                )
-            old_num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
-            new_num_scheduled_tokens = draft_token_num + 1
-            scheduler_output.num_scheduled_tokens[req_id] = new_num_scheduled_tokens
-            scheduler_output.total_num_scheduled_tokens -= (
-                old_num_scheduled_tokens - new_num_scheduled_tokens
-            )
-
-    def _sync_echo_uniform_decode_len(self) -> None:
-        """Align uniform-decode metadata with post-pruning draft counts."""
         if not envs.VLLM_ECHO_ENABLED or not self.echo_cu_draft_tokens:
             return
-        max_kept_drafts = max(self.echo_cu_draft_tokens)
-        query_len = 1 + max_kept_drafts
-        self.uniform_decode_query_len = query_len
-        self.decode_token_per_req = query_len
+
+        new_total = 0
+        for req_id, old_num_scheduled_tokens in list(
+            scheduler_output.num_scheduled_tokens.items()
+        ):
+            draft_token_num = self.echo_cu_draft_tokens.get(req_id, 0)
+            spec_tokens = scheduler_output.scheduled_spec_decode_tokens.get(req_id, [])
+            valid_spec_tokens = [tok for tok in spec_tokens if tok != -1]
+            kept_spec_tokens = valid_spec_tokens[:draft_token_num]
+            if kept_spec_tokens:
+                scheduler_output.scheduled_spec_decode_tokens[req_id] = kept_spec_tokens
+            elif req_id in scheduler_output.scheduled_spec_decode_tokens:
+                del scheduler_output.scheduled_spec_decode_tokens[req_id]
+
+            new_num_scheduled_tokens = len(kept_spec_tokens) + 1
+            scheduler_output.num_scheduled_tokens[req_id] = new_num_scheduled_tokens
+            new_total += new_num_scheduled_tokens
+        scheduler_output.total_num_scheduled_tokens = new_total
 
     def _get_draft_token_ids_cpu(self) -> tuple[list[list[int]], list[str]]:
         if envs.VLLM_ECHO_ENABLED and isinstance(self._draft_token_ids, torch.Tensor):
@@ -1941,8 +1932,10 @@ class NPUModelRunner(GPUModelRunner):
                 batch_desc,
             )
             mask = (self._draft_token_ids != -1)
-            self.echo_cu_draft_tokens = mask.int().sum(dim=1).cpu().tolist()
-            self._sync_echo_uniform_decode_len()
+            kept_counts = mask.int().sum(dim=1).cpu().tolist()
+            self.echo_cu_draft_tokens = dict(
+                zip(self.input_batch.req_ids, kept_counts)
+            )
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         (
