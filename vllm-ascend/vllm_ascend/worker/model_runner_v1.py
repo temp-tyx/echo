@@ -1192,8 +1192,8 @@ class NPUModelRunner(GPUModelRunner):
             sample_idx = flat_end - draft_len
             spec_start = sample_idx + 1
 
-            input_ids_cpu[spec_start : flat_end + 1] = np.asarray(
-                spec_tokens, dtype=np.int32
+            input_ids_cpu[spec_start : flat_end + 1] = torch.tensor(
+                spec_tokens, dtype=input_ids_cpu.dtype
             )
 
             if self.input_batch.prev_sampled_token_ids is not None:
