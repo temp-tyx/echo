@@ -156,6 +156,7 @@ else:
 
 
 from vllm.model_executor.layers.attention import Attention, MLAAttention
+from vllm_ascend import envs
 
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
 torch.npu.config.allow_internal_format = True
@@ -470,6 +471,7 @@ class NPUModelRunner(GPUModelRunner):
             self.kvcomp_meta_data = initialize_kvcomp_metadata(max_num_reqs=self.max_num_reqs,
                 block_size=self.block_size, device=self.device, vllm_config=self.vllm_config,
                 parallel_config=self.parallel_config, dtype=self.dtype)
+        self.echo_cu_draft_tokens = []
 
     @property
     def use_cp(self) -> bool:
@@ -1067,6 +1069,7 @@ class NPUModelRunner(GPUModelRunner):
             total_num_scheduled_tokens,
         )
 
+
     def _preprocess(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1322,6 +1325,13 @@ class NPUModelRunner(GPUModelRunner):
                 valid_sampled_token_ids, sampling_metadata, spec_decode_metadata, sample_hidden_states
             )
         elif self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model():
+            echo_k_max = envs.VLLM_ECHO_K_MAX
+            batch_size = spec_decode_common_attn_metadata.batch_size()
+            draft_step = min(max(envs.VLLM_ECHO_STEPS_MULTIPLIER * echo_k_max // batch_size, 1), self.drafter.num_speculative_tokens)
+            self.drafter.num_speculative_tokens = draft_step
+            # TODO: gpu_model_runner
+            self.num_spec_tokens = draft_step
+            self.speculative_config.num_speculative_tokens = draft_step
             common_attn_metadata = spec_decode_common_attn_metadata
             sampled_token_ids = valid_sampled_token_ids
 
@@ -1451,6 +1461,14 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        if len(scheduler_output.num_scheduled_tokens) != 0 and len(self.input_batch.req_ids) != 0:
+            if len(self.echo_cu_draft_tokens) == len(self.input_batch.req_ids):
+                req_ids = scheduler_output.num_scheduled_tokens.keys()
+                for req_id, draft_token_num in zip(req_ids, self.echo_cu_draft_tokens):
+                    scheduler_output.scheduled_spec_decode_tokens[req_id] = scheduler_output.scheduled_spec_decode_tokens[req_id][:draft_token_num]
+                    old_num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+                    scheduler_output.num_scheduled_tokens[req_id] = draft_token_num + 1
+                    scheduler_output.total_num_scheduled_tokens -= (old_num_scheduled_tokens - (draft_token_num + 1))
         if self.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
@@ -1881,6 +1899,8 @@ class NPUModelRunner(GPUModelRunner):
                 sample_hidden_states,
                 batch_desc,
             )
+            mask = (self._draft_token_ids != -1)
+            self.echo_cu_draft_tokens = mask.int().sum(dim=1).cpu().tolist()
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         (
@@ -3025,6 +3045,7 @@ class NPUModelRunner(GPUModelRunner):
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
 
+
     def _align_memory(self, tensor: torch.Tensor, alignment: int) -> torch.Tensor:
         data_ptr = tensor.data_ptr()
         aligned_addr = (data_ptr + alignment - 1) // alignment * alignment
@@ -3068,6 +3089,7 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         return kv_caches
+
 
     def _get_layer_kv_cache_specs(self, kv_cache_config: KVCacheConfig) -> dict[str, KVCacheSpec]:
         layer_kv_cache_spec: dict[str, KVCacheSpec] = {}
@@ -3447,6 +3469,7 @@ class NPUModelRunner(GPUModelRunner):
                     raise ValueError("Unknown KV cache spec type.")
 
         return kv_caches
+
 
     def may_reinitialize_input_batch(self, kv_cache_config: KVCacheConfig) -> None:
         """

@@ -48,6 +48,7 @@ from vllm_ascend.compilation.acl_graph import ACLGraphWrapper, update_full_graph
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 from vllm_ascend.utils import enable_sp, lmhead_tp_enable, shared_expert_dp_enabled, vllm_version_is
+from vllm_ascend import envs
 
 if not vllm_version_is("0.19.1"):
     from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
@@ -95,6 +96,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     _runnable: ACLGraphWrapper | Callable
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device, pass_hidden_states_to_model: bool, runner=None):
+        vllm_config.speculative_config.num_speculative_tokens = envs.VLLM_ECHO_MAX_SPEC_NUM
         super().__init__(vllm_config, device, pass_hidden_states_to_model, runner=runner)
 
         # Assign runner before it's used in the methods below
@@ -843,6 +845,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             else:
                 draft_token_ids = run_draft()
                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
+
+            if envs.VLLM_ECHO_ENABLED:
+                draft_token_ids = self._apply_echo_pruning(draft_token_ids, batch_size)
+
         return draft_token_ids
 
     def _run_merged_draft(
@@ -928,6 +934,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             token_indices_to_sample = token_indices_to_sample[:num_indices]
 
         draft_token_ids = logits.argmax(dim=-1)
+
+        self._echo_logits_list = [logits]
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
@@ -1064,6 +1072,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             hidden_states = hidden_states[:batch_size]
             draft_token_ids = logits.argmax(dim=-1)
             draft_token_ids_tensor[draft_step + 1] = draft_token_ids
+            self._echo_logits_list.append(logits)
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = draft_token_ids_tensor.swapaxes(0, 1)
@@ -1802,6 +1811,41 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 if hidden_states is not None:
                     hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states.contiguous(), True)
         return last_hidden_states, positions, hidden_states
+
+    def _apply_echo_pruning(self, draft_token_ids: torch.Tensor, batch_size: int) -> torch.Tensor:
+        if not hasattr(self, "_echo_logits_list") or not self._echo_logits_list:
+            return draft_token_ids
+
+        actual_batch_size = draft_token_ids.shape[0]
+        total_steps = draft_token_ids.shape[1]
+
+        logits_list = self._echo_logits_list
+        log_probs_per_step = []
+
+        for step_idx in range(total_steps):
+            logits = logits_list[step_idx]
+            log_probs = F.log_softmax(logits, dim=-1)
+            step_tokens = draft_token_ids[:, step_idx]
+            step_log_probs = log_probs.gather(1, step_tokens.unsqueeze(1)).squeeze(1)
+            log_probs_per_step.append(step_log_probs)
+
+        cond_log_probs = torch.stack(log_probs_per_step, dim=1)
+        cum_log_probs = torch.cumsum(cond_log_probs, dim=1)
+
+        k_max = envs.VLLM_ECHO_K_MAX
+        k_max = min(k_max, cum_log_probs.numel())
+
+        flat_log_probs = cum_log_probs.flatten()
+        _, top_flat_indices = torch.topk(flat_log_probs, k=k_max)
+
+        mask = torch.zeros_like(flat_log_probs, dtype=torch.bool)
+        mask[top_flat_indices] = True
+        mask = mask.view(actual_batch_size, total_steps)
+
+        pruned_draft_ids = draft_token_ids.clone()
+        pruned_draft_ids[~mask] = -1
+
+        return pruned_draft_ids
 
 
 class AscendEagleProposer(EagleProposer, AscendSpecDecodeBaseProposer):
