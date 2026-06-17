@@ -473,6 +473,9 @@ class NPUModelRunner(GPUModelRunner):
                 parallel_config=self.parallel_config, dtype=self.dtype)
         self.echo_cu_draft_tokens: dict[str, int] = {}
         self.echo_draft_tokens: dict[str, list[int]] = {}
+        # Persists until every req in the plan is trimmed; survives multiple
+        # _update_states calls within one async scheduling step.
+        self.echo_trim_plan: dict[str, int] = {}
         # Scheduler optimistic advance uses pre-trim schedule; track delta for
         # correction on the next _update_states.
         self.echo_prev_scheduled: dict[str, int] = {}
@@ -622,7 +625,21 @@ class NPUModelRunner(GPUModelRunner):
             total_num_scheduled_tokens,
         ]
         """
-        total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        if envs.VLLM_ECHO_ENABLED and self.echo_trim_plan:
+            self._apply_echo_scheduler_trim(scheduler_output)
+            for i, req_id in enumerate(self.input_batch.req_ids):
+                if req_id in scheduler_output.num_scheduled_tokens:
+                    num_scheduled_tokens[i] = (
+                        scheduler_output.num_scheduled_tokens[req_id]
+                    )
+            total_num_scheduled_tokens = (
+                scheduler_output.total_num_scheduled_tokens
+            )
+        else:
+            total_num_scheduled_tokens = (
+                scheduler_output.total_num_scheduled_tokens
+            )
+
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
@@ -1103,18 +1120,21 @@ class NPUModelRunner(GPUModelRunner):
     def _apply_echo_scheduler_trim(self, scheduler_output: "SchedulerOutput") -> None:
         """Trim scheduler spec-decode schedule using per-request ECHO keep counts.
 
-        echo_cu_draft_tokens maps req_id -> number of kept drafts from the
-        previous propose step. echo_draft_tokens holds the actual filtered
-        draft token ids (scheduler spec may be padded with -1 placeholders).
+        echo_trim_plan maps req_id -> number of kept drafts from the previous
+        propose step. echo_draft_tokens holds the actual filtered draft token
+        ids (scheduler spec may be padded with -1 placeholders).
+
+        The plan persists across multiple _update_states invocations within
+        one async step; each req is popped once trimmed.
         """
-        if not envs.VLLM_ECHO_ENABLED or not self.echo_cu_draft_tokens:
+        if not envs.VLLM_ECHO_ENABLED or not self.echo_trim_plan:
             return
 
         if envs.VLLM_ECHO_DEBUG:
             logger.info(
-                "ECHO [trim] before echo_cu_draft_tokens=%s echo_draft_tokens=%s "
+                "ECHO [trim] before echo_trim_plan=%s echo_draft_tokens=%s "
                 "total=%s schedule=%s spec=%s",
-                self.echo_cu_draft_tokens,
+                self.echo_trim_plan,
                 self.echo_draft_tokens,
                 scheduler_output.total_num_scheduled_tokens,
                 dict(scheduler_output.num_scheduled_tokens),
@@ -1122,17 +1142,14 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         trim_details = []
+        trimmed_req_ids: list[str] = []
         for req_id, old_num_scheduled_tokens in list(
             scheduler_output.num_scheduled_tokens.items()
         ):
-            # Only trim requests that participated in the previous propose
-            # step. Prefill/chunked-prefill requests are absent from
-            # echo_cu_draft_tokens; defaulting to 0 would collapse their
-            # schedule to a single token (e.g. 2673 -> 1).
-            if req_id not in self.echo_cu_draft_tokens:
+            if req_id not in self.echo_trim_plan:
                 continue
 
-            draft_token_num = self.echo_cu_draft_tokens[req_id]
+            draft_token_num = self.echo_trim_plan[req_id]
             proposed_drafts = self.echo_draft_tokens.get(req_id, [])
             spec_tokens = scheduler_output.scheduled_spec_decode_tokens.get(req_id, [])
             kept_spec_tokens = proposed_drafts[:draft_token_num]
@@ -1144,6 +1161,7 @@ class NPUModelRunner(GPUModelRunner):
             new_num_scheduled_tokens = len(kept_spec_tokens) + 1
             scheduler_output.num_scheduled_tokens[req_id] = new_num_scheduled_tokens
             self.echo_prev_scheduled[req_id] = old_num_scheduled_tokens
+            trimmed_req_ids.append(req_id)
             if envs.VLLM_ECHO_DEBUG:
                 trim_details.append(
                     {
@@ -1156,23 +1174,39 @@ class NPUModelRunner(GPUModelRunner):
                         "new_sched": new_num_scheduled_tokens,
                     }
                 )
+        for req_id in trimmed_req_ids:
+            self.echo_trim_plan.pop(req_id, None)
+            self.echo_cu_draft_tokens.pop(req_id, None)
+
         scheduler_output.total_num_scheduled_tokens = sum(
             scheduler_output.num_scheduled_tokens.values()
         )
 
         if envs.VLLM_ECHO_DEBUG:
             logger.info(
-                "ECHO [trim] after total=%s schedule=%s spec=%s details=%s",
+                "ECHO [trim] after total=%s schedule=%s spec=%s details=%s "
+                "pending_plan=%s",
                 scheduler_output.total_num_scheduled_tokens,
                 dict(scheduler_output.num_scheduled_tokens),
                 dict(scheduler_output.scheduled_spec_decode_tokens),
                 trim_details,
+                dict(self.echo_trim_plan),
             )
 
-        # Consumed for this propose cycle; prevents double-trim if
-        # _update_states runs more than once before the next propose.
-        self.echo_cu_draft_tokens = {}
-        self.echo_draft_tokens = {}
+    def _echo_get_kept_spec_tokens(
+        self, req_id: str, scheduled_spec_tokens: dict[str, list[int]]
+    ) -> list[int]:
+        """Return trimmed spec tokens, falling back to echo_draft_tokens."""
+        spec_tokens = list(scheduled_spec_tokens.get(req_id, []))
+        if spec_tokens and not all(t == -1 for t in spec_tokens):
+            return spec_tokens
+        keep = self.echo_trim_plan.get(req_id)
+        if keep is None:
+            keep = self.echo_cu_draft_tokens.get(req_id)
+        proposed = self.echo_draft_tokens.get(req_id, [])
+        if keep is not None and proposed:
+            return proposed[:keep]
+        return spec_tokens
 
     def _echo_resolve_sample_token(self, cur_index: int, req_id: str) -> int:
         """Resolve the sample token for ECHO spec-decode input_ids scatter."""
@@ -1230,16 +1264,16 @@ class NPUModelRunner(GPUModelRunner):
         needs_gpu_copy = False
         for cur_index in range(num_reqs):
             req_id = self.input_batch.req_ids[cur_index]
-            spec_tokens = scheduled_spec_tokens.get(req_id, [])
+            kept_spec = self._echo_get_kept_spec_tokens(req_id, scheduled_spec_tokens)
 
             flat_end = int(cu_num_tokens[cur_index]) - 1
-            draft_len = len(spec_tokens)
+            draft_len = len(kept_spec)
             sample_idx = flat_end - draft_len
 
-            if spec_tokens:
+            if kept_spec:
                 spec_start = sample_idx + 1
                 input_ids_cpu[spec_start : flat_end + 1] = torch.tensor(
-                    spec_tokens, dtype=input_ids_cpu.dtype
+                    kept_spec, dtype=input_ids_cpu.dtype
                 )
                 needs_gpu_copy = True
 
@@ -1248,6 +1282,9 @@ class NPUModelRunner(GPUModelRunner):
                 input_ids_cpu[sample_idx] = sampled
                 needs_gpu_copy = True
                 if envs.VLLM_ECHO_DEBUG:
+                    echo_keep = self.echo_trim_plan.get(req_id)
+                    if echo_keep is None:
+                        echo_keep = self.echo_cu_draft_tokens.get(req_id, draft_len)
                     logger.info(
                         "ECHO [input_ids] req_id=%s sample_idx=%s sampled=%s "
                         "num_computed=%s num_prompt=%s echo_keep=%s",
@@ -1256,7 +1293,7 @@ class NPUModelRunner(GPUModelRunner):
                         sampled,
                         int(self.input_batch.num_computed_tokens_cpu[cur_index]),
                         int(self.input_batch.num_prompt_tokens[cur_index]),
-                        len(spec_tokens),
+                        echo_keep,
                     )
 
         if needs_gpu_copy:
@@ -1277,7 +1314,7 @@ class NPUModelRunner(GPUModelRunner):
         self.echo_prev_scheduled = {}
 
     def _update_states(self, scheduler_output: "SchedulerOutput"):
-        if envs.VLLM_ECHO_ENABLED and self.echo_cu_draft_tokens:
+        if envs.VLLM_ECHO_ENABLED and self.echo_trim_plan:
             self._apply_echo_scheduler_trim(scheduler_output)
 
         if envs.VLLM_ECHO_ENABLED and self.echo_overcount_pending:
@@ -2197,13 +2234,14 @@ class NPUModelRunner(GPUModelRunner):
             req_ids_for_echo = (
                 draft_req_ids if draft_req_ids else self.input_batch.req_ids
             )
-            self.echo_cu_draft_tokens = dict(zip(req_ids_for_echo, kept_counts))
+            self.echo_trim_plan = dict(zip(req_ids_for_echo, kept_counts))
+            self.echo_cu_draft_tokens = dict(self.echo_trim_plan)
             self.echo_draft_tokens = dict(zip(req_ids_for_echo, filtered_drafts))
             if envs.VLLM_ECHO_DEBUG and envs.VLLM_ECHO_ENABLED:
                 logger.info(
-                    "ECHO [draft_result] echo_cu_draft_tokens=%s "
+                    "ECHO [draft_result] echo_trim_plan=%s "
                     "echo_draft_tokens=%s raw_drafts=%s",
-                    self.echo_cu_draft_tokens,
+                    self.echo_trim_plan,
                     self.echo_draft_tokens,
                     self._draft_token_ids.detach().cpu().tolist()
                     if torch.is_tensor(self._draft_token_ids)
