@@ -1128,8 +1128,15 @@ class NPUModelRunner(GPUModelRunner):
             layer_indices.append(len(self.kv_caches) - 1)
 
         per_req = []
+        nc_gpu_list = self.num_computed_tokens[:num_reqs].detach().cpu().tolist()
         for r_idx in range(num_reqs):
-            nc = int(self.input_batch.num_computed_tokens_cpu[r_idx])
+            nc_cpu = int(self.input_batch.num_computed_tokens_cpu[r_idx])
+            nc_gpu = int(nc_gpu_list[r_idx])
+            # After target forward, GPU num_computed is authoritative in async
+            # spec decode; CPU may lag until next _prepare_inputs sync.
+            nc = nc_gpu if self.use_async_spec_decode else nc_cpu
+            if not self.use_async_spec_decode and nc_gpu != nc_cpu:
+                nc = max(nc_gpu, nc_cpu)
             n_blocks = int(blk_tbl.num_blocks_per_row[r_idx])
             phys_row = blk_tbl.block_table.cpu[r_idx, :n_blocks].tolist()
 
@@ -1168,7 +1175,9 @@ class NPUModelRunner(GPUModelRunner):
             per_req.append(
                 {
                     "req_id": self.input_batch.req_ids[r_idx],
-                    "num_computed": nc,
+                    "num_computed_cpu": nc_cpu,
+                    "num_computed_gpu": nc_gpu,
+                    "num_computed_used": nc,
                     "kv": layer_stats,
                 }
             )
