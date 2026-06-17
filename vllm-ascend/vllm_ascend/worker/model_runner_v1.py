@@ -641,6 +641,9 @@ class NPUModelRunner(GPUModelRunner):
                 scheduler_output.total_num_scheduled_tokens
             )
 
+        if envs.VLLM_ECHO_ENABLED:
+            self._echo_fix_num_computed_lag(scheduler_output)
+
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
@@ -1265,6 +1268,47 @@ class NPUModelRunner(GPUModelRunner):
                 req_index = self.input_batch.req_id_to_index.get(req_id)
                 if req_index is not None:
                     self.input_batch.spec_token_ids[req_index].clear()
+
+    def _echo_fix_num_computed_lag(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> None:
+        """Raise num_computed when scheduler lags behind committed output tokens.
+
+        Async scheduling with echo_keep=0 can leave num_computed at prompt_len
+        while output_token_ids already contains accepted tokens. Positions and
+        KV slot_mapping are derived from num_computed, so the lag breaks verify
+        even when input_ids sample token is correct.
+        """
+        if not envs.VLLM_ECHO_ENABLED:
+            return
+        req_data = scheduler_output.scheduled_cached_reqs
+        for i, req_id in enumerate(req_data.req_ids):
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                continue
+            req_index = self.input_batch.req_id_to_index.get(req_id)
+            num_prompt = int(req_state.num_prompt_tokens)
+            num_output = int(req_data.num_output_tokens[i])
+            valid_out = sum(1 for t in req_state.output_token_ids if t > 0)
+            expected = num_prompt + max(num_output, valid_out)
+            current = int(req_data.num_computed_tokens[i])
+            if current >= expected:
+                continue
+            req_data.num_computed_tokens[i] = expected
+            req_state.num_computed_tokens = expected
+            if req_index is not None:
+                self.input_batch.num_computed_tokens_cpu[req_index] = expected
+            if envs.VLLM_ECHO_DEBUG:
+                logger.info(
+                    "ECHO [num_computed_fix] req_id=%s %s->%s "
+                    "num_prompt=%s num_output=%s valid_out=%s",
+                    req_id,
+                    current,
+                    expected,
+                    num_prompt,
+                    num_output,
+                    valid_out,
+                )
 
     def _prepare_input_ids(
         self,
