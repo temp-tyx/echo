@@ -635,6 +635,7 @@ class NPUModelRunner(GPUModelRunner):
             total_num_scheduled_tokens = (
                 scheduler_output.total_num_scheduled_tokens
             )
+            self._sync_echo_spec_to_batch_state(scheduler_output)
         else:
             total_num_scheduled_tokens = (
                 scheduler_output.total_num_scheduled_tokens
@@ -1208,19 +1209,19 @@ class NPUModelRunner(GPUModelRunner):
             return proposed[:keep]
         return spec_tokens
 
-    def _echo_resolve_sample_token(self, cur_index: int, req_id: str) -> int:
-        """Resolve the sample token for ECHO spec-decode input_ids scatter."""
-        req_state = self.requests.get(req_id)
-        num_computed = int(self.input_batch.num_computed_tokens_cpu[cur_index])
-        num_prompt = int(self.input_batch.num_prompt_tokens[cur_index])
+    def _echo_resolve_sample_token(self, cur_index: int, req_id: str) -> tuple[int, str]:
+        """Resolve the sample token for ECHO spec-decode input_ids scatter.
 
-        # Prefer the last computed token from request state (matches Eagle
-        # backup-token logic). More reliable than prev_sampled_token_ids when
-        # batch slots change (req finished) or after prefill→decode transition.
-        if req_state is not None and num_computed > 0 and num_computed >= num_prompt:
-            tok = req_state.get_token_id(num_computed - 1)
-            if tok > 0:
-                return tok
+        Returns (token_id, source_name). Async scheduling can leave
+        num_computed_tokens_cpu lagging behind accepted output tokens, so
+        output_token_ids / prev_sampled take priority over get_token_id.
+        """
+        req_state = self.requests.get(req_id)
+
+        if req_state is not None:
+            for t in reversed(req_state.output_token_ids):
+                if t > 0:
+                    return t, "output_token_ids"
 
         if self.input_batch.prev_sampled_token_ids is not None:
             prev_index = self.prev_positions.np[cur_index]
@@ -1229,14 +1230,41 @@ class NPUModelRunner(GPUModelRunner):
                     self.input_batch.prev_sampled_token_ids[prev_index, 0].item()
                 )
                 if tok > 0:
-                    return tok
+                    return tok, "prev_sampled"
+
+        if req_state is not None:
+            num_computed = int(self.input_batch.num_computed_tokens_cpu[cur_index])
+            if num_computed > 0:
+                tok = req_state.get_token_id(num_computed - 1)
+                if tok > 0:
+                    return tok, "get_token_id"
 
         num_out = int(self.input_batch.num_tokens_no_spec[cur_index])
         if num_out > 0:
             tok = int(self.input_batch.token_ids_cpu[cur_index, num_out - 1])
             if tok > 0:
-                return tok
-        return -1
+                return tok, "token_ids_cpu"
+        return -1, "none"
+
+    def _sync_echo_spec_to_batch_state(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> None:
+        """Align prev_num_draft_len with ECHO-trimmed spec after super()._update_states."""
+        if not envs.VLLM_ECHO_ENABLED:
+            return
+        spec_map = scheduler_output.scheduled_spec_decode_tokens
+        for req_id in self.input_batch.req_ids:
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                continue
+            kept = self._echo_get_kept_spec_tokens(req_id, spec_map)
+            if kept:
+                self.input_batch.update_req_spec_token_ids(req_state, {req_id: kept})
+            else:
+                req_state.prev_num_draft_len = 0
+                req_index = self.input_batch.req_id_to_index.get(req_id)
+                if req_index is not None:
+                    self.input_batch.spec_token_ids[req_index].clear()
 
     def _prepare_input_ids(
         self,
@@ -1277,7 +1305,7 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 needs_gpu_copy = True
 
-            sampled = self._echo_resolve_sample_token(cur_index, req_id)
+            sampled, sample_src = self._echo_resolve_sample_token(cur_index, req_id)
             if sampled > 0:
                 input_ids_cpu[sample_idx] = sampled
                 needs_gpu_copy = True
@@ -1287,13 +1315,18 @@ class NPUModelRunner(GPUModelRunner):
                         echo_keep = self.echo_cu_draft_tokens.get(req_id, draft_len)
                     logger.info(
                         "ECHO [input_ids] req_id=%s sample_idx=%s sampled=%s "
-                        "num_computed=%s num_prompt=%s echo_keep=%s",
+                        "source=%s num_computed=%s num_prompt=%s echo_keep=%s "
+                        "num_output=%s",
                         req_id,
                         sample_idx,
                         sampled,
+                        sample_src,
                         int(self.input_batch.num_computed_tokens_cpu[cur_index]),
                         int(self.input_batch.num_prompt_tokens[cur_index]),
                         echo_keep,
+                        len(self.requests[req_id].output_token_ids)
+                        if req_id in self.requests
+                        else 0,
                     )
 
         if needs_gpu_copy:
@@ -1314,8 +1347,9 @@ class NPUModelRunner(GPUModelRunner):
         self.echo_prev_scheduled = {}
 
     def _update_states(self, scheduler_output: "SchedulerOutput"):
-        if envs.VLLM_ECHO_ENABLED and self.echo_trim_plan:
-            self._apply_echo_scheduler_trim(scheduler_output)
+        # ECHO trim runs in _prepare_inputs (after super) so that
+        # update_req_spec_token_ids in super() is corrected by
+        # _sync_echo_spec_to_batch_state before forward.
 
         if envs.VLLM_ECHO_ENABLED and self.echo_overcount_pending:
             pending = self.echo_overcount_pending
