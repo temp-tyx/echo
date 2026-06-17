@@ -473,6 +473,10 @@ class NPUModelRunner(GPUModelRunner):
                 parallel_config=self.parallel_config, dtype=self.dtype)
         self.echo_cu_draft_tokens: dict[str, int] = {}
         self.echo_draft_tokens: dict[str, list[int]] = {}
+        # Scheduler optimistic advance uses pre-trim schedule; track delta for
+        # correction on the next _update_states.
+        self.echo_prev_scheduled: dict[str, int] = {}
+        self.echo_overcount_pending: dict[str, int] = {}
 
     @property
     def use_cp(self) -> bool:
@@ -1139,6 +1143,7 @@ class NPUModelRunner(GPUModelRunner):
 
             new_num_scheduled_tokens = len(kept_spec_tokens) + 1
             scheduler_output.num_scheduled_tokens[req_id] = new_num_scheduled_tokens
+            self.echo_prev_scheduled[req_id] = old_num_scheduled_tokens
             if envs.VLLM_ECHO_DEBUG:
                 trim_details.append(
                     {
@@ -1206,13 +1211,53 @@ class NPUModelRunner(GPUModelRunner):
             if self.input_batch.prev_sampled_token_ids is not None:
                 prev_index = self.prev_positions.np[cur_index]
                 if prev_index >= 0:
-                    input_ids_cpu[sample_idx] = int(
+                    sampled = int(
                         self.input_batch.prev_sampled_token_ids[prev_index, 0].item()
                     )
-                    needs_gpu_copy = True
+                    if sampled <= 0:
+                        num_out = int(self.input_batch.num_tokens_no_spec[cur_index])
+                        num_prompt = int(self.input_batch.num_prompt_tokens[cur_index])
+                        if num_out > num_prompt:
+                            sampled = int(
+                                self.input_batch.token_ids_cpu[cur_index, num_out - 1]
+                            )
+                    if sampled > 0:
+                        input_ids_cpu[sample_idx] = sampled
+                        needs_gpu_copy = True
 
         if needs_gpu_copy:
             self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
+
+    def _record_echo_overcount(self, valid_sampled_tokens_count: torch.Tensor) -> None:
+        if not envs.VLLM_ECHO_ENABLED or not self.echo_prev_scheduled:
+            return
+        counts = valid_sampled_tokens_count.detach().cpu().tolist()
+        for batch_idx, req_id in enumerate(self.input_batch.req_ids):
+            old_sched = self.echo_prev_scheduled.get(req_id)
+            if old_sched is None:
+                continue
+            valid = counts[batch_idx] if batch_idx < len(counts) else 0
+            over = old_sched - int(valid)
+            if over > 0:
+                self.echo_overcount_pending[req_id] = over
+        self.echo_prev_scheduled = {}
+
+    def _update_states(self, scheduler_output: "SchedulerOutput"):
+        if envs.VLLM_ECHO_ENABLED and self.echo_cu_draft_tokens:
+            self._apply_echo_scheduler_trim(scheduler_output)
+
+        if envs.VLLM_ECHO_ENABLED and self.echo_overcount_pending:
+            req_data = scheduler_output.scheduled_cached_reqs
+            for i, req_id in enumerate(req_data.req_ids):
+                over = self.echo_overcount_pending.pop(req_id, None)
+                if over is None or over <= 0:
+                    continue
+                req_data.num_computed_tokens[i] -= over
+                req_state = self.requests.get(req_id)
+                if req_state is not None:
+                    req_state.num_computed_tokens -= over
+
+        return super()._update_states(scheduler_output)
 
     def _get_draft_token_ids_cpu(self) -> tuple[list[list[int]], list[str]]:
         if envs.VLLM_ECHO_ENABLED and isinstance(self._draft_token_ids, torch.Tensor):
@@ -1526,6 +1571,7 @@ class NPUModelRunner(GPUModelRunner):
                     self.num_discarded_requests,
                 )
                 self._copy_valid_sampled_token_count(next_token_ids, valid_sampled_tokens_count)
+                self._record_echo_overcount(valid_sampled_tokens_count)
 
             req_scheduled_tokens = scheduler_output.num_scheduled_tokens
             if self.use_cp:
@@ -1624,8 +1670,6 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
-        if len(scheduler_output.num_scheduled_tokens) != 0 and len(self.input_batch.req_ids) != 0:
-            self._apply_echo_scheduler_trim(scheduler_output)
         if self.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:

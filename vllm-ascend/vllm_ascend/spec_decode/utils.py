@@ -13,21 +13,17 @@ def update_num_computed_tokens_for_batch_change(
 ) -> None:
     """Correct num_computed_tokens for async spec decode drift.
 
-    Continuing requests (prev_positions >= 0): corrected = prev_gpu + valid_count.
-    New requests (prev_positions == -1, e.g. prefills): use CPU value directly.
+    Requests that had drafts: corrected = prev_gpu + valid_count.
+    New requests or non-draft (e.g. prefills): use CPU value directly.
     """
     # Clamp because prev_positions can be -1 for new requests
     gather_indices = prev_positions.clamp(min=0)
 
     valid_counts = valid_sampled_token_count[gather_indices]
     prev_computed = num_computed_tokens[gather_indices]
+    prev_drafts = prev_num_draft_tokens[gather_indices]
 
-    # Continue requests (prev_positions >= 0) must advance by the actual
-    # accepted token count from the previous step. The old check
-    # (prev_drafts > 0) skipped decode steps with zero drafts — e.g. the
-    # first spec-decode step after prefill or ECHO echo_keep=0 — leaving
-    # num_computed_tokens stale and reusing KV positions.
-    participating = prev_positions >= 0
+    participating = (prev_positions >= 0) & (prev_drafts > 0)
     corrected = prev_computed + valid_counts.int()
 
     n = prev_positions.shape[0]
