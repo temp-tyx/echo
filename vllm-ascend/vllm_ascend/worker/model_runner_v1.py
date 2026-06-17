@@ -657,6 +657,45 @@ class NPUModelRunner(GPUModelRunner):
             block_size,
         )
 
+    def _refresh_input_ids_after_async_num_computed(
+        self,
+        num_reqs: int,
+        req_indices: np.ndarray,
+        cu_num_tokens: np.ndarray,
+        positions_np: np.ndarray,
+        total_num_scheduled_tokens: int,
+    ) -> None:
+        """Re-sync positions/input_ids after async num_computed GPU correction.
+
+        Ascend runs an early input_ids gather from CPU num_computed, then the
+        async kernel may correct GPU num_computed for spec-decode. slot_mapping
+        uses GPU positions; input_ids must match.
+        """
+        if not (
+            self.use_async_spec_decode
+            and self.valid_sampled_token_count_gpu is not None
+        ):
+            return
+        synced = self.num_computed_tokens[:num_reqs].detach().cpu().numpy()
+        self.input_batch.num_computed_tokens_cpu[:num_reqs] = synced
+        if self.pcp_size > 1:
+            return
+        np.add(
+            self.input_batch.num_computed_tokens_cpu[req_indices],
+            self.query_pos.np[: int(cu_num_tokens[-1])],
+            out=positions_np[:total_num_scheduled_tokens],
+        )
+        token_indices = (
+            positions_np[:total_num_scheduled_tokens]
+            + req_indices * self.input_batch.token_ids_cpu.shape[1]
+        )
+        torch.index_select(
+            self.input_batch.token_ids_cpu_tensor.flatten(),
+            0,
+            torch.from_numpy(token_indices),
+            out=self.input_ids.cpu[:total_num_scheduled_tokens],
+        )
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -872,25 +911,6 @@ class NPUModelRunner(GPUModelRunner):
         # Fill unused with -1. Needed for reshape_and_cache in attention_cp
         self.query_start_loc.gpu[num_reqs + 1 :].fill_(-1)
 
-        # Copy the tensors to the NPU.
-        self._prepare_input_ids(scheduler_output, num_reqs, total_num_scheduled_tokens, cu_num_tokens)
-        # Calculate M-RoPE positions.
-        # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
-        if self.uses_mrope:
-            # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
-            self._calc_mrope_positions(scheduler_output)
-            self.mrope_positions.gpu.copy_(
-                self.mrope_positions.cpu,
-                non_blocking=True,
-            )
-        elif self.uses_xdrope_dim > 0:
-            self._calc_xdrope_positions(scheduler_output)
-            # Only relevant for models using XD-RoPE (e.g, HunYuan-VL)
-            self.xdrope_positions.gpu[:, :total_num_scheduled_tokens].copy_(
-                self.xdrope_positions.cpu[:, :total_num_scheduled_tokens],
-                non_blocking=True,
-            )
-
         # Record the index of requests that should not be sampled,
         # so that we could clear the sampled tokens before returning
         num_tokens = [self.requests[r].num_tokens for r in self.input_batch.req_ids]
@@ -999,6 +1019,29 @@ class NPUModelRunner(GPUModelRunner):
             self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
         )
         self.seq_lens[num_reqs:].fill_(0)
+
+        self._refresh_input_ids_after_async_num_computed(
+            num_reqs,
+            req_indices,
+            cu_num_tokens,
+            positions_np,
+            total_num_scheduled_tokens,
+        )
+        self._prepare_input_ids(
+            scheduler_output, num_reqs, total_num_scheduled_tokens, cu_num_tokens
+        )
+        if self.uses_mrope:
+            self._calc_mrope_positions(scheduler_output)
+            self.mrope_positions.gpu.copy_(
+                self.mrope_positions.cpu,
+                non_blocking=True,
+            )
+        elif self.uses_xdrope_dim > 0:
+            self._calc_xdrope_positions(scheduler_output)
+            self.xdrope_positions.gpu[:, :total_num_scheduled_tokens].copy_(
+                self.xdrope_positions.cpu[:, :total_num_scheduled_tokens],
+                non_blocking=True,
+            )
 
         # In async spec decode mode, num_computed_tokens was corrected on GPU
         # by update_num_computed_tokens_for_batch_change, so seq_lens (GPU) is
