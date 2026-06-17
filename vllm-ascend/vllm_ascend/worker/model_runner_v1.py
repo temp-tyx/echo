@@ -1185,7 +1185,6 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output.total_num_scheduled_tokens = sum(
             scheduler_output.num_scheduled_tokens.values()
         )
-
         if envs.VLLM_ECHO_DEBUG:
             logger.info(
                 "ECHO [trim] after total=%s schedule=%s spec=%s details=%s "
@@ -1341,10 +1340,9 @@ class NPUModelRunner(GPUModelRunner):
             flat_end = int(cu_num_tokens[cur_index]) - 1
             draft_len = len(kept_spec)
             sample_idx = flat_end - draft_len
-
             if kept_spec:
                 spec_start = sample_idx + 1
-                input_ids_cpu[spec_start : flat_end + 1] = torch.tensor(
+                input_ids_cpu[spec_start: flat_end + 1] = torch.tensor(
                     kept_spec, dtype=input_ids_cpu.dtype
                 )
                 needs_gpu_copy = True
@@ -3531,7 +3529,6 @@ class NPUModelRunner(GPUModelRunner):
 
         return kv_caches
 
-
     def _get_layer_kv_cache_specs(self, kv_cache_config: KVCacheConfig) -> dict[str, KVCacheSpec]:
         layer_kv_cache_spec: dict[str, KVCacheSpec] = {}
         for group_kv_cache_spec in kv_cache_config.kv_cache_groups:
@@ -3910,7 +3907,6 @@ class NPUModelRunner(GPUModelRunner):
                     raise ValueError("Unknown KV cache spec type.")
 
         return kv_caches
-
 
     def may_reinitialize_input_batch(self, kv_cache_config: KVCacheConfig) -> None:
         """
