@@ -1181,27 +1181,27 @@ class NPUModelRunner(GPUModelRunner):
             return
 
         scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
-        if not scheduled_spec_tokens:
-            return
 
         # Async spec-decode scatter can miss ECHO-trimmed drafts; write the
         # scheduler spec tokens (populated by _apply_echo_scheduler_trim) and
-        # the per-request sampled token directly into input_ids.
+        # the per-request sampled token directly into input_ids. Also handle
+        # echo_keep=0 (no spec tokens) where only the sampled token is scheduled.
         input_ids_cpu = self.input_ids.cpu[:total_num_scheduled_tokens]
+        needs_gpu_copy = False
         for cur_index in range(num_reqs):
             req_id = self.input_batch.req_ids[cur_index]
-            spec_tokens = scheduled_spec_tokens.get(req_id)
-            if not spec_tokens:
-                continue
+            spec_tokens = scheduled_spec_tokens.get(req_id, [])
 
             flat_end = int(cu_num_tokens[cur_index]) - 1
             draft_len = len(spec_tokens)
             sample_idx = flat_end - draft_len
-            spec_start = sample_idx + 1
 
-            input_ids_cpu[spec_start : flat_end + 1] = torch.tensor(
-                spec_tokens, dtype=input_ids_cpu.dtype
-            )
+            if spec_tokens:
+                spec_start = sample_idx + 1
+                input_ids_cpu[spec_start : flat_end + 1] = torch.tensor(
+                    spec_tokens, dtype=input_ids_cpu.dtype
+                )
+                needs_gpu_copy = True
 
             if self.input_batch.prev_sampled_token_ids is not None:
                 prev_index = self.prev_positions.np[cur_index]
@@ -1209,8 +1209,10 @@ class NPUModelRunner(GPUModelRunner):
                     input_ids_cpu[sample_idx] = int(
                         self.input_batch.prev_sampled_token_ids[prev_index, 0].item()
                     )
+                    needs_gpu_copy = True
 
-        self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
+        if needs_gpu_copy:
+            self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
 
     def _get_draft_token_ids_cpu(self) -> tuple[list[list[int]], list[str]]:
         if envs.VLLM_ECHO_ENABLED and isinstance(self._draft_token_ids, torch.Tensor):
