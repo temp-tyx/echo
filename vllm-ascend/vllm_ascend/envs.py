@@ -127,6 +127,8 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ECHO_MAX_SPEC_NUM": lambda: int(os.getenv("VLLM_ECHO_MAX_SPEC_NUM", "7")),
     # Debug slot_mapping / positions / block_table at target-model prepare.
     "VLLM_ECHO_DEBUG": lambda: bool(int(os.getenv("VLLM_ECHO_DEBUG", "0"))),
+    # Verbose ECHO debug: full block_table rows, per-layer NaN trace, extra KV layers.
+    "VLLM_ECHO_DEBUG_VERBOSE": lambda: bool(int(os.getenv("VLLM_ECHO_DEBUG_VERBOSE", "0"))),
 }
 
 # end-env-vars-definition

@@ -266,6 +266,7 @@ class NPUModelRunner(GPUModelRunner):
 
         self.sampler = AscendSampler()
         self.attn_state: AscendAttentionState | None = None
+        self._echo_debug_step = 0
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
@@ -612,6 +613,98 @@ class NPUModelRunner(GPUModelRunner):
             return list(values)
         return list(values[:head]) + ["..."] + list(values[-head:]) + [f"(len={n})"]
 
+    def _echo_bump_step(
+        self,
+        num_reqs: int,
+        num_scheduled_tokens: np.ndarray,
+        total_num_scheduled_tokens: int,
+        use_spec_decode: bool,
+    ) -> None:
+        self._echo_debug_step += 1
+        logger.info(
+            "ECHO [step] step=%s req_ids=%s num_scheduled=%s total=%s "
+            "spec_decode=%s verbose=%s",
+            self._echo_debug_step,
+            self.input_batch.req_ids[:num_reqs],
+            num_scheduled_tokens[:num_reqs].tolist(),
+            total_num_scheduled_tokens,
+            use_spec_decode,
+            envs.VLLM_ECHO_DEBUG_VERBOSE,
+        )
+
+    @staticmethod
+    def _echo_tensor_stats(t: torch.Tensor | None) -> dict:
+        if t is None or t.numel() == 0:
+            return {"numel": 0}
+        tf = t.detach().float().cpu()
+        return {
+            "shape": list(t.shape),
+            "has_nan": bool(torch.isnan(tf).any().item()),
+            "has_inf": bool(torch.isinf(tf).any().item()),
+            "all_zero": bool((tf.abs() < 1e-12).all().item()),
+            "max_abs": float(tf.abs().max().item()),
+            "l2": float(tf.norm().item()),
+        }
+
+    def _echo_get_k_cache(self, layer_idx: int = 0) -> torch.Tensor | None:
+        kv_caches = getattr(self, "kv_caches", None)
+        if not kv_caches or layer_idx >= len(kv_caches):
+            return None
+        kv = kv_caches[layer_idx]
+        if isinstance(kv, (tuple, list)):
+            return kv[0] if kv else None
+        if isinstance(kv, torch.Tensor) and kv.dim() == 5 and kv.shape[0] == 2:
+            return kv[0]
+        return kv if isinstance(kv, torch.Tensor) else None
+
+    @staticmethod
+    def _echo_kv_slice_at_slot(
+        k_cache: torch.Tensor, slot: int, block_size: int
+    ) -> torch.Tensor | None:
+        if slot < 0:
+            return None
+        block_idx = slot // block_size
+        block_offset = slot % block_size
+        if k_cache.dim() == 5 and k_cache.shape[0] == 2:
+            return NPUModelRunner._echo_kv_slice_at_slot(
+                k_cache[0], slot, block_size
+            )
+        if k_cache.dim() == 4:
+            if k_cache.shape[1] == block_size:
+                if block_idx >= k_cache.shape[0]:
+                    return None
+                return k_cache[block_idx, block_offset]
+            if k_cache.shape[2] == block_size:
+                if block_idx >= k_cache.shape[0]:
+                    return None
+                return k_cache[block_idx, :, block_offset]
+        try:
+            head_dim = k_cache.shape[-1]
+            num_kv_heads = k_cache.shape[-2]
+            flat = k_cache.reshape(-1, num_kv_heads, head_dim)
+            if slot >= flat.shape[0]:
+                return None
+            return flat[slot]
+        except Exception:
+            return None
+
+    def _echo_block_table_rows(self, num_reqs: int, verbose: bool) -> list[dict]:
+        blk_tbl = self.input_batch.block_table[0]
+        rows = []
+        for r_idx in range(num_reqs):
+            n_blocks = int(blk_tbl.num_blocks_per_row[r_idx])
+            phys_row = blk_tbl.block_table.cpu[r_idx, :n_blocks].tolist()
+            rows.append(
+                {
+                    "req_id": self.input_batch.req_ids[r_idx],
+                    "num_blocks": n_blocks,
+                    "block_table_row": phys_row
+                    if verbose
+                    else self._echo_summarize_block_row(phys_row),
+                }
+            )
+        return rows
+
     def _echo_per_req_token_layout(
         self,
         num_reqs: int,
@@ -708,8 +801,9 @@ class NPUModelRunner(GPUModelRunner):
             input_ids_gpu,
         )
         logger.info(
-            "ECHO [slot_mapping] req_ids=%s num_scheduled=%s total=%s "
+            "ECHO [slot_mapping] step=%s req_ids=%s num_scheduled=%s total=%s "
             "block_table=%s block_size=%s token_layout=%s",
+            self._echo_debug_step,
             self.input_batch.req_ids[:num_reqs],
             num_scheduled_tokens[:num_reqs].tolist(),
             total_num_scheduled_tokens,
@@ -771,9 +865,10 @@ class NPUModelRunner(GPUModelRunner):
                 .tolist(),
             }
         logger.info(
-            "ECHO [prepare] attn_state=%s with_prefill=%s max_seq_len_cpu=%s "
+            "ECHO [prepare] step=%s attn_state=%s with_prefill=%s max_seq_len_cpu=%s "
             "seq_lens_gpu=%s seq_lens_cpu=%s seq_drift=%s "
             "valid_sampled_count_prev=%s query_start_loc=%s per_req=%s spec=%s",
+            self._echo_debug_step,
             attn_state,
             self.with_prefill,
             max(seq_cpu) if seq_cpu else 0,
@@ -794,18 +889,23 @@ class NPUModelRunner(GPUModelRunner):
         common_attn_metadata: CommonAttentionMetadata | None,
         max_query_len: int,
     ) -> None:
+        step = self._echo_debug_step
         if common_attn_metadata is None:
             logger.info(
-                "ECHO [attn] common_attn_metadata=None max_query_len=%s",
+                "ECHO [attn] step=%s common_attn_metadata=None max_query_len=%s",
+                step,
                 max_query_len,
             )
             return
         num_reqs = common_attn_metadata.num_reqs
+        verbose = envs.VLLM_ECHO_DEBUG_VERBOSE
         seq_gpu = common_attn_metadata.seq_lens[:num_reqs].detach().cpu().tolist()
-        seq_lens_cpu_attr = getattr(common_attn_metadata, "_seq_lens_cpu", None)
+        seq_lens_cpu_tensor = getattr(common_attn_metadata, "seq_lens_cpu", None)
+        if seq_lens_cpu_tensor is None:
+            seq_lens_cpu_tensor = getattr(common_attn_metadata, "_seq_lens_cpu", None)
         seq_cpu = (
-            seq_lens_cpu_attr[:num_reqs].detach().cpu().tolist()
-            if seq_lens_cpu_attr is not None
+            seq_lens_cpu_tensor[:num_reqs].detach().cpu().tolist()
+            if seq_lens_cpu_tensor is not None
             else None
         )
         seq_drift = (
@@ -813,11 +913,27 @@ class NPUModelRunner(GPUModelRunner):
             if seq_cpu is not None
             else None
         )
+        nc_cpu = getattr(common_attn_metadata, "num_computed_tokens_cpu", None)
+        nc_cpu_list = (
+            nc_cpu[:num_reqs].detach().cpu().tolist()
+            if nc_cpu is not None
+            else None
+        )
+        actual_seq_lengths_q = getattr(
+            common_attn_metadata, "actual_seq_lengths_q", None
+        )
+        asl_q = None
+        if actual_seq_lengths_q is not None:
+            n_tok = common_attn_metadata.num_actual_tokens
+            asl_q = self._echo_summarize_seq(
+                list(actual_seq_lengths_q[:n_tok]), head=4
+            )
         slot_map = common_attn_metadata.slot_mapping[
             : common_attn_metadata.num_actual_tokens
         ].detach().cpu()
         qsl = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1].tolist()
         cu = np.array(qsl[1:], dtype=np.int32)
+        positions_meta = getattr(common_attn_metadata, "positions", None)
         token_layout = []
         for r_idx in range(num_reqs):
             start = 0 if r_idx == 0 else int(cu[r_idx - 1])
@@ -825,27 +941,142 @@ class NPUModelRunner(GPUModelRunner):
             if start >= end:
                 continue
             slots = slot_map[start:end].tolist()
-            token_layout.append(
-                {
-                    "req_id": self.input_batch.req_ids[r_idx],
-                    "num_tokens": end - start,
-                    "slot_first_last": [slots[0], slots[-1]],
-                    "slot_mapping": self._echo_summarize_seq(slots, 3),
-                }
-            )
+            entry = {
+                "req_id": self.input_batch.req_ids[r_idx],
+                "num_tokens": end - start,
+                "slot_first_last": [slots[0], slots[-1]],
+                "slot_mapping": self._echo_summarize_seq(slots, 3),
+            }
+            if positions_meta is not None:
+                pos_slice = positions_meta[start:end].detach().cpu().tolist()
+                entry["positions"] = self._echo_summarize_seq(pos_slice, 3)
+                entry["pos_first_last"] = [pos_slice[0], pos_slice[-1]]
+            token_layout.append(entry)
+        block_table_rows = self._echo_block_table_rows(num_reqs, verbose)
+        bt_tensor = common_attn_metadata.block_table_tensor
+        bt_summary = None
+        if bt_tensor is not None and verbose:
+            bt_summary = bt_tensor[:num_reqs].detach().cpu().tolist()
         logger.info(
-            "ECHO [attn] attn_state=%s num_actual_tokens=%s max_query_len=%s "
-            "max_seq_len=%s seq_lens_gpu=%s seq_lens_cpu=%s seq_drift=%s "
-            "query_start_loc=%s token_layout=%s",
+            "ECHO [attn] step=%s attn_state=%s num_actual_tokens=%s max_query_len=%s "
+            "max_seq_len=%s decode_token_per_req=%s "
+            "seq_lens_gpu=%s seq_lens_cpu=%s seq_drift=%s "
+            "num_computed_cpu=%s actual_seq_lengths_q=%s "
+            "query_start_loc=%s block_table_rows=%s block_table_tensor=%s "
+            "token_layout=%s",
+            step,
             getattr(common_attn_metadata, "attn_state", None),
             common_attn_metadata.num_actual_tokens,
             common_attn_metadata.max_query_len,
             common_attn_metadata.max_seq_len,
+            getattr(common_attn_metadata, "decode_token_per_req", None),
             seq_gpu,
             seq_cpu,
             seq_drift,
+            nc_cpu_list,
+            asl_q,
             qsl,
+            block_table_rows,
+            bt_summary,
             token_layout,
+        )
+
+    def _echo_log_kv_probe_debug(
+        self,
+        num_reqs: int,
+        num_scheduled_tokens: np.ndarray,
+        total_num_scheduled_tokens: int,
+        positions_np: np.ndarray,
+    ) -> None:
+        """Sample layer-0 K cache at key slots before target forward."""
+        blk_tbl = self.input_batch.block_table[0]
+        block_size = blk_tbl.block_size
+        k_cache = self._echo_get_k_cache(0)
+        if k_cache is None:
+            logger.info(
+                "ECHO [kv_probe] step=%s skip reason=no_kv_cache",
+                self._echo_debug_step,
+            )
+            return
+        slot_map = blk_tbl.slot_mapping.gpu[:total_num_scheduled_tokens].detach().cpu()
+        cu = np.cumsum(num_scheduled_tokens[:num_reqs], dtype=np.int32)
+        layer_indices = [0]
+        if envs.VLLM_ECHO_DEBUG_VERBOSE and len(self.kv_caches) > 1:
+            layer_indices.append(len(self.kv_caches) - 1)
+        per_req = []
+        for r_idx in range(num_reqs):
+            nc = int(self.input_batch.num_computed_tokens_cpu[r_idx])
+            bi = nc // block_size
+            n_blocks = int(blk_tbl.num_blocks_per_row[r_idx])
+            phys_row = blk_tbl.block_table.cpu[r_idx, :n_blocks].tolist()
+            slot_at_nc = (
+                int(phys_row[bi]) * block_size + (nc % block_size)
+                if bi < len(phys_row) and phys_row[bi] > 0
+                else None
+            )
+            slot_prefill_last = (
+                int(phys_row[(nc - 1) // block_size]) * block_size
+                + ((nc - 1) % block_size)
+                if nc > 0 and (nc - 1) // block_size < len(phys_row)
+                and phys_row[(nc - 1) // block_size] > 0
+                else None
+            )
+            start = 0 if r_idx == 0 else int(cu[r_idx - 1])
+            end = int(cu[r_idx])
+            sched_slots = slot_map[start:end].tolist() if start < end else []
+            probe_slots = []
+            for label, s in (
+                ("at_num_computed", slot_at_nc),
+                ("prefill_last", slot_prefill_last),
+                ("sched_first", sched_slots[0] if sched_slots else None),
+                ("sched_last", sched_slots[-1] if sched_slots else None),
+            ):
+                if s is None:
+                    continue
+                probe_slots.append((label, int(s)))
+            seen = set()
+            unique_probes = []
+            for label, s in probe_slots:
+                if s in seen:
+                    continue
+                seen.add(s)
+                unique_probes.append((label, s))
+            layer_stats = {}
+            for layer_idx in layer_indices:
+                k_layer = self._echo_get_k_cache(layer_idx)
+                if k_layer is None:
+                    continue
+                slot_stats = {}
+                for label, s in unique_probes:
+                    sl = self._echo_kv_slice_at_slot(k_layer, s, block_size)
+                    slot_stats[label] = {
+                        "slot": s,
+                        **self._echo_tensor_stats(sl),
+                    }
+                layer_stats[f"layer_{layer_idx}"] = slot_stats
+            per_req.append(
+                {
+                    "req_id": self.input_batch.req_ids[r_idx],
+                    "num_computed": nc,
+                    "num_scheduled": int(num_scheduled_tokens[r_idx]),
+                    "pos_first_last": [
+                        int(positions_np[start]),
+                        int(positions_np[end - 1]),
+                    ]
+                    if start < end
+                    else None,
+                    "block_table_row": phys_row
+                    if envs.VLLM_ECHO_DEBUG_VERBOSE
+                    else self._echo_summarize_block_row(phys_row),
+                    "kv": layer_stats,
+                }
+            )
+        logger.info(
+            "ECHO [kv_probe] step=%s block_size=%s k_cache_shape=%s per_req=%s",
+            self._echo_debug_step,
+            block_size,
+            list(k_cache.shape),
+            per_req,
         )
 
     def _echo_log_forward_debug(self, hidden_states: torch.Tensor | IntermediateTensors) -> None:
@@ -853,7 +1084,8 @@ class NPUModelRunner(GPUModelRunner):
             return
         if hidden_states is None or isinstance(hidden_states, IntermediateTensors):
             logger.info(
-                "ECHO [forward] skip hidden_states type=%s",
+                "ECHO [forward] step=%s skip hidden_states type=%s",
+                self._echo_debug_step,
                 type(hidden_states).__name__,
             )
             return
@@ -881,12 +1113,56 @@ class NPUModelRunner(GPUModelRunner):
                 }
             )
         logger.info(
-            "ECHO [forward] total_tokens=%s total_nan=%s total_inf=%s per_req=%s",
+            "ECHO [forward] step=%s total_tokens=%s total_nan=%s total_inf=%s per_req=%s",
+            self._echo_debug_step,
             total,
             int(torch.isnan(hs).sum().item()),
             int(torch.isinf(hs).sum().item()),
             per_req,
         )
+
+    def _echo_run_with_layer_trace(
+        self,
+        run_fn,
+        total_tokens: int,
+    ):
+        handles: list = []
+        trace: list[dict] = []
+
+        def make_hook(layer_name: str):
+            def hook(_mod, _inp, out):
+                hs = out[0] if isinstance(out, tuple) else out
+                if not isinstance(hs, torch.Tensor):
+                    return
+                sl = hs[:total_tokens]
+                trace.append(
+                    {
+                        "layer": layer_name,
+                        **self._echo_tensor_stats(sl),
+                    }
+                )
+
+            return hook
+
+        for name, mod in self.model.named_modules():
+            if mod.__class__.__name__.endswith("DecoderLayer"):
+                handles.append(mod.register_forward_hook(make_hook(name)))
+        try:
+            return run_fn()
+        finally:
+            for h in handles:
+                h.remove()
+            if trace:
+                bad = [t for t in trace if t.get("has_nan") or t.get("has_inf")]
+                logger.info(
+                    "ECHO [layers] step=%s total_tokens=%s num_layers=%s "
+                    "first_bad=%s trace=%s",
+                    self._echo_debug_step,
+                    total_tokens,
+                    len(trace),
+                    bad[0] if bad else None,
+                    trace if envs.VLLM_ECHO_DEBUG_VERBOSE else self._echo_summarize_seq(trace, 2),
+                )
 
     def _refresh_input_ids_after_async_num_computed(
         self,
@@ -1905,6 +2181,14 @@ class NPUModelRunner(GPUModelRunner):
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
 
+                if envs.VLLM_ECHO_DEBUG:
+                    self._echo_bump_step(
+                        num_reqs,
+                        num_scheduled_tokens_np,
+                        int(num_scheduled_tokens_np.sum()),
+                        len(scheduler_output.scheduled_spec_decode_tokens) > 0,
+                    )
+
                 (
                     logits_indices,
                     spec_decode_metadata,
@@ -2029,6 +2313,13 @@ class NPUModelRunner(GPUModelRunner):
                     self._echo_log_attn_debug(
                         spec_decode_common_attn_metadata,
                         max_num_scheduled_tokens,
+                    )
+                    positions_np = self._positions_np_buf[:total_num_scheduled_tokens]
+                    self._echo_log_kv_probe_debug(
+                        num_reqs,
+                        num_scheduled_tokens_np,
+                        total_num_scheduled_tokens,
+                        positions_np,
                     )
 
             (
@@ -2605,9 +2896,17 @@ class NPUModelRunner(GPUModelRunner):
             self._update_full_graph_params_if_needed(
                 forward_context, num_tokens_padded, positions
             )
-            hidden_states = run_model()
+            if envs.VLLM_ECHO_DEBUG and envs.VLLM_ECHO_DEBUG_VERBOSE:
+                total_trace = getattr(self, "_echo_debug_total_tokens", num_tokens_padded)
+                hidden_states = self._echo_run_with_layer_trace(run_model, total_trace)
+            else:
+                hidden_states = run_model()
         else:
-            hidden_states = run_model()
+            if envs.VLLM_ECHO_DEBUG and envs.VLLM_ECHO_DEBUG_VERBOSE:
+                total_trace = getattr(self, "_echo_debug_total_tokens", num_tokens_padded)
+                hidden_states = self._echo_run_with_layer_trace(run_model, total_trace)
+            else:
+                hidden_states = run_model()
             self._update_full_graph_params_if_needed(
                 forward_context, num_tokens_padded, positions
             )
