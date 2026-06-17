@@ -118,13 +118,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ECHO_ENABLED": lambda: bool(int(os.getenv("VLLM_ECHO_ENABLED", "1"))),
     # Maximum number of draft tokens to keep per request in ECHO.
     # Only the top K_max requests by confidence (log probability) are retained.
-    "VLLM_ECHO_K_MAX": lambda: int(os.getenv("VLLM_ECHO_K_MAX", "6")),
+    "VLLM_ECHO_K_MAX": lambda: int(os.getenv("VLLM_ECHO_K_MAX", "5")),
     # Multiplier for extending speculation steps in ECHO.
     # The actual number of draft steps will be k * steps_multiplier.
-    "VLLM_ECHO_STEPS_MULTIPLIER": lambda: int(os.getenv("VLLM_ECHO_STEPS_MULTIPLIER", "1")),
+    "VLLM_ECHO_STEPS_MULTIPLIER": lambda: int(os.getenv("VLLM_ECHO_STEPS_MULTIPLIER", "2")),
     # Maximum number of speculative steps in ECHO draft generation.
     # Used to pre-allocate slot_mapping_group buffers for extended draft length.
-    "VLLM_ECHO_MAX_SPEC_NUM": lambda: int(os.getenv("VLLM_ECHO_MAX_SPEC_NUM", "3")),
+    "VLLM_ECHO_MAX_SPEC_NUM": lambda: int(os.getenv("VLLM_ECHO_MAX_SPEC_NUM", "7")),
     # Debug slot_mapping / positions / block_table at target-model prepare.
     "VLLM_ECHO_DEBUG": lambda: bool(int(os.getenv("VLLM_ECHO_DEBUG", "0"))),
 }
