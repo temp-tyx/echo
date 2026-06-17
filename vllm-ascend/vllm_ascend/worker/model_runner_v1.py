@@ -884,10 +884,31 @@ class NPUModelRunner(GPUModelRunner):
         self._echo_debug_num_reqs = num_reqs
         self._echo_debug_total_tokens = total_num_scheduled_tokens
 
+    @staticmethod
+    def _echo_extract_actual_seq_lengths_q(attn_metadata: Any) -> list[int] | None:
+        """Read actual_seq_lengths_q from built per-layer attention metadata."""
+        if attn_metadata is None:
+            return None
+        meta_dict = attn_metadata[0] if isinstance(attn_metadata, list) else attn_metadata
+        if not isinstance(meta_dict, dict):
+            return None
+        for layer_meta in meta_dict.values():
+            for node in (layer_meta, getattr(layer_meta, "decode", None), getattr(layer_meta, "prefill", None)):
+                if node is None:
+                    continue
+                asl = getattr(node, "actual_seq_lengths_q", None)
+                if asl is None:
+                    continue
+                if torch.is_tensor(asl):
+                    return asl.detach().cpu().tolist()
+                return list(asl)
+        return None
+
     def _echo_log_attn_debug(
         self,
         common_attn_metadata: CommonAttentionMetadata | None,
         max_query_len: int,
+        attn_metadata: Any = None,
     ) -> None:
         step = self._echo_debug_step
         if common_attn_metadata is None:
@@ -919,19 +940,22 @@ class NPUModelRunner(GPUModelRunner):
             if nc_cpu is not None
             else None
         )
-        actual_seq_lengths_q = getattr(
-            common_attn_metadata, "actual_seq_lengths_q", None
-        )
+        actual_seq_lengths_q = self._echo_extract_actual_seq_lengths_q(attn_metadata)
+        qsl = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1].tolist()
+        # Fallback: many backends derive this from query_start_loc cumsum.
+        qsl_cum_per_req = qsl[1:]
         asl_q = None
         if actual_seq_lengths_q is not None:
-            n_tok = common_attn_metadata.num_actual_tokens
-            asl_q = self._echo_summarize_seq(
-                list(actual_seq_lengths_q[:n_tok]), head=4
-            )
+            asl_q = self._echo_summarize_seq(actual_seq_lengths_q, head=4)
+        elif qsl_cum_per_req:
+            asl_q = {
+                "from_query_start_loc": qsl_cum_per_req,
+                "note": "actual_seq_lengths_q unset on common metadata; "
+                "per-req cumsum from query_start_loc shown instead",
+            }
         slot_map = common_attn_metadata.slot_mapping[
             : common_attn_metadata.num_actual_tokens
         ].detach().cpu()
-        qsl = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1].tolist()
         cu = np.array(qsl[1:], dtype=np.int32)
         positions_meta = getattr(common_attn_metadata, "positions", None)
         token_layout = []
@@ -1053,6 +1077,13 @@ class NPUModelRunner(GPUModelRunner):
                         "slot": s,
                         **self._echo_tensor_stats(sl),
                     }
+                    if slot_stats[label].get("all_zero") and label in (
+                        "at_num_computed",
+                        "sched_last",
+                    ):
+                        slot_stats[label]["note"] = (
+                            "all_zero expected for unwritten spec-decode slots"
+                        )
                 layer_stats[f"layer_{layer_idx}"] = slot_stats
             per_req.append(
                 {
@@ -1076,6 +1107,44 @@ class NPUModelRunner(GPUModelRunner):
             self._echo_debug_step,
             block_size,
             list(k_cache.shape),
+            per_req,
+        )
+
+    def _echo_log_draft_debug(
+        self,
+        draft_token_ids: torch.Tensor | None,
+        draft_step: int | None = None,
+        batch_size: int | None = None,
+        echo_cu_draft_tokens: dict[str, int] | None = None,
+    ) -> None:
+        if draft_token_ids is None:
+            return
+        per_req = []
+        ids_cpu = draft_token_ids.detach().cpu()
+        for r_idx, req_id in enumerate(self.input_batch.req_ids[: ids_cpu.shape[0]]):
+            row = ids_cpu[r_idx].tolist()
+            valid = [t for t in row if t != -1]
+            per_req.append(
+                {
+                    "req_id": req_id,
+                    "draft_tokens": row,
+                    "valid_count": len(valid),
+                }
+            )
+        logger.info(
+            "ECHO [draft] step=%s draft_step=%s batch_size=%s "
+            "max_spec_num=%s k_max=%s steps_multiplier=%s "
+            "runner_num_spec_tokens=%s decode_token_per_req=%s "
+            "echo_cu_draft_tokens=%s per_req=%s",
+            self._echo_debug_step,
+            draft_step,
+            batch_size,
+            envs.VLLM_ECHO_MAX_SPEC_NUM,
+            envs.VLLM_ECHO_K_MAX,
+            envs.VLLM_ECHO_STEPS_MULTIPLIER,
+            getattr(self, "num_spec_tokens", None),
+            getattr(self, "decode_token_per_req", None),
+            echo_cu_draft_tokens,
             per_req,
         )
 
@@ -1120,49 +1189,6 @@ class NPUModelRunner(GPUModelRunner):
             int(torch.isinf(hs).sum().item()),
             per_req,
         )
-
-    def _echo_run_with_layer_trace(
-        self,
-        run_fn,
-        total_tokens: int,
-    ):
-        handles: list = []
-        trace: list[dict] = []
-
-        def make_hook(layer_name: str):
-            def hook(_mod, _inp, out):
-                hs = out[0] if isinstance(out, tuple) else out
-                if not isinstance(hs, torch.Tensor):
-                    return
-                sl = hs[:total_tokens]
-                trace.append(
-                    {
-                        "layer": layer_name,
-                        **self._echo_tensor_stats(sl),
-                    }
-                )
-
-            return hook
-
-        for name, mod in self.model.named_modules():
-            if mod.__class__.__name__.endswith("DecoderLayer"):
-                handles.append(mod.register_forward_hook(make_hook(name)))
-        try:
-            return run_fn()
-        finally:
-            for h in handles:
-                h.remove()
-            if trace:
-                bad = [t for t in trace if t.get("has_nan") or t.get("has_inf")]
-                logger.info(
-                    "ECHO [layers] step=%s total_tokens=%s num_layers=%s "
-                    "first_bad=%s trace=%s",
-                    self._echo_debug_step,
-                    total_tokens,
-                    len(trace),
-                    bad[0] if bad else None,
-                    trace if envs.VLLM_ECHO_DEBUG_VERBOSE else self._echo_summarize_seq(trace, 2),
-                )
 
     def _refresh_input_ids_after_async_num_computed(
         self,
@@ -1956,6 +1982,8 @@ class NPUModelRunner(GPUModelRunner):
             # TODO: gpu_model_runner
             self.num_spec_tokens = draft_step
             self.speculative_config.num_speculative_tokens = draft_step
+            self._echo_last_draft_step = draft_step
+            self._echo_last_draft_batch_size = batch_size
             common_attn_metadata = spec_decode_common_attn_metadata
             sampled_token_ids = valid_sampled_token_ids
 
@@ -2313,6 +2341,7 @@ class NPUModelRunner(GPUModelRunner):
                     self._echo_log_attn_debug(
                         spec_decode_common_attn_metadata,
                         max_num_scheduled_tokens,
+                        attn_metadata,
                     )
                     positions_np = self._positions_np_buf[:total_num_scheduled_tokens]
                     self._echo_log_kv_probe_debug(
@@ -2568,6 +2597,13 @@ class NPUModelRunner(GPUModelRunner):
                     mask.int().sum(dim=1).cpu().tolist(),
                 )
             }
+            if envs.VLLM_ECHO_DEBUG:
+                self._echo_log_draft_debug(
+                    self._draft_token_ids,
+                    getattr(self, "_echo_last_draft_step", None),
+                    getattr(self, "_echo_last_draft_batch_size", None),
+                    self.echo_cu_draft_tokens,
+                )
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         (
@@ -2896,17 +2932,9 @@ class NPUModelRunner(GPUModelRunner):
             self._update_full_graph_params_if_needed(
                 forward_context, num_tokens_padded, positions
             )
-            if envs.VLLM_ECHO_DEBUG and envs.VLLM_ECHO_DEBUG_VERBOSE:
-                total_trace = getattr(self, "_echo_debug_total_tokens", num_tokens_padded)
-                hidden_states = self._echo_run_with_layer_trace(run_model, total_trace)
-            else:
-                hidden_states = run_model()
+            hidden_states = run_model()
         else:
-            if envs.VLLM_ECHO_DEBUG and envs.VLLM_ECHO_DEBUG_VERBOSE:
-                total_trace = getattr(self, "_echo_debug_total_tokens", num_tokens_padded)
-                hidden_states = self._echo_run_with_layer_trace(run_model, total_trace)
-            else:
-                hidden_states = run_model()
+            hidden_states = run_model()
             self._update_full_graph_params_if_needed(
                 forward_context, num_tokens_padded, positions
             )
