@@ -481,6 +481,9 @@ class NPUModelRunner(GPUModelRunner):
         self.echo_prev_scheduled: dict[str, int] = {}
         self.echo_overcount_pending: dict[str, int] = {}
         self.echo_num_computed_fixed: set[str] = set()
+        # Reqs whose output_token_ids were recovered from prev_sampled but KV
+        # at num_prompt may not have been written yet; skip num_computed bump.
+        self.echo_kv_unconfirmed: set[str] = set()
 
     @property
     def use_cp(self) -> bool:
@@ -644,7 +647,7 @@ class NPUModelRunner(GPUModelRunner):
 
         if envs.VLLM_ECHO_ENABLED:
             self._echo_reconcile_async_output(scheduler_output)
-            self._echo_fix_num_computed_lag(scheduler_output)
+            self._echo_sync_num_computed(scheduler_output)
 
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
@@ -1039,6 +1042,7 @@ class NPUModelRunner(GPUModelRunner):
                 req_bt_info = []
                 for r_idx, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
                     nc = int(self.input_batch.num_computed_tokens_cpu[r_idx])
+                    num_prompt = int(self.input_batch.num_prompt_tokens[r_idx])
                     bi = nc // block_size
                     phys = blk_tbl.block_table.cpu[r_idx, bi : bi + 2].tolist()
                     slot_at_nc = (
@@ -1046,13 +1050,24 @@ class NPUModelRunner(GPUModelRunner):
                         if phys and phys[0] > 0
                         else None
                     )
+                    bi_prompt = num_prompt // block_size
+                    phys_prompt = blk_tbl.block_table.cpu[
+                        r_idx, bi_prompt : bi_prompt + 1
+                    ].tolist()
+                    slot_at_num_prompt = (
+                        int(phys_prompt[0]) * block_size + (num_prompt % block_size)
+                        if phys_prompt and phys_prompt[0] > 0
+                        else None
+                    )
                     req_bt_info.append(
                         {
                             "req_id": req_id,
                             "num_computed": nc,
+                            "num_prompt": num_prompt,
                             "block_idx": bi,
                             "phys_blocks": phys,
                             "slot_at_num_computed": slot_at_nc,
+                            "slot_at_num_prompt": slot_at_num_prompt,
                         }
                     )
                 logger.info(
@@ -1287,11 +1302,16 @@ class NPUModelRunner(GPUModelRunner):
         """
         req_state = self.requests.get(req_id)
         num_computed = int(self.input_batch.num_computed_tokens_cpu[cur_index])
+        kv_unconfirmed = req_id in self.echo_kv_unconfirmed
 
         if req_state is not None and num_computed > 0:
             tok = req_state.get_token_id(num_computed - 1)
             if tok > 0:
-                return tok, "get_token_id"
+                src = "kv_unconfirmed_last" if kv_unconfirmed else "get_token_id"
+                return tok, src
+
+        if kv_unconfirmed:
+            return -1, "kv_unconfirmed_none"
 
         if req_state is not None:
             for t in reversed(req_state.output_token_ids):
@@ -1370,6 +1390,7 @@ class NPUModelRunner(GPUModelRunner):
                 continue
             missing = num_output - valid_out
             req_state.output_token_ids.extend([tok] * missing)
+            self.echo_kv_unconfirmed.add(req_id)
             if envs.VLLM_ECHO_DEBUG:
                 logger.info(
                     "ECHO [async_reconcile] req_id=%s num_output=%s "
@@ -1381,13 +1402,14 @@ class NPUModelRunner(GPUModelRunner):
                     len(req_state.output_token_ids),
                 )
 
-    def _echo_fix_num_computed_lag(
+    def _echo_sync_num_computed(
         self, scheduler_output: "SchedulerOutput"
     ) -> None:
-        """Raise num_computed when scheduler is stuck at prompt_len after decode.
+        """Keep num_computed aligned with recovered output_token_ids.
 
-        Only applies when num_computed == num_prompt but num_output > 0.
-        Avoids inflating num_computed via async-optimistic num_output (e.g. 9).
+        Async scheduling can leave num_computed ahead of KV (overshoot) or
+        stuck at prompt_len (lag). Positions and slot_mapping derive from
+        num_computed, so both directions must be corrected.
         """
         if not envs.VLLM_ECHO_ENABLED:
             return
@@ -1401,24 +1423,45 @@ class NPUModelRunner(GPUModelRunner):
             num_prompt = int(req_state.num_prompt_tokens)
             num_output = int(req_data.num_output_tokens[i])
             current = int(req_data.num_computed_tokens[i])
-            if current != num_prompt or num_output <= 0:
-                continue
             valid_out = sum(1 for t in req_state.output_token_ids if t > 0)
-            if valid_out <= 0:
-                continue
             expected = num_prompt + valid_out
-            req_data.num_computed_tokens[i] = expected
-            req_state.num_computed_tokens = expected
+
+            if current == expected:
+                continue
+            if current > expected:
+                new_val = expected
+                reason = "clamp"
+            elif current == num_prompt and valid_out > 0:
+                if req_id in self.echo_kv_unconfirmed:
+                    if envs.VLLM_ECHO_DEBUG:
+                        logger.info(
+                            "ECHO [num_computed_sync] req_id=%s skip_bump "
+                            "kv_unconfirmed num_prompt=%s valid_out=%s "
+                            "keep_num_computed=%s",
+                            req_id,
+                            num_prompt,
+                            valid_out,
+                            current,
+                        )
+                    continue
+                new_val = expected
+                reason = "fix_lag"
+            else:
+                continue
+
+            req_data.num_computed_tokens[i] = new_val
+            req_state.num_computed_tokens = new_val
             if req_index is not None:
-                self.input_batch.num_computed_tokens_cpu[req_index] = expected
+                self.input_batch.num_computed_tokens_cpu[req_index] = new_val
             self.echo_num_computed_fixed.add(req_id)
             if envs.VLLM_ECHO_DEBUG:
                 logger.info(
-                    "ECHO [num_computed_fix] req_id=%s %s->%s "
+                    "ECHO [num_computed_sync] req_id=%s %s->%s reason=%s "
                     "num_prompt=%s num_output=%s valid_out=%s",
                     req_id,
                     current,
-                    expected,
+                    new_val,
+                    reason,
                     num_prompt,
                     num_output,
                     valid_out,
@@ -2473,6 +2516,21 @@ class NPUModelRunner(GPUModelRunner):
                 if spec_decode_metadata is not None
                 else None,
             )
+
+        if envs.VLLM_ECHO_ENABLED and self.echo_kv_unconfirmed:
+            for req_id, tokens in zip(
+                req_ids_output_copy, valid_sampled_token_ids
+            ):
+                if req_id not in self.echo_kv_unconfirmed:
+                    continue
+                if tokens and tokens[0] > 0:
+                    self.echo_kv_unconfirmed.discard(req_id)
+                    if envs.VLLM_ECHO_DEBUG:
+                        logger.info(
+                            "ECHO [kv_confirmed] req_id=%s first_token=%s",
+                            req_id,
+                            tokens[0],
+                        )
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
