@@ -1117,7 +1117,6 @@ class NPUModelRunner(GPUModelRunner):
                 dict(scheduler_output.scheduled_spec_decode_tokens),
             )
 
-        new_total = 0
         trim_details = []
         for req_id, old_num_scheduled_tokens in list(
             scheduler_output.num_scheduled_tokens.items()
@@ -1127,7 +1126,6 @@ class NPUModelRunner(GPUModelRunner):
             # echo_cu_draft_tokens; defaulting to 0 would collapse their
             # schedule to a single token (e.g. 2673 -> 1).
             if req_id not in self.echo_cu_draft_tokens:
-                new_total += old_num_scheduled_tokens
                 continue
 
             draft_token_num = self.echo_cu_draft_tokens[req_id]
@@ -1141,7 +1139,6 @@ class NPUModelRunner(GPUModelRunner):
 
             new_num_scheduled_tokens = len(kept_spec_tokens) + 1
             scheduler_output.num_scheduled_tokens[req_id] = new_num_scheduled_tokens
-            new_total += new_num_scheduled_tokens
             if envs.VLLM_ECHO_DEBUG:
                 trim_details.append(
                     {
@@ -1154,7 +1151,9 @@ class NPUModelRunner(GPUModelRunner):
                         "new_sched": new_num_scheduled_tokens,
                     }
                 )
-        scheduler_output.total_num_scheduled_tokens = new_total
+        scheduler_output.total_num_scheduled_tokens = sum(
+            scheduler_output.num_scheduled_tokens.values()
+        )
 
         if envs.VLLM_ECHO_DEBUG:
             logger.info(
