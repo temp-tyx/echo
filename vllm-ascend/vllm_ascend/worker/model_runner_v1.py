@@ -605,6 +605,58 @@ class NPUModelRunner(GPUModelRunner):
 
         return num_reqs_padded
 
+    def _echo_log_slot_mapping_debug(
+        self,
+        num_reqs: int,
+        num_scheduled_tokens: np.ndarray,
+        total_num_scheduled_tokens: int,
+        positions_np: np.ndarray,
+    ) -> None:
+        """Log slot_mapping inputs to compare baseline vs ECHO at step 3."""
+        blk_tbl = self.input_batch.block_table[0]
+        block_size = blk_tbl.block_size
+        slot_map = blk_tbl.slot_mapping.gpu[:total_num_scheduled_tokens].detach().cpu()
+        pos_gpu = self.positions[:total_num_scheduled_tokens].detach().cpu()
+        pos_cpu = positions_np[:total_num_scheduled_tokens]
+        pos_drift = (pos_gpu.to(torch.int64) - torch.from_numpy(pos_cpu).to(torch.int64)).tolist()
+        nc_cpu = self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist()
+        nc_gpu = self.num_computed_tokens[:num_reqs].detach().cpu().tolist()
+        prev_drafts = self.prev_num_draft_tokens.np[:num_reqs].tolist()
+        req_info = []
+        for r_idx, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            nc = int(self.input_batch.num_computed_tokens_cpu[r_idx])
+            bi = nc // block_size
+            phys = blk_tbl.block_table.cpu[r_idx, bi : bi + 2].tolist()
+            slot_at_nc = (
+                int(phys[0]) * block_size + (nc % block_size)
+                if phys and phys[0] > 0
+                else None
+            )
+            req_info.append(
+                {
+                    "req_id": req_id,
+                    "num_computed_cpu": nc,
+                    "num_computed_gpu": int(nc_gpu[r_idx]),
+                    "prev_drafts": prev_drafts[r_idx],
+                    "block_idx": bi,
+                    "phys_blocks": phys,
+                    "slot_at_num_computed": slot_at_nc,
+                }
+            )
+        logger.info(
+            "ECHO [slot_mapping] req_ids=%s num_scheduled=%s "
+            "positions_cpu=%s positions_gpu=%s pos_drift=%s "
+            "slot_mapping=%s block_table=%s block_size=%s",
+            self.input_batch.req_ids[:num_reqs],
+            num_scheduled_tokens[:num_reqs].tolist(),
+            pos_cpu.tolist(),
+            pos_gpu.tolist(),
+            pos_drift,
+            slot_map.tolist(),
+            req_info,
+            block_size,
+        )
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -979,6 +1031,13 @@ class NPUModelRunner(GPUModelRunner):
                 self.query_start_loc.gpu[: num_reqs + 1],
                 self.positions[:total_num_scheduled_tokens],
             )
+            if envs.VLLM_ECHO_DEBUG:
+                self._echo_log_slot_mapping_debug(
+                    num_reqs,
+                    num_scheduled_tokens,
+                    total_num_scheduled_tokens,
+                    positions_np,
+                )
 
         if self.use_async_spec_decode and (self.uses_mrope or self.uses_xdrope_dim > 0):
             drift = self.num_computed_tokens[req_indices_gpu].to(
