@@ -96,12 +96,20 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     _runnable: ACLGraphWrapper | Callable
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device, pass_hidden_states_to_model: bool, runner=None):
-        # ECHO draft propose may exceed user-configured num_speculative_tokens.
-        # Expand the speculative token budget for proposer/runner buffers only.
-        # This is independent from whether a particular forward hits NaN.
-        if envs.VLLM_ECHO_ENABLED:
-            vllm_config.speculative_config.num_speculative_tokens = envs.VLLM_ECHO_MAX_SPEC_NUM
+        # Do not mutate vllm_config.speculative_config.num_speculative_tokens here.
+        # Target model / runner must keep the user-configured MTP depth; only the
+        # draft proposer expands buffers up to VLLM_ECHO_MAX_SPEC_NUM.
         super().__init__(vllm_config, device, pass_hidden_states_to_model, runner=runner)
+
+        self._target_num_speculative_tokens = self.speculative_config.num_speculative_tokens
+        if envs.VLLM_ECHO_ENABLED:
+            self._echo_draft_max_tokens = envs.VLLM_ECHO_MAX_SPEC_NUM
+            self.num_speculative_tokens = max(
+                self._echo_draft_max_tokens,
+                self._target_num_speculative_tokens,
+            )
+        else:
+            self._echo_draft_max_tokens = self.num_speculative_tokens
 
         # Assign runner before it's used in the methods below
         self.runner = runner

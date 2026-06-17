@@ -1240,13 +1240,14 @@ class NPUModelRunner(GPUModelRunner):
             )
         logger.info(
             "ECHO [draft] step=%s draft_step=%s batch_size=%s "
-            "max_spec_num=%s k_max=%s steps_multiplier=%s "
+            "target_num_spec_tokens=%s echo_draft_max=%s k_max=%s steps_multiplier=%s "
             "runner_num_spec_tokens=%s decode_token_per_req=%s "
             "echo_cu_draft_tokens=%s per_req=%s",
             self._echo_debug_step,
             draft_step,
             batch_size,
-            envs.VLLM_ECHO_MAX_SPEC_NUM,
+            self.speculative_config.num_speculative_tokens,
+            getattr(self.drafter, "_echo_draft_max_tokens", None),
             envs.VLLM_ECHO_K_MAX,
             envs.VLLM_ECHO_STEPS_MULTIPLIER,
             getattr(self, "num_spec_tokens", None),
@@ -2081,134 +2082,141 @@ class NPUModelRunner(GPUModelRunner):
         elif self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model():
             echo_k_max = envs.VLLM_ECHO_K_MAX
             batch_size = spec_decode_common_attn_metadata.batch_size()
-            draft_step = min(
-                max(envs.VLLM_ECHO_STEPS_MULTIPLIER * echo_k_max // batch_size, 1),
+            draft_max = getattr(
+                self.drafter,
+                "_echo_draft_max_tokens",
                 self.drafter.num_speculative_tokens,
             )
+            draft_step = min(
+                max(envs.VLLM_ECHO_STEPS_MULTIPLIER * echo_k_max // batch_size, 1),
+                draft_max,
+            )
+            draft_num_spec_restore = self.drafter.num_speculative_tokens
             self.drafter.num_speculative_tokens = draft_step
-            # TODO: gpu_model_runner
             self.num_spec_tokens = draft_step
-            self.speculative_config.num_speculative_tokens = draft_step
             self._echo_last_draft_step = draft_step
             self._echo_last_draft_batch_size = batch_size
             common_attn_metadata = spec_decode_common_attn_metadata
             sampled_token_ids = valid_sampled_token_ids
 
-            if self.vllm_config.speculative_config.disable_padded_drafter_batch:
-                # When padded-batch is disabled, the sampled_token_ids should be
-                # the cpu-side list[list[int]] of valid sampled tokens for each
-                # request, with invalid requests having empty lists.
-                assert isinstance(sampled_token_ids, list), (
-                    "sampled_token_ids should be a python list whenpadded-batch is disabled."
-                )
-                assert self.drafter is not None
-                next_token_ids = self.drafter.prepare_next_token_ids_cpu(
-                    sampled_token_ids, self.requests, self.input_batch, scheduler_output.num_scheduled_tokens
-                )
-            else:
-                # When using padded-batch, the sampled_token_ids should be
-                # the gpu tensor of sampled tokens for each request, of shape
-                # (num_reqs, num_spec_tokens + 1) with rejected tokens having
-                # value -1.
-                assert isinstance(sampled_token_ids, torch.Tensor), (
-                    "sampled_token_ids should be a torch.Tensor whenpadded-batch is enabled."
-                )
-                assert self.drafter is not None
-                next_token_ids, valid_sampled_tokens_count = self.drafter.prepare_next_token_ids_padded(
-                    sampled_token_ids,
-                    self.requests,
-                    self.input_batch,
-                    self.discard_request_indices.gpu,
-                    self.num_discarded_requests,
-                )
-                self._copy_valid_sampled_token_count(next_token_ids, valid_sampled_tokens_count)
-
-            req_scheduled_tokens = scheduler_output.num_scheduled_tokens
-            if self.use_cp:
-                long_seq_metadata = self.long_seq_metadata  # type: ignore
-                input_ids_pcp_full = self.pcp_manager.input_ids_pcp_full.gpu
-                query_start_loc_pcp_full = self.pcp_manager.query_start_loc_pcp_full.gpu
-                query_start_loc_pcp_full_cpu = self.pcp_manager.query_start_loc_pcp_full.cpu
-                num_reqs = self.input_batch.num_reqs
-                num_prefill_reqs = self.pcp_manager.num_prefill_reqs
-                num_decode_reqs = self.pcp_manager.num_decode_reqs
-            else:
-                long_seq_metadata = None  # type: ignore
-                num_prefill_reqs = 0
-                num_decode_reqs = 0
-
-            num_rejected_tokens_gpu = None
-            if spec_decode_metadata is None:
-                # update pcp related params
-                if self.pcp_size > 1:
-                    token_indices_to_sample = query_start_loc_pcp_full[1 : num_reqs + 1] - 1
-                    target_token_ids = input_ids_pcp_full[:num_scheduled_tokens]
-                    target_positions = self._get_positions(num_scheduled_tokens)
-                    target_hidden_states = hidden_states
-                    if self.use_aux_hidden_state_outputs:
-                        target_hidden_states = torch.cat([h for h in aux_hidden_states], dim=-1)
-                else:
-                    token_indices_to_sample = None
-                    # input_ids can be None for multimodal models.
-                    target_token_ids = self.input_ids.gpu[:num_scheduled_tokens]
-                    target_positions = self._get_positions(num_scheduled_tokens)
-                    if self.use_aux_hidden_state_outputs:
-                        target_hidden_states = torch.cat([h[:num_scheduled_tokens] for h in aux_hidden_states], dim=-1)
-                    else:
-                        target_hidden_states = hidden_states[:num_scheduled_tokens]
-            else:
-                if self.pcp_size > 1:
-                    assert common_attn_metadata is not None
-                    common_attn_metadata.query_start_loc_cpu[: num_reqs + 1] = query_start_loc_pcp_full_cpu[
-                        : num_reqs + 1
-                    ]
-                    assert common_attn_metadata is not None
-                    common_attn_metadata.query_start_loc[: num_reqs + 1] = query_start_loc_pcp_full[: num_reqs + 1]
+            try:
                 if self.vllm_config.speculative_config.disable_padded_drafter_batch:
-                    # NOTE: Currently, MTP-fullgraph is incompatibility with pcp
-                    token_indices_to_sample = None
+                    # When padded-batch is disabled, the sampled_token_ids should be
+                    # the cpu-side list[list[int]] of valid sampled tokens for each
+                    # request, with invalid requests having empty lists.
+                    assert isinstance(sampled_token_ids, list), (
+                        "sampled_token_ids should be a python list whenpadded-batch is disabled."
+                    )
                     assert self.drafter is not None
-                    common_attn_metadata, token_indices = self.drafter.prepare_inputs(
-                        common_attn_metadata, sampled_token_ids, spec_decode_metadata.num_draft_tokens
+                    next_token_ids = self.drafter.prepare_next_token_ids_cpu(
+                        sampled_token_ids, self.requests, self.input_batch, scheduler_output.num_scheduled_tokens
                     )
                 else:
-                    assert self.drafter is not None
-                    common_attn_metadata, token_indices, token_indices_to_sample, num_rejected_tokens_gpu = (
-                        self.drafter.prepare_inputs_padded(
-                            common_attn_metadata, spec_decode_metadata, valid_sampled_tokens_count
-                        )
+                    # When using padded-batch, the sampled_token_ids should be
+                    # the gpu tensor of sampled tokens for each request, of shape
+                    # (num_reqs, num_spec_tokens + 1) with rejected tokens having
+                    # value -1.
+                    assert isinstance(sampled_token_ids, torch.Tensor), (
+                        "sampled_token_ids should be a torch.Tensor whenpadded-batch is enabled."
                     )
-                if self.pcp_size > 1:
-                    target_token_ids = input_ids_pcp_full[token_indices]
-                    target_positions = positions
-                    target_hidden_states = hidden_states
-                    if self.use_aux_hidden_state_outputs:
-                        target_hidden_states = torch.cat([h for h in aux_hidden_states], dim=-1)
+                    assert self.drafter is not None
+                    next_token_ids, valid_sampled_tokens_count = self.drafter.prepare_next_token_ids_padded(
+                        sampled_token_ids,
+                        self.requests,
+                        self.input_batch,
+                        self.discard_request_indices.gpu,
+                        self.num_discarded_requests,
+                    )
+                    self._copy_valid_sampled_token_count(next_token_ids, valid_sampled_tokens_count)
+
+                req_scheduled_tokens = scheduler_output.num_scheduled_tokens
+                if self.use_cp:
+                    long_seq_metadata = self.long_seq_metadata  # type: ignore
+                    input_ids_pcp_full = self.pcp_manager.input_ids_pcp_full.gpu
+                    query_start_loc_pcp_full = self.pcp_manager.query_start_loc_pcp_full.gpu
+                    query_start_loc_pcp_full_cpu = self.pcp_manager.query_start_loc_pcp_full.cpu
+                    num_reqs = self.input_batch.num_reqs
+                    num_prefill_reqs = self.pcp_manager.num_prefill_reqs
+                    num_decode_reqs = self.pcp_manager.num_decode_reqs
                 else:
-                    target_token_ids = self.input_ids.gpu[token_indices]
-                    target_positions = self._get_positions(token_indices)
-                    if self.use_aux_hidden_state_outputs:
-                        target_hidden_states = torch.cat([h[token_indices] for h in aux_hidden_states], dim=-1)
+                    long_seq_metadata = None  # type: ignore
+                    num_prefill_reqs = 0
+                    num_decode_reqs = 0
+
+                num_rejected_tokens_gpu = None
+                if spec_decode_metadata is None:
+                    # update pcp related params
+                    if self.pcp_size > 1:
+                        token_indices_to_sample = query_start_loc_pcp_full[1 : num_reqs + 1] - 1
+                        target_token_ids = input_ids_pcp_full[:num_scheduled_tokens]
+                        target_positions = self._get_positions(num_scheduled_tokens)
+                        target_hidden_states = hidden_states
+                        if self.use_aux_hidden_state_outputs:
+                            target_hidden_states = torch.cat([h for h in aux_hidden_states], dim=-1)
                     else:
-                        target_hidden_states = hidden_states[token_indices]
-            assert self.drafter is not None
-            draft_token_ids = self.drafter._propose(
-                target_token_ids=target_token_ids,
-                target_positions=target_positions,
-                target_hidden_states=target_hidden_states,
-                next_token_ids=next_token_ids,
-                token_indices_to_sample=token_indices_to_sample,
-                common_attn_metadata=common_attn_metadata,
-                target_model_batch_desc=target_model_batch_desc,
-                sampling_metadata=sampling_metadata,
-                req_scheduled_tokens=req_scheduled_tokens,
-                long_seq_metadata=long_seq_metadata,
-                num_prefill_reqs=num_prefill_reqs,
-                num_decode_reqs=num_decode_reqs,
-                scheduler_output=scheduler_output,
-                num_scheduled_tokens=num_scheduled_tokens,
-                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
-            )
+                        token_indices_to_sample = None
+                        # input_ids can be None for multimodal models.
+                        target_token_ids = self.input_ids.gpu[:num_scheduled_tokens]
+                        target_positions = self._get_positions(num_scheduled_tokens)
+                        if self.use_aux_hidden_state_outputs:
+                            target_hidden_states = torch.cat([h[:num_scheduled_tokens] for h in aux_hidden_states], dim=-1)
+                        else:
+                            target_hidden_states = hidden_states[:num_scheduled_tokens]
+                else:
+                    if self.pcp_size > 1:
+                        assert common_attn_metadata is not None
+                        common_attn_metadata.query_start_loc_cpu[: num_reqs + 1] = query_start_loc_pcp_full_cpu[
+                            : num_reqs + 1
+                        ]
+                        assert common_attn_metadata is not None
+                        common_attn_metadata.query_start_loc[: num_reqs + 1] = query_start_loc_pcp_full[: num_reqs + 1]
+                    if self.vllm_config.speculative_config.disable_padded_drafter_batch:
+                        # NOTE: Currently, MTP-fullgraph is incompatibility with pcp
+                        token_indices_to_sample = None
+                        assert self.drafter is not None
+                        common_attn_metadata, token_indices = self.drafter.prepare_inputs(
+                            common_attn_metadata, sampled_token_ids, spec_decode_metadata.num_draft_tokens
+                        )
+                    else:
+                        assert self.drafter is not None
+                        common_attn_metadata, token_indices, token_indices_to_sample, num_rejected_tokens_gpu = (
+                            self.drafter.prepare_inputs_padded(
+                                common_attn_metadata, spec_decode_metadata, valid_sampled_tokens_count
+                            )
+                        )
+                    if self.pcp_size > 1:
+                        target_token_ids = input_ids_pcp_full[token_indices]
+                        target_positions = positions
+                        target_hidden_states = hidden_states
+                        if self.use_aux_hidden_state_outputs:
+                            target_hidden_states = torch.cat([h for h in aux_hidden_states], dim=-1)
+                    else:
+                        target_token_ids = self.input_ids.gpu[token_indices]
+                        target_positions = self._get_positions(token_indices)
+                        if self.use_aux_hidden_state_outputs:
+                            target_hidden_states = torch.cat([h[token_indices] for h in aux_hidden_states], dim=-1)
+                        else:
+                            target_hidden_states = hidden_states[token_indices]
+                assert self.drafter is not None
+                draft_token_ids = self.drafter._propose(
+                    target_token_ids=target_token_ids,
+                    target_positions=target_positions,
+                    target_hidden_states=target_hidden_states,
+                    next_token_ids=next_token_ids,
+                    token_indices_to_sample=token_indices_to_sample,
+                    common_attn_metadata=common_attn_metadata,
+                    target_model_batch_desc=target_model_batch_desc,
+                    sampling_metadata=sampling_metadata,
+                    req_scheduled_tokens=req_scheduled_tokens,
+                    long_seq_metadata=long_seq_metadata,
+                    num_prefill_reqs=num_prefill_reqs,
+                    num_decode_reqs=num_decode_reqs,
+                    scheduler_output=scheduler_output,
+                    num_scheduled_tokens=num_scheduled_tokens,
+                    num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                )
+            finally:
+                self.drafter.num_speculative_tokens = draft_num_spec_restore
         else:
             raise ValueError(f"Unknown speculative decoding method: {self.speculative_config.method}")
 
