@@ -17,10 +17,12 @@
 
 from dataclasses import dataclass
 from enum import Enum
+import logging
 
 import torch
 import torch_npu
 import vllm.envs as envs_vllm
+from vllm_ascend import envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from vllm.utils.math_utils import cdiv
@@ -64,6 +66,8 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
 from vllm_ascend.utils import weak_ref_tensors
 from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
+
+logger = logging.getLogger(__name__)
 
 # default max value of sliding window size
 SWA_INT_MAX = 2147483647
@@ -1024,6 +1028,47 @@ class AscendAttentionBackendImpl(AttentionImpl):
             slot_mapping=slot_mapping,
         )
 
+    def _echo_log_kv_write_debug(
+        self,
+        attn_metadata: AscendMetadata,
+        layer_idx: int,
+    ) -> None:
+        if not envs.VLLM_ECHO_DEBUG:
+            return
+        if self.key_cache is None or self.value_cache is None:
+            return
+        slots = attn_metadata.slot_mapping[: attn_metadata.num_actual_tokens]
+        if slots.numel() == 0:
+            return
+        num_tokens = slots.numel()
+        slots_cpu = slots.detach().cpu()
+        sample_indices = [0, num_tokens // 2, num_tokens - 1] if num_tokens > 2 else list(range(num_tokens))
+        sample_slots = [int(slots_cpu[i]) for i in sample_indices]
+        key_samples = []
+        val_samples = []
+        has_nan_key = False
+        has_nan_val = False
+        for s in sample_slots:
+            k_slice = self.key_cache[s].detach()
+            v_slice = self.value_cache[s].detach()
+            key_samples.append(float(k_slice.abs().max().item()) if k_slice.numel() > 0 else 0.0)
+            val_samples.append(float(v_slice.abs().max().item()) if v_slice.numel() > 0 else 0.0)
+            if torch.isnan(k_slice).any():
+                has_nan_key = True
+            if torch.isnan(v_slice).any():
+                has_nan_val = True
+        logger.info(
+            "ECHO [kv_write] layer=%s num_tokens=%s sample_slots=%s key_maxabs=%s val_maxabs=%s has_nan_key=%s has_nan_val=%s attn_state=%s",
+            layer_idx,
+            num_tokens,
+            sample_slots,
+            key_samples,
+            val_samples,
+            has_nan_key,
+            has_nan_val,
+            attn_metadata.attn_state,
+        )
+
     def reshape_and_cache(
         self,
         query: torch.Tensor,
@@ -1128,6 +1173,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
             query, key, value, output_padded = self.reshape_and_cache(
                 query, key, value, kv_cache, attn_metadata, output
             )
+            if envs.VLLM_ECHO_DEBUG:
+                self._echo_log_kv_write_debug(attn_metadata, self.layerIndex)
         # pooling model branch
         if attn_metadata.model_runner_type == "pooling" and not attn_metadata.causal:
             attn_output = self._forward_encoder_attention(query, key, value, attn_metadata, output)
@@ -1179,6 +1226,8 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
                     float_key, float_value = key, value
                 key, value = self._quantize_kv_to_int8(key, value, layer, attn_metadata.num_actual_tokens)
                 query, key, value, _ = self.reshape_and_cache(query, key, value, kv_cache, attn_metadata, output)
+                if envs.VLLM_ECHO_DEBUG:
+                    self._echo_log_kv_write_debug(attn_metadata, self.layerIndex)
             # pooling model branch
             if attn_metadata.model_runner_type == "pooling":
                 attn_output = self._forward_encoder_attention(query, key, value, attn_metadata, output)
@@ -1209,6 +1258,8 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
                     query, key, value, output_padded = self.reshape_and_cache(
                         query, key, value, kv_cache, attn_metadata, output
                     )
+                    if envs.VLLM_ECHO_DEBUG:
+                        self._echo_log_kv_write_debug(attn_metadata, self.layerIndex)
                 # pooling model branch
                 if attn_metadata.model_runner_type == "pooling":
                     attn_output = self._forward_encoder_attention(query, key, value, attn_metadata, output)
@@ -1224,6 +1275,8 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
                 if key is not None and value is not None:
                     key, value = self._quantize_kv_to_int8(key, value, layer, attn_metadata.num_actual_tokens)
                     query, key, value, _ = self.reshape_and_cache(query, key, value, kv_cache, attn_metadata, output)
+                    if envs.VLLM_ECHO_DEBUG:
+                        self._echo_log_kv_write_debug(attn_metadata, self.layerIndex)
                 # pooling model branch
                 if attn_metadata.model_runner_type == "pooling":
                     attn_output = self._forward_encoder_attention(query, key, value, attn_metadata, output)
