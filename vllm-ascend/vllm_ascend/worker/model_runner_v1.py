@@ -1110,7 +1110,11 @@ class NPUModelRunner(GPUModelRunner):
             per_req,
         )
 
-    def _echo_log_kv_probe_draft(self, phase: str) -> None:
+    def _echo_log_kv_probe_draft(
+        self,
+        phase: str,
+        scheduler_output: "SchedulerOutput | None" = None,
+    ) -> None:
         """Probe target KV at prefill/decode boundary before/after draft propose."""
         blk_tbl = self.input_batch.block_table[0]
         block_size = blk_tbl.block_size
@@ -1129,16 +1133,34 @@ class NPUModelRunner(GPUModelRunner):
 
         per_req = []
         nc_gpu_list = self.num_computed_tokens[:num_reqs].detach().cpu().tolist()
+        seq_gpu_list = self.seq_lens[:num_reqs].detach().cpu().tolist()
         for r_idx in range(num_reqs):
+            req_id = self.input_batch.req_ids[r_idx]
             nc_cpu = int(self.input_batch.num_computed_tokens_cpu[r_idx])
             nc_gpu = int(nc_gpu_list[r_idx])
-            # After target forward, GPU num_computed is authoritative in async
-            # spec decode; CPU may lag until next _prepare_inputs sync.
-            nc = nc_gpu if self.use_async_spec_decode else nc_cpu
-            if not self.use_async_spec_decode and nc_gpu != nc_cpu:
-                nc = max(nc_gpu, nc_cpu)
+            seq_gpu = int(seq_gpu_list[r_idx])
+            num_prompt = int(self.input_batch.num_prompt_tokens[r_idx])
+            num_sched = 0
+            if scheduler_output is not None:
+                num_sched = int(
+                    scheduler_output.num_scheduled_tokens.get(req_id, 0)
+                )
+
+            # After target forward, async spec decode updates num_computed in
+            # _update_states_after_model_execute (after propose). seq_lens was
+            # set to nc_start + num_scheduled in _prepare_inputs.
+            nc = max(nc_cpu, nc_gpu)
+            nc_inferred_from = None
+            if nc == 0 and seq_gpu > 0 and seq_gpu <= num_prompt:
+                nc = seq_gpu
+                nc_inferred_from = "seq_lens_prefill"
+            elif nc == 0 and num_sched > 0:
+                nc = num_sched
+                nc_inferred_from = "num_scheduled"
+
             n_blocks = int(blk_tbl.num_blocks_per_row[r_idx])
             phys_row = blk_tbl.block_table.cpu[r_idx, :n_blocks].tolist()
+            first_phys_block = phys_row[0] if phys_row else None
 
             def slot_at_pos(pos: int) -> int | None:
                 if pos < 0:
@@ -1174,10 +1196,15 @@ class NPUModelRunner(GPUModelRunner):
 
             per_req.append(
                 {
-                    "req_id": self.input_batch.req_ids[r_idx],
+                    "req_id": req_id,
                     "num_computed_cpu": nc_cpu,
                     "num_computed_gpu": nc_gpu,
+                    "seq_len_gpu": seq_gpu,
+                    "num_prompt": num_prompt,
+                    "num_scheduled": num_sched,
                     "num_computed_used": nc,
+                    "nc_inferred_from": nc_inferred_from,
+                    "first_phys_block": first_phys_block,
                     "kv": layer_stats,
                 }
             )
@@ -2657,7 +2684,7 @@ class NPUModelRunner(GPUModelRunner):
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
             if envs.VLLM_ECHO_DEBUG:
-                self._echo_log_kv_probe_draft("before_propose")
+                self._echo_log_kv_probe_draft("before_propose", scheduler_output)
             self._draft_token_ids = self.propose_draft_token_ids(
                 sampled_token_ids,
                 self.input_batch.sampling_metadata,
@@ -2672,7 +2699,7 @@ class NPUModelRunner(GPUModelRunner):
                 batch_desc,
             )
             if envs.VLLM_ECHO_DEBUG:
-                self._echo_log_kv_probe_draft("after_propose")
+                self._echo_log_kv_probe_draft("after_propose", scheduler_output)
             mask = (self._draft_token_ids != -1)
             self.echo_cu_draft_tokens = {
                 req_id: int(count)
