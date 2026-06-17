@@ -1030,6 +1030,21 @@ class NPUModelRunner(GPUModelRunner):
                 self.query_start_loc.gpu[: num_reqs + 1],
                 self.positions[:total_num_scheduled_tokens],
             )
+            if envs.VLLM_ECHO_DEBUG and envs.VLLM_ECHO_ENABLED:
+                slot_map = self.input_batch.block_table.slot_mapping.gpu[
+                    :total_num_scheduled_tokens
+                ]
+                logger.info(
+                    "ECHO [slot_mapping] req_ids=%s num_scheduled=%s "
+                    "positions_1d=%s slot_mapping=%s",
+                    self.input_batch.req_ids,
+                    num_scheduled_tokens.tolist(),
+                    self.positions[:total_num_scheduled_tokens]
+                    .detach()
+                    .cpu()
+                    .tolist(),
+                    slot_map.detach().cpu().tolist(),
+                )
 
         if self.use_async_spec_decode and (self.uses_mrope or self.uses_xdrope_dim > 0):
             drift = self.num_computed_tokens[req_indices_gpu].to(
