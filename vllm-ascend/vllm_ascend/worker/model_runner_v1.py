@@ -1110,6 +1110,77 @@ class NPUModelRunner(GPUModelRunner):
             per_req,
         )
 
+    def _echo_log_kv_probe_draft(self, phase: str) -> None:
+        """Probe target KV at prefill/decode boundary before/after draft propose."""
+        blk_tbl = self.input_batch.block_table[0]
+        block_size = blk_tbl.block_size
+        if self._echo_get_k_cache(0) is None:
+            logger.info(
+                "ECHO [kv_probe_draft] step=%s phase=%s skip reason=no_kv_cache",
+                self._echo_debug_step,
+                phase,
+            )
+            return
+
+        num_reqs = self.input_batch.num_reqs
+        layer_indices = [0]
+        if len(self.kv_caches) > 1:
+            layer_indices.append(len(self.kv_caches) - 1)
+
+        per_req = []
+        for r_idx in range(num_reqs):
+            nc = int(self.input_batch.num_computed_tokens_cpu[r_idx])
+            n_blocks = int(blk_tbl.num_blocks_per_row[r_idx])
+            phys_row = blk_tbl.block_table.cpu[r_idx, :n_blocks].tolist()
+
+            def slot_at_pos(pos: int) -> int | None:
+                if pos < 0:
+                    return None
+                bi = pos // block_size
+                if bi >= len(phys_row) or phys_row[bi] <= 0:
+                    return None
+                return int(phys_row[bi]) * block_size + (pos % block_size)
+
+            probe_slots: list[tuple[str, int | None]] = []
+            if nc > 0:
+                probe_slots.append(("prefill_last", slot_at_pos(nc - 1)))
+            for offset in range(4):
+                probe_slots.append((f"pos_{nc + offset}", slot_at_pos(nc + offset)))
+
+            layer_stats: dict[str, dict] = {}
+            for layer_idx in layer_indices:
+                k_layer = self._echo_get_k_cache(layer_idx)
+                if k_layer is None:
+                    continue
+                slot_stats: dict[str, dict] = {}
+                seen: set[int] = set()
+                for label, s in probe_slots:
+                    if s is None or s in seen:
+                        continue
+                    seen.add(s)
+                    sl = self._echo_kv_slice_at_slot(k_layer, s, block_size)
+                    stat = {"slot": s, **self._echo_tensor_stats(sl)}
+                    if stat.get("all_zero") and label != "prefill_last":
+                        stat["note"] = "unwritten spec-decode slot"
+                    slot_stats[label] = stat
+                layer_stats[f"layer_{layer_idx}"] = slot_stats
+
+            per_req.append(
+                {
+                    "req_id": self.input_batch.req_ids[r_idx],
+                    "num_computed": nc,
+                    "kv": layer_stats,
+                }
+            )
+
+        logger.info(
+            "ECHO [kv_probe_draft] step=%s phase=%s block_size=%s per_req=%s",
+            self._echo_debug_step,
+            phase,
+            block_size,
+            per_req,
+        )
+
     def _echo_log_draft_debug(
         self,
         draft_token_ids: torch.Tensor | None,
@@ -2576,6 +2647,8 @@ class NPUModelRunner(GPUModelRunner):
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
+            if envs.VLLM_ECHO_DEBUG:
+                self._echo_log_kv_probe_draft("before_propose")
             self._draft_token_ids = self.propose_draft_token_ids(
                 sampled_token_ids,
                 self.input_batch.sampling_metadata,
@@ -2589,6 +2662,8 @@ class NPUModelRunner(GPUModelRunner):
                 sample_hidden_states,
                 batch_desc,
             )
+            if envs.VLLM_ECHO_DEBUG:
+                self._echo_log_kv_probe_draft("after_propose")
             mask = (self._draft_token_ids != -1)
             self.echo_cu_draft_tokens = {
                 req_id: int(count)
