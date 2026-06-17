@@ -1031,7 +1031,7 @@ class NPUModelRunner(GPUModelRunner):
                 self.positions[:total_num_scheduled_tokens],
             )
             if envs.VLLM_ECHO_DEBUG and envs.VLLM_ECHO_ENABLED:
-                slot_map = self.input_batch.block_table.slot_mapping.gpu[
+                slot_map = self.input_batch.block_table[0].slot_mapping.gpu[
                     :total_num_scheduled_tokens
                 ]
                 logger.info(
