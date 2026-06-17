@@ -96,7 +96,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     _runnable: ACLGraphWrapper | Callable
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device, pass_hidden_states_to_model: bool, runner=None):
-        vllm_config.speculative_config.num_speculative_tokens = envs.VLLM_ECHO_MAX_SPEC_NUM
+        # ECHO draft propose may exceed user-configured num_speculative_tokens.
+        # Expand the speculative token budget for proposer/runner buffers only.
+        # This is independent from whether a particular forward hits NaN.
+        if envs.VLLM_ECHO_ENABLED:
+            vllm_config.speculative_config.num_speculative_tokens = envs.VLLM_ECHO_MAX_SPEC_NUM
         super().__init__(vllm_config, device, pass_hidden_states_to_model, runner=runner)
 
         # Assign runner before it's used in the methods below
@@ -1845,24 +1849,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         pruned_draft_ids = draft_token_ids.clone()
         pruned_draft_ids[~mask] = -1
 
-        return self._compact_echo_draft_rows(pruned_draft_ids)
-
-    @staticmethod
-    def _compact_echo_draft_rows(draft_token_ids: torch.Tensor) -> torch.Tensor:
-        """Left-align valid drafts after global top-k pruning.
-
-        Async spec-decode scatters drafts from flattened row prefix
-        ``[prev_index * num_spec_tokens, prev_index * num_spec_tokens + draft_len)``.
-        Pruning can leave ``-1`` holes in the middle; compact so scatter indices
-        match the kept tokens.
-        """
-        valid = draft_token_ids != -1
-        compacted = torch.full_like(draft_token_ids, -1)
-        for row_idx in range(draft_token_ids.shape[0]):
-            kept = draft_token_ids[row_idx][valid[row_idx]]
-            if kept.numel() > 0:
-                compacted[row_idx, : kept.numel()] = kept
-        return compacted
+        return pruned_draft_ids
 
 
 class AscendEagleProposer(EagleProposer, AscendSpecDecodeBaseProposer):

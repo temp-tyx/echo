@@ -626,6 +626,8 @@ class NPUModelRunner(GPUModelRunner):
         for r_idx, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
             nc = int(self.input_batch.num_computed_tokens_cpu[r_idx])
             bi = nc // block_size
+            n_blocks = int(blk_tbl.num_blocks_per_row[r_idx])
+            phys_row = blk_tbl.block_table.cpu[r_idx, :n_blocks].tolist()
             phys = blk_tbl.block_table.cpu[r_idx, bi : bi + 2].tolist()
             slot_at_nc = (
                 int(phys[0]) * block_size + (nc % block_size)
@@ -640,6 +642,7 @@ class NPUModelRunner(GPUModelRunner):
                     "prev_drafts": prev_drafts[r_idx],
                     "block_idx": bi,
                     "phys_blocks": phys,
+                    "block_table_row": phys_row,
                     "slot_at_num_computed": slot_at_nc,
                 }
             )
@@ -1430,7 +1433,10 @@ class NPUModelRunner(GPUModelRunner):
         elif self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model():
             echo_k_max = envs.VLLM_ECHO_K_MAX
             batch_size = spec_decode_common_attn_metadata.batch_size()
-            draft_step = min(max(envs.VLLM_ECHO_STEPS_MULTIPLIER * echo_k_max // batch_size, 1), self.drafter.num_speculative_tokens)
+            draft_step = min(
+                max(envs.VLLM_ECHO_STEPS_MULTIPLIER * echo_k_max // batch_size, 1),
+                self.drafter.num_speculative_tokens,
+            )
             self.drafter.num_speculative_tokens = draft_step
             # TODO: gpu_model_runner
             self.num_spec_tokens = draft_step
