@@ -643,6 +643,7 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         if envs.VLLM_ECHO_ENABLED:
+            self._echo_reconcile_async_output(scheduler_output)
             self._echo_fix_num_computed_lag(scheduler_output)
 
         assert total_num_scheduled_tokens > 0
@@ -934,7 +935,6 @@ class NPUModelRunner(GPUModelRunner):
             self.prev_num_draft_tokens.copy_to_gpu()
             self.num_computed_tokens[:num_reqs].copy_(
                 self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
-                non_blocking=True,
             )
             if envs.VLLM_ECHO_DEBUG:
                 logger.info(
@@ -1034,16 +1034,41 @@ class NPUModelRunner(GPUModelRunner):
                 slot_map = self.input_batch.block_table[0].slot_mapping.gpu[
                     :total_num_scheduled_tokens
                 ]
+                blk_tbl = self.input_batch.block_table[0]
+                block_size = blk_tbl.block_size
+                req_bt_info = []
+                for r_idx, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                    nc = int(self.input_batch.num_computed_tokens_cpu[r_idx])
+                    bi = nc // block_size
+                    phys = blk_tbl.block_table.cpu[r_idx, bi : bi + 2].tolist()
+                    slot_at_nc = (
+                        int(phys[0]) * block_size + (nc % block_size)
+                        if phys and phys[0] > 0
+                        else None
+                    )
+                    req_bt_info.append(
+                        {
+                            "req_id": req_id,
+                            "num_computed": nc,
+                            "block_idx": bi,
+                            "phys_blocks": phys,
+                            "slot_at_num_computed": slot_at_nc,
+                        }
+                    )
                 logger.info(
                     "ECHO [slot_mapping] req_ids=%s num_scheduled=%s "
-                    "positions_1d=%s slot_mapping=%s",
+                    "num_computed=%s positions_1d=%s slot_mapping=%s "
+                    "block_table=%s block_size=%s",
                     self.input_batch.req_ids,
                     num_scheduled_tokens.tolist(),
+                    self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist(),
                     self.positions[:total_num_scheduled_tokens]
                     .detach()
                     .cpu()
                     .tolist(),
                     slot_map.detach().cpu().tolist(),
+                    req_bt_info,
+                    block_size,
                 )
 
         if self.use_async_spec_decode and (self.uses_mrope or self.uses_xdrope_dim > 0):
@@ -1255,11 +1280,18 @@ class NPUModelRunner(GPUModelRunner):
     def _echo_resolve_sample_token(self, cur_index: int, req_id: str) -> tuple[int, str]:
         """Resolve the sample token for ECHO spec-decode input_ids scatter.
 
-        Returns (token_id, source_name). Async scheduling can leave
-        num_computed_tokens_cpu lagging behind accepted output tokens, so
-        output_token_ids / prev_sampled take priority over get_token_id.
+        Returns (token_id, source_name). The sample slot must match the token
+        at sequence index num_computed-1 (last token in KV). Prefer
+        get_token_id over prev_sampled to avoid feeding a sampled token that
+        was never written into the cache.
         """
         req_state = self.requests.get(req_id)
+        num_computed = int(self.input_batch.num_computed_tokens_cpu[cur_index])
+
+        if req_state is not None and num_computed > 0:
+            tok = req_state.get_token_id(num_computed - 1)
+            if tok > 0:
+                return tok, "get_token_id"
 
         if req_state is not None:
             for t in reversed(req_state.output_token_ids):
@@ -1274,13 +1306,6 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 if tok > 0:
                     return tok, "prev_sampled"
-
-        if req_state is not None:
-            num_computed = int(self.input_batch.num_computed_tokens_cpu[cur_index])
-            if num_computed > 0:
-                tok = req_state.get_token_id(num_computed - 1)
-                if tok > 0:
-                    return tok, "get_token_id"
 
         num_out = int(self.input_batch.num_tokens_no_spec[cur_index])
         if num_out > 0:
@@ -1309,6 +1334,53 @@ class NPUModelRunner(GPUModelRunner):
                 if req_index is not None:
                     self.input_batch.spec_token_ids[req_index].clear()
 
+    def _echo_reconcile_async_output(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> None:
+        """Recover output_token_ids cleared by async scheduling.
+
+        When num_output > 0 but output_token_ids are empty placeholders,
+        prev_sampled holds the last accepted token from the previous step.
+        """
+        if not envs.VLLM_ECHO_ENABLED:
+            return
+        if self.input_batch.prev_sampled_token_ids is None:
+            return
+        req_data = scheduler_output.scheduled_cached_reqs
+        for i, req_id in enumerate(req_data.req_ids):
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                continue
+            num_output = int(req_data.num_output_tokens[i])
+            if num_output <= 0:
+                continue
+            valid_out = sum(1 for t in req_state.output_token_ids if t > 0)
+            if valid_out >= num_output:
+                continue
+            req_index = self.input_batch.req_id_to_index.get(req_id)
+            if req_index is None:
+                continue
+            prev_idx = self.input_batch.prev_req_id_to_index.get(req_id, -1)
+            if prev_idx < 0:
+                continue
+            tok = int(
+                self.input_batch.prev_sampled_token_ids[prev_idx, 0].item()
+            )
+            if tok <= 0:
+                continue
+            missing = num_output - valid_out
+            req_state.output_token_ids.extend([tok] * missing)
+            if envs.VLLM_ECHO_DEBUG:
+                logger.info(
+                    "ECHO [async_reconcile] req_id=%s num_output=%s "
+                    "valid_out=%s recovered=%s output_len=%s",
+                    req_id,
+                    num_output,
+                    valid_out,
+                    tok,
+                    len(req_state.output_token_ids),
+                )
+
     def _echo_fix_num_computed_lag(
         self, scheduler_output: "SchedulerOutput"
     ) -> None:
@@ -1332,8 +1404,9 @@ class NPUModelRunner(GPUModelRunner):
             if current != num_prompt or num_output <= 0:
                 continue
             valid_out = sum(1 for t in req_state.output_token_ids if t > 0)
-            increment = valid_out if valid_out > 0 else 1
-            expected = num_prompt + increment
+            if valid_out <= 0:
+                continue
+            expected = num_prompt + valid_out
             req_data.num_computed_tokens[i] = expected
             req_state.num_computed_tokens = expected
             if req_index is not None:
