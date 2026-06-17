@@ -485,6 +485,40 @@ class NPUModelRunner(GPUModelRunner):
         # at num_prompt may not have been written yet; skip num_computed bump.
         self.echo_kv_unconfirmed: set[str] = set()
 
+    def _echo_sanitize_output_ids(self, req_state) -> int:
+        """Drop async -1 placeholders; return count of valid output tokens."""
+        positives = [t for t in req_state.output_token_ids if t > 0]
+        if len(positives) != len(req_state.output_token_ids):
+            req_state.output_token_ids = positives
+        return len(positives)
+
+    def _echo_reset_decode_state(
+        self, req_id: str, scheduler_output: "SchedulerOutput"
+    ) -> None:
+        """Reset req to prompt boundary after failed KV-unconfirmed decode."""
+        req_state = self.requests.get(req_id)
+        if req_state is None:
+            return
+        num_prompt = int(req_state.num_prompt_tokens)
+        req_state.output_token_ids.clear()
+        req_state.num_computed_tokens = num_prompt
+        req_data = scheduler_output.scheduled_cached_reqs
+        for i, rid in enumerate(req_data.req_ids):
+            if rid == req_id:
+                req_data.num_computed_tokens[i] = num_prompt
+                break
+        req_index = self.input_batch.req_id_to_index.get(req_id)
+        if req_index is not None:
+            self.input_batch.num_computed_tokens_cpu[req_index] = num_prompt
+            self.input_batch.num_tokens_no_spec[req_index] = num_prompt
+        self.echo_kv_unconfirmed.discard(req_id)
+        if envs.VLLM_ECHO_DEBUG:
+            logger.info(
+                "ECHO [decode_reset] req_id=%s num_computed=%s",
+                req_id,
+                num_prompt,
+            )
+
     @property
     def use_cp(self) -> bool:
         return self.pcp_size * self.dcp_size > 1
@@ -1293,25 +1327,26 @@ class NPUModelRunner(GPUModelRunner):
         return spec_tokens
 
     def _echo_resolve_sample_token(self, cur_index: int, req_id: str) -> tuple[int, str]:
-        """Resolve the sample token for ECHO spec-decode input_ids scatter.
-
-        Returns (token_id, source_name). The sample slot must match the token
-        at sequence index num_computed-1 (last token in KV). Prefer
-        get_token_id over prev_sampled to avoid feeding a sampled token that
-        was never written into the cache.
-        """
+        """Resolve the sample token for ECHO spec-decode input_ids scatter."""
         req_state = self.requests.get(req_id)
         num_computed = int(self.input_batch.num_computed_tokens_cpu[cur_index])
+        num_prompt = int(self.input_batch.num_prompt_tokens[cur_index])
         kv_unconfirmed = req_id in self.echo_kv_unconfirmed
+
+        if (
+            kv_unconfirmed
+            and num_computed <= num_prompt
+            and req_state is not None
+            and num_prompt > 0
+        ):
+            tok = req_state.get_token_id(num_prompt - 1)
+            if tok > 0:
+                return tok, "kv_unconfirmed_prompt_last"
 
         if req_state is not None and num_computed > 0:
             tok = req_state.get_token_id(num_computed - 1)
             if tok > 0:
-                src = "kv_unconfirmed_last" if kv_unconfirmed else "get_token_id"
-                return tok, src
-
-        if kv_unconfirmed:
-            return -1, "kv_unconfirmed_none"
+                return tok, "get_token_id"
 
         if req_state is not None:
             for t in reversed(req_state.output_token_ids):
@@ -1374,8 +1409,8 @@ class NPUModelRunner(GPUModelRunner):
             num_output = int(req_data.num_output_tokens[i])
             if num_output <= 0:
                 continue
-            valid_out = sum(1 for t in req_state.output_token_ids if t > 0)
-            if valid_out >= num_output:
+            valid_out = self._echo_sanitize_output_ids(req_state)
+            if valid_out > 0:
                 continue
             req_index = self.input_batch.req_id_to_index.get(req_id)
             if req_index is None:
@@ -1388,8 +1423,7 @@ class NPUModelRunner(GPUModelRunner):
             )
             if tok <= 0:
                 continue
-            missing = num_output - valid_out
-            req_state.output_token_ids.extend([tok] * missing)
+            req_state.output_token_ids.append(tok)
             self.echo_kv_unconfirmed.add(req_id)
             if envs.VLLM_ECHO_DEBUG:
                 logger.info(
@@ -1423,7 +1457,14 @@ class NPUModelRunner(GPUModelRunner):
             num_prompt = int(req_state.num_prompt_tokens)
             num_output = int(req_data.num_output_tokens[i])
             current = int(req_data.num_computed_tokens[i])
-            valid_out = sum(1 for t in req_state.output_token_ids if t > 0)
+            valid_out = self._echo_sanitize_output_ids(req_state)
+            if req_id in self.echo_kv_unconfirmed and valid_out > 1:
+                req_state.output_token_ids = req_state.output_token_ids[:1]
+                valid_out = 1
+            max_valid = max(0, current - num_prompt)
+            if max_valid > 0 and valid_out > max_valid:
+                req_state.output_token_ids = req_state.output_token_ids[:max_valid]
+                valid_out = max_valid
             expected = num_prompt + valid_out
 
             if current == expected:
@@ -1493,6 +1534,7 @@ class NPUModelRunner(GPUModelRunner):
         needs_gpu_copy = False
         for cur_index in range(num_reqs):
             req_id = self.input_batch.req_ids[cur_index]
+            req_state = self.requests.get(req_id)
             kept_spec = self._echo_get_kept_spec_tokens(req_id, scheduled_spec_tokens)
 
             flat_end = int(cu_num_tokens[cur_index]) - 1
@@ -1507,6 +1549,11 @@ class NPUModelRunner(GPUModelRunner):
                 needs_gpu_copy = True
 
             sampled, sample_src = self._echo_resolve_sample_token(cur_index, req_id)
+            if sampled <= 0 and req_state is not None:
+                num_prompt = int(self.input_batch.num_prompt_tokens[cur_index])
+                if num_prompt > 0:
+                    sampled = req_state.get_token_id(num_prompt - 1)
+                    sample_src = "fallback_prompt_last"
             if sampled > 0:
                 input_ids_cpu[sample_idx] = sampled
                 needs_gpu_copy = True
@@ -1529,6 +1576,15 @@ class NPUModelRunner(GPUModelRunner):
                         if req_id in self.requests
                         else 0,
                     )
+            elif envs.VLLM_ECHO_DEBUG:
+                logger.info(
+                    "ECHO [input_ids] req_id=%s sample_idx=%s MISSING sample "
+                    "num_computed=%s num_prompt=%s",
+                    req_id,
+                    sample_idx,
+                    int(self.input_batch.num_computed_tokens_cpu[cur_index]),
+                    int(self.input_batch.num_prompt_tokens[cur_index]),
+                )
 
         if needs_gpu_copy:
             self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
@@ -2517,7 +2573,7 @@ class NPUModelRunner(GPUModelRunner):
                 else None,
             )
 
-        if envs.VLLM_ECHO_ENABLED and self.echo_kv_unconfirmed:
+        if envs.VLLM_ECHO_ENABLED:
             for req_id, tokens in zip(
                 req_ids_output_copy, valid_sampled_token_ids
             ):
@@ -2531,6 +2587,8 @@ class NPUModelRunner(GPUModelRunner):
                             req_id,
                             tokens[0],
                         )
+                else:
+                    self._echo_reset_decode_state(req_id, scheduler_output)
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
