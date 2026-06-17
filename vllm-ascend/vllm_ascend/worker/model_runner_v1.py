@@ -471,7 +471,7 @@ class NPUModelRunner(GPUModelRunner):
             self.kvcomp_meta_data = initialize_kvcomp_metadata(max_num_reqs=self.max_num_reqs,
                 block_size=self.block_size, device=self.device, vllm_config=self.vllm_config,
                 parallel_config=self.parallel_config, dtype=self.dtype)
-        self.echo_cu_draft_tokens = []
+        self.echo_cu_draft_tokens: dict[str, int] = {}
 
     @property
     def use_cp(self) -> bool:
@@ -646,12 +646,13 @@ class NPUModelRunner(GPUModelRunner):
         logger.info(
             "ECHO [slot_mapping] req_ids=%s num_scheduled=%s "
             "positions_cpu=%s positions_gpu=%s pos_drift=%s "
-            "slot_mapping=%s block_table=%s block_size=%s",
+            "input_ids=%s slot_mapping=%s block_table=%s block_size=%s",
             self.input_batch.req_ids[:num_reqs],
             num_scheduled_tokens[:num_reqs].tolist(),
             pos_cpu.tolist(),
             pos_gpu.tolist(),
             pos_drift,
+            self.input_ids.gpu[:total_num_scheduled_tokens].detach().cpu().tolist(),
             slot_map.tolist(),
             req_info,
             block_size,
@@ -1563,14 +1564,29 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
-        if len(scheduler_output.num_scheduled_tokens) != 0 and len(self.input_batch.req_ids) != 0:
-            if len(self.echo_cu_draft_tokens) == len(self.input_batch.req_ids):
-                req_ids = scheduler_output.num_scheduled_tokens.keys()
-                for req_id, draft_token_num in zip(req_ids, self.echo_cu_draft_tokens):
-                    scheduler_output.scheduled_spec_decode_tokens[req_id] = scheduler_output.scheduled_spec_decode_tokens[req_id][:draft_token_num]
-                    old_num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
-                    scheduler_output.num_scheduled_tokens[req_id] = draft_token_num + 1
-                    scheduler_output.total_num_scheduled_tokens -= (old_num_scheduled_tokens - (draft_token_num + 1))
+        if (
+            envs.VLLM_ECHO_ENABLED
+            and self.echo_cu_draft_tokens
+            and len(scheduler_output.num_scheduled_tokens) != 0
+        ):
+            for req_id in list(scheduler_output.num_scheduled_tokens.keys()):
+                draft_token_num = self.echo_cu_draft_tokens.get(req_id)
+                if draft_token_num is None:
+                    continue
+                spec_tokens = scheduler_output.scheduled_spec_decode_tokens.get(
+                    req_id, []
+                )
+                scheduler_output.scheduled_spec_decode_tokens[req_id] = spec_tokens[
+                    :draft_token_num
+                ]
+                old_num_scheduled_tokens = scheduler_output.num_scheduled_tokens[
+                    req_id
+                ]
+                scheduler_output.num_scheduled_tokens[req_id] = draft_token_num + 1
+                scheduler_output.total_num_scheduled_tokens -= (
+                    old_num_scheduled_tokens - (draft_token_num + 1)
+                )
+            self.echo_cu_draft_tokens = {}
         if self.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
@@ -2002,7 +2018,13 @@ class NPUModelRunner(GPUModelRunner):
                 batch_desc,
             )
             mask = (self._draft_token_ids != -1)
-            self.echo_cu_draft_tokens = mask.int().sum(dim=1).cpu().tolist()
+            self.echo_cu_draft_tokens = {
+                req_id: int(count)
+                for req_id, count in zip(
+                    self.input_batch.req_ids,
+                    mask.int().sum(dim=1).cpu().tolist(),
+                )
+            }
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         (
