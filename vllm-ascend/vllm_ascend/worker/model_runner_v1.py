@@ -1122,7 +1122,15 @@ class NPUModelRunner(GPUModelRunner):
         for req_id, old_num_scheduled_tokens in list(
             scheduler_output.num_scheduled_tokens.items()
         ):
-            draft_token_num = self.echo_cu_draft_tokens.get(req_id, 0)
+            # Only trim requests that participated in the previous propose
+            # step. Prefill/chunked-prefill requests are absent from
+            # echo_cu_draft_tokens; defaulting to 0 would collapse their
+            # schedule to a single token (e.g. 2673 -> 1).
+            if req_id not in self.echo_cu_draft_tokens:
+                new_total += old_num_scheduled_tokens
+                continue
+
+            draft_token_num = self.echo_cu_draft_tokens[req_id]
             proposed_drafts = self.echo_draft_tokens.get(req_id, [])
             spec_tokens = scheduler_output.scheduled_spec_decode_tokens.get(req_id, [])
             kept_spec_tokens = proposed_drafts[:draft_token_num]
