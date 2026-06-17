@@ -605,6 +605,57 @@ class NPUModelRunner(GPUModelRunner):
 
         return num_reqs_padded
 
+    @staticmethod
+    def _echo_summarize_seq(values, head: int = 3) -> list:
+        n = len(values)
+        if n <= head * 2:
+            return list(values)
+        return list(values[:head]) + ["..."] + list(values[-head:]) + [f"(len={n})"]
+
+    def _echo_per_req_token_layout(
+        self,
+        num_reqs: int,
+        cu_num_tokens: np.ndarray,
+        positions_np: np.ndarray,
+        pos_gpu: torch.Tensor,
+        slot_map: torch.Tensor,
+        pos_drift: list,
+        input_ids_gpu: torch.Tensor | None = None,
+        head: int = 3,
+    ) -> list[dict]:
+        layout = []
+        for r_idx in range(num_reqs):
+            start = 0 if r_idx == 0 else int(cu_num_tokens[r_idx - 1])
+            end = int(cu_num_tokens[r_idx])
+            if start >= end:
+                continue
+            pos_cpu_slice = positions_np[start:end]
+            pos_gpu_slice = pos_gpu[start:end].tolist()
+            drift_slice = pos_drift[start:end]
+            slot_slice = slot_map[start:end].tolist()
+            entry = {
+                "req_id": self.input_batch.req_ids[r_idx],
+                "num_tokens": end - start,
+                "pos_cpu": self._echo_summarize_seq(pos_cpu_slice.tolist(), head),
+                "pos_gpu": self._echo_summarize_seq(pos_gpu_slice, head),
+                "pos_drift": self._echo_summarize_seq(drift_slice, head),
+                "slot_mapping": self._echo_summarize_seq(slot_slice, head),
+                "pos_first_last": [int(pos_cpu_slice[0]), int(pos_cpu_slice[-1])],
+                "slot_first_last": [int(slot_slice[0]), int(slot_slice[-1])],
+                "pos_drift_nonzero": sum(d != 0 for d in drift_slice),
+            }
+            if input_ids_gpu is not None:
+                ids_slice = input_ids_gpu[start:end].tolist()
+                entry["input_ids"] = self._echo_summarize_seq(ids_slice, head)
+            layout.append(entry)
+        return layout
+
+    @staticmethod
+    def _echo_summarize_block_row(phys_row: list[int], head: int = 2) -> list:
+        if len(phys_row) <= head * 2:
+            return phys_row
+        return phys_row[:head] + ["..."] + phys_row[-head:] + [f"(n={len(phys_row)})"]
+
     def _echo_log_slot_mapping_debug(
         self,
         num_reqs: int,
@@ -612,16 +663,17 @@ class NPUModelRunner(GPUModelRunner):
         total_num_scheduled_tokens: int,
         positions_np: np.ndarray,
     ) -> None:
-        """Log slot_mapping inputs to compare baseline vs ECHO at step 3."""
+        """Log compact slot_mapping summary (head/tail per req, no full prefill dump)."""
         blk_tbl = self.input_batch.block_table[0]
         block_size = blk_tbl.block_size
         slot_map = blk_tbl.slot_mapping.gpu[:total_num_scheduled_tokens].detach().cpu()
         pos_gpu = self.positions[:total_num_scheduled_tokens].detach().cpu()
         pos_cpu = positions_np[:total_num_scheduled_tokens]
         pos_drift = (pos_gpu.to(torch.int64) - torch.from_numpy(pos_cpu).to(torch.int64)).tolist()
-        nc_cpu = self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist()
         nc_gpu = self.num_computed_tokens[:num_reqs].detach().cpu().tolist()
         prev_drafts = self.prev_num_draft_tokens.np[:num_reqs].tolist()
+        cu_num_tokens = np.cumsum(num_scheduled_tokens[:num_reqs], dtype=np.int32)
+        input_ids_gpu = self.input_ids.gpu[:total_num_scheduled_tokens].detach().cpu()
         req_info = []
         for r_idx, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
             nc = int(self.input_batch.num_computed_tokens_cpu[r_idx])
@@ -642,23 +694,198 @@ class NPUModelRunner(GPUModelRunner):
                     "prev_drafts": prev_drafts[r_idx],
                     "block_idx": bi,
                     "phys_blocks": phys,
-                    "block_table_row": phys_row,
+                    "block_table_row": self._echo_summarize_block_row(phys_row),
                     "slot_at_num_computed": slot_at_nc,
                 }
             )
+        token_layout = self._echo_per_req_token_layout(
+            num_reqs,
+            cu_num_tokens,
+            pos_cpu,
+            pos_gpu,
+            slot_map,
+            pos_drift,
+            input_ids_gpu,
+        )
         logger.info(
-            "ECHO [slot_mapping] req_ids=%s num_scheduled=%s "
-            "positions_cpu=%s positions_gpu=%s pos_drift=%s "
-            "input_ids=%s slot_mapping=%s block_table=%s block_size=%s",
+            "ECHO [slot_mapping] req_ids=%s num_scheduled=%s total=%s "
+            "block_table=%s block_size=%s token_layout=%s",
             self.input_batch.req_ids[:num_reqs],
             num_scheduled_tokens[:num_reqs].tolist(),
-            pos_cpu.tolist(),
-            pos_gpu.tolist(),
-            pos_drift,
-            self.input_ids.gpu[:total_num_scheduled_tokens].detach().cpu().tolist(),
-            slot_map.tolist(),
+            total_num_scheduled_tokens,
             req_info,
             block_size,
+            token_layout,
+        )
+
+    def _echo_log_prepare_debug(
+        self,
+        num_reqs: int,
+        num_scheduled_tokens: np.ndarray,
+        total_num_scheduled_tokens: int,
+        cu_num_tokens: np.ndarray,
+        attn_state: AscendAttentionState,
+        num_valid_tokens: np.ndarray,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+        num_draft_tokens: np.ndarray | None,
+    ) -> None:
+        seq_gpu = self.seq_lens[:num_reqs].detach().cpu().tolist()
+        seq_cpu = self.optimistic_seq_lens_cpu[:num_reqs].detach().cpu().tolist()
+        seq_drift = [g - c for g, c in zip(seq_gpu, seq_cpu)]
+        valid_counts = None
+        if self.valid_sampled_token_count_cpu is not None:
+            valid_counts = self.valid_sampled_token_count_cpu[:num_reqs].tolist()
+        per_req = []
+        for r_idx, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            start = 0 if r_idx == 0 else int(cu_num_tokens[r_idx - 1])
+            end = int(cu_num_tokens[r_idx])
+            per_req.append(
+                {
+                    "req_id": req_id,
+                    "token_range": [start, end],
+                    "num_scheduled": int(num_scheduled_tokens[r_idx]),
+                    "num_valid_tokens": int(num_valid_tokens[r_idx]),
+                    "num_computed_cpu": int(
+                        self.input_batch.num_computed_tokens_cpu[r_idx]
+                    ),
+                    "num_computed_gpu": int(self.num_computed_tokens[r_idx].item()),
+                    "num_prompt": int(self.input_batch.num_prompt_tokens[r_idx]),
+                    "seq_len_gpu": seq_gpu[r_idx],
+                    "seq_len_cpu": seq_cpu[r_idx],
+                    "seq_drift": seq_drift[r_idx],
+                }
+            )
+        spec_info = None
+        if spec_decode_metadata is not None and num_draft_tokens is not None:
+            li = spec_decode_metadata.logits_indices
+            spec_info = {
+                "num_draft_tokens": num_draft_tokens[:num_reqs].tolist(),
+                "logits_indices": li.detach().cpu().tolist()
+                if torch.is_tensor(li)
+                else li,
+                "target_logits_indices": spec_decode_metadata.target_logits_indices.detach()
+                .cpu()
+                .tolist(),
+                "bonus_logits_indices": spec_decode_metadata.bonus_logits_indices.detach()
+                .cpu()
+                .tolist(),
+            }
+        logger.info(
+            "ECHO [prepare] attn_state=%s with_prefill=%s max_seq_len_cpu=%s "
+            "seq_lens_gpu=%s seq_lens_cpu=%s seq_drift=%s "
+            "valid_sampled_count_prev=%s query_start_loc=%s per_req=%s spec=%s",
+            attn_state,
+            self.with_prefill,
+            max(seq_cpu) if seq_cpu else 0,
+            seq_gpu,
+            seq_cpu,
+            seq_drift,
+            valid_counts,
+            self.query_start_loc.np[: num_reqs + 1].tolist(),
+            per_req,
+            spec_info,
+        )
+        self._echo_debug_cu_num_tokens = cu_num_tokens.copy()
+        self._echo_debug_num_reqs = num_reqs
+        self._echo_debug_total_tokens = total_num_scheduled_tokens
+
+    def _echo_log_attn_debug(
+        self,
+        common_attn_metadata: CommonAttentionMetadata | None,
+        max_query_len: int,
+    ) -> None:
+        if common_attn_metadata is None:
+            logger.info(
+                "ECHO [attn] common_attn_metadata=None max_query_len=%s",
+                max_query_len,
+            )
+            return
+        num_reqs = common_attn_metadata.num_reqs
+        seq_gpu = common_attn_metadata.seq_lens[:num_reqs].detach().cpu().tolist()
+        seq_lens_cpu_attr = getattr(common_attn_metadata, "_seq_lens_cpu", None)
+        seq_cpu = (
+            seq_lens_cpu_attr[:num_reqs].detach().cpu().tolist()
+            if seq_lens_cpu_attr is not None
+            else None
+        )
+        seq_drift = (
+            [g - c for g, c in zip(seq_gpu, seq_cpu)]
+            if seq_cpu is not None
+            else None
+        )
+        slot_map = common_attn_metadata.slot_mapping[
+            : common_attn_metadata.num_actual_tokens
+        ].detach().cpu()
+        qsl = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1].tolist()
+        cu = np.array(qsl[1:], dtype=np.int32)
+        token_layout = []
+        for r_idx in range(num_reqs):
+            start = 0 if r_idx == 0 else int(cu[r_idx - 1])
+            end = int(cu[r_idx])
+            if start >= end:
+                continue
+            slots = slot_map[start:end].tolist()
+            token_layout.append(
+                {
+                    "req_id": self.input_batch.req_ids[r_idx],
+                    "num_tokens": end - start,
+                    "slot_first_last": [slots[0], slots[-1]],
+                    "slot_mapping": self._echo_summarize_seq(slots, 3),
+                }
+            )
+        logger.info(
+            "ECHO [attn] attn_state=%s num_actual_tokens=%s max_query_len=%s "
+            "max_seq_len=%s seq_lens_gpu=%s seq_lens_cpu=%s seq_drift=%s "
+            "query_start_loc=%s token_layout=%s",
+            getattr(common_attn_metadata, "attn_state", None),
+            common_attn_metadata.num_actual_tokens,
+            common_attn_metadata.max_query_len,
+            common_attn_metadata.max_seq_len,
+            seq_gpu,
+            seq_cpu,
+            seq_drift,
+            qsl,
+            token_layout,
+        )
+
+    def _echo_log_forward_debug(self, hidden_states: torch.Tensor | IntermediateTensors) -> None:
+        if not hasattr(self, "_echo_debug_cu_num_tokens"):
+            return
+        if hidden_states is None or isinstance(hidden_states, IntermediateTensors):
+            logger.info(
+                "ECHO [forward] skip hidden_states type=%s",
+                type(hidden_states).__name__,
+            )
+            return
+        num_reqs = self._echo_debug_num_reqs
+        total = self._echo_debug_total_tokens
+        cu = self._echo_debug_cu_num_tokens
+        hs = hidden_states[:total]
+        per_req = []
+        for r_idx in range(num_reqs):
+            start = 0 if r_idx == 0 else int(cu[r_idx - 1])
+            end = int(cu[r_idx])
+            slice_hs = hs[start:end]
+            has_nan = bool(torch.isnan(slice_hs).any().item())
+            has_inf = bool(torch.isinf(slice_hs).any().item())
+            per_req.append(
+                {
+                    "req_id": self.input_batch.req_ids[r_idx],
+                    "token_range": [start, end],
+                    "has_nan": has_nan,
+                    "has_inf": has_inf,
+                    "nan_count": int(torch.isnan(slice_hs).sum().item()),
+                    "max_abs": float(slice_hs.abs().max().item())
+                    if slice_hs.numel()
+                    else 0.0,
+                }
+            )
+        logger.info(
+            "ECHO [forward] total_tokens=%s total_nan=%s total_inf=%s per_req=%s",
+            total,
+            int(torch.isnan(hs).sum().item()),
+            int(torch.isinf(hs).sum().item()),
+            per_req,
         )
 
     def _refresh_input_ids_after_async_num_computed(
@@ -1167,6 +1394,18 @@ class NPUModelRunner(GPUModelRunner):
                 num_scheduled_tokens=num_scheduled_tokens,
                 num_reqs=base_num_reqs,
                 total_num_scheduled_tokens=total_num_scheduled_tokens,
+            )
+
+        if envs.VLLM_ECHO_DEBUG:
+            self._echo_log_prepare_debug(
+                num_reqs,
+                num_scheduled_tokens,
+                total_num_scheduled_tokens,
+                cu_num_tokens,
+                attn_state,
+                num_valid_tokens,
+                spec_decode_metadata,
+                num_draft_tokens if use_spec_decode else None,
             )
 
         return (
@@ -1786,6 +2025,11 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                 )
+                if envs.VLLM_ECHO_DEBUG:
+                    self._echo_log_attn_debug(
+                        spec_decode_common_attn_metadata,
+                        max_num_scheduled_tokens,
+                    )
 
             (
                 input_ids,
@@ -1862,6 +2106,8 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+            if envs.VLLM_ECHO_DEBUG:
+                self._echo_log_forward_debug(hidden_states)
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
