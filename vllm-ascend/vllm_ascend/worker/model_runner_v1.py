@@ -480,6 +480,7 @@ class NPUModelRunner(GPUModelRunner):
         # correction on the next _update_states.
         self.echo_prev_scheduled: dict[str, int] = {}
         self.echo_overcount_pending: dict[str, int] = {}
+        self.echo_num_computed_fixed: set[str] = set()
 
     @property
     def use_cp(self) -> bool:
@@ -920,7 +921,31 @@ class NPUModelRunner(GPUModelRunner):
         # CPU values are optimistic (all drafts accepted). The kernel
         # corrects on GPU using the previous step's
         # valid_sampled_token_count_gpu. Otherwise, just copy from CPU.
+        # ECHO: skip the GPU drift kernel; num_computed is managed on CPU
+        # via overcount/lag fixes. The kernel + M-RoPE drift would otherwise
+        # overwrite corrected CPU values (e.g. req1 stuck at prompt_len).
         if (
+            envs.VLLM_ECHO_ENABLED
+            and self.use_async_spec_decode
+            and self.valid_sampled_token_count_gpu is not None
+            and prev_req_id_to_index
+        ):
+            self.prev_positions.copy_to_gpu(num_reqs)
+            self.prev_num_draft_tokens.copy_to_gpu()
+            self.num_computed_tokens[:num_reqs].copy_(
+                self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
+                non_blocking=True,
+            )
+            if envs.VLLM_ECHO_DEBUG:
+                logger.info(
+                    "ECHO [num_computed_sync] cpu=%s prev_positions=%s "
+                    "prev_drafts=%s fixed=%s",
+                    self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist(),
+                    self.prev_positions.np[:num_reqs].tolist(),
+                    self.prev_num_draft_tokens.np[:num_reqs].tolist(),
+                    list(self.echo_num_computed_fixed),
+                )
+        elif (
             self.use_async_spec_decode
             and self.valid_sampled_token_count_gpu is not None
             and prev_req_id_to_index
@@ -1185,6 +1210,7 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output.total_num_scheduled_tokens = sum(
             scheduler_output.num_scheduled_tokens.values()
         )
+
         if envs.VLLM_ECHO_DEBUG:
             logger.info(
                 "ECHO [trim] after total=%s schedule=%s spec=%s details=%s "
@@ -1271,15 +1297,14 @@ class NPUModelRunner(GPUModelRunner):
     def _echo_fix_num_computed_lag(
         self, scheduler_output: "SchedulerOutput"
     ) -> None:
-        """Raise num_computed when scheduler lags behind committed output tokens.
+        """Raise num_computed when scheduler is stuck at prompt_len after decode.
 
-        Async scheduling with echo_keep=0 can leave num_computed at prompt_len
-        while output_token_ids already contains accepted tokens. Positions and
-        KV slot_mapping are derived from num_computed, so the lag breaks verify
-        even when input_ids sample token is correct.
+        Only applies when num_computed == num_prompt but num_output > 0.
+        Avoids inflating num_computed via async-optimistic num_output (e.g. 9).
         """
         if not envs.VLLM_ECHO_ENABLED:
             return
+        self.echo_num_computed_fixed.clear()
         req_data = scheduler_output.scheduled_cached_reqs
         for i, req_id in enumerate(req_data.req_ids):
             req_state = self.requests.get(req_id)
@@ -1288,15 +1313,17 @@ class NPUModelRunner(GPUModelRunner):
             req_index = self.input_batch.req_id_to_index.get(req_id)
             num_prompt = int(req_state.num_prompt_tokens)
             num_output = int(req_data.num_output_tokens[i])
-            valid_out = sum(1 for t in req_state.output_token_ids if t > 0)
-            expected = num_prompt + max(num_output, valid_out)
             current = int(req_data.num_computed_tokens[i])
-            if current >= expected:
+            if current != num_prompt or num_output <= 0:
                 continue
+            valid_out = sum(1 for t in req_state.output_token_ids if t > 0)
+            increment = valid_out if valid_out > 0 else 1
+            expected = num_prompt + increment
             req_data.num_computed_tokens[i] = expected
             req_state.num_computed_tokens = expected
             if req_index is not None:
                 self.input_batch.num_computed_tokens_cpu[req_index] = expected
+            self.echo_num_computed_fixed.add(req_id)
             if envs.VLLM_ECHO_DEBUG:
                 logger.info(
                     "ECHO [num_computed_fix] req_id=%s %s->%s "
@@ -1340,9 +1367,10 @@ class NPUModelRunner(GPUModelRunner):
             flat_end = int(cu_num_tokens[cur_index]) - 1
             draft_len = len(kept_spec)
             sample_idx = flat_end - draft_len
+
             if kept_spec:
                 spec_start = sample_idx + 1
-                input_ids_cpu[spec_start: flat_end + 1] = torch.tensor(
+                input_ids_cpu[spec_start : flat_end + 1] = torch.tensor(
                     kept_spec, dtype=input_ids_cpu.dtype
                 )
                 needs_gpu_copy = True
