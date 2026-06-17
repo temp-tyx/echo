@@ -1169,6 +1169,41 @@ class NPUModelRunner(GPUModelRunner):
                 trim_details,
             )
 
+        # Consumed for this propose cycle; prevents double-trim if
+        # _update_states runs more than once before the next propose.
+        self.echo_cu_draft_tokens = {}
+        self.echo_draft_tokens = {}
+
+    def _echo_resolve_sample_token(self, cur_index: int, req_id: str) -> int:
+        """Resolve the sample token for ECHO spec-decode input_ids scatter."""
+        req_state = self.requests.get(req_id)
+        num_computed = int(self.input_batch.num_computed_tokens_cpu[cur_index])
+        num_prompt = int(self.input_batch.num_prompt_tokens[cur_index])
+
+        # Prefer the last computed token from request state (matches Eagle
+        # backup-token logic). More reliable than prev_sampled_token_ids when
+        # batch slots change (req finished) or after prefill→decode transition.
+        if req_state is not None and num_computed > 0 and num_computed >= num_prompt:
+            tok = req_state.get_token_id(num_computed - 1)
+            if tok > 0:
+                return tok
+
+        if self.input_batch.prev_sampled_token_ids is not None:
+            prev_index = self.prev_positions.np[cur_index]
+            if prev_index >= 0:
+                tok = int(
+                    self.input_batch.prev_sampled_token_ids[prev_index, 0].item()
+                )
+                if tok > 0:
+                    return tok
+
+        num_out = int(self.input_batch.num_tokens_no_spec[cur_index])
+        if num_out > 0:
+            tok = int(self.input_batch.token_ids_cpu[cur_index, num_out - 1])
+            if tok > 0:
+                return tok
+        return -1
+
     def _prepare_input_ids(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1208,22 +1243,21 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 needs_gpu_copy = True
 
-            if self.input_batch.prev_sampled_token_ids is not None:
-                prev_index = self.prev_positions.np[cur_index]
-                if prev_index >= 0:
-                    sampled = int(
-                        self.input_batch.prev_sampled_token_ids[prev_index, 0].item()
+            sampled = self._echo_resolve_sample_token(cur_index, req_id)
+            if sampled > 0:
+                input_ids_cpu[sample_idx] = sampled
+                needs_gpu_copy = True
+                if envs.VLLM_ECHO_DEBUG:
+                    logger.info(
+                        "ECHO [input_ids] req_id=%s sample_idx=%s sampled=%s "
+                        "num_computed=%s num_prompt=%s echo_keep=%s",
+                        req_id,
+                        sample_idx,
+                        sampled,
+                        int(self.input_batch.num_computed_tokens_cpu[cur_index]),
+                        int(self.input_batch.num_prompt_tokens[cur_index]),
+                        len(spec_tokens),
                     )
-                    if sampled <= 0:
-                        num_out = int(self.input_batch.num_tokens_no_spec[cur_index])
-                        num_prompt = int(self.input_batch.num_prompt_tokens[cur_index])
-                        if num_out > num_prompt:
-                            sampled = int(
-                                self.input_batch.token_ids_cpu[cur_index, num_out - 1]
-                            )
-                    if sampled > 0:
-                        input_ids_cpu[sample_idx] = sampled
-                        needs_gpu_copy = True
 
         if needs_gpu_copy:
             self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
@@ -1247,15 +1281,30 @@ class NPUModelRunner(GPUModelRunner):
             self._apply_echo_scheduler_trim(scheduler_output)
 
         if envs.VLLM_ECHO_ENABLED and self.echo_overcount_pending:
+            pending = self.echo_overcount_pending
+            self.echo_overcount_pending = {}
             req_data = scheduler_output.scheduled_cached_reqs
-            for i, req_id in enumerate(req_data.req_ids):
-                over = self.echo_overcount_pending.pop(req_id, None)
-                if over is None or over <= 0:
+            for req_id, over in pending.items():
+                if over <= 0:
                     continue
-                req_data.num_computed_tokens[i] -= over
+                for i, rid in enumerate(req_data.req_ids):
+                    if rid == req_id:
+                        req_data.num_computed_tokens[i] -= over
+                        break
                 req_state = self.requests.get(req_id)
                 if req_state is not None:
                     req_state.num_computed_tokens -= over
+                req_index = self.input_batch.req_id_to_index.get(req_id)
+                if req_index is not None:
+                    self.input_batch.num_computed_tokens_cpu[req_index] -= over
+                if envs.VLLM_ECHO_DEBUG:
+                    logger.info(
+                        "ECHO [overcount] req_id=%s subtract=%s "
+                        "num_computed_after=%s",
+                        req_id,
+                        over,
+                        req_state.num_computed_tokens if req_state else None,
+                    )
 
         return super()._update_states(scheduler_output)
 
