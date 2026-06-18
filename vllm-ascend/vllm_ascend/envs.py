@@ -124,10 +124,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ECHO_STEPS_MULTIPLIER": lambda: int(os.getenv("VLLM_ECHO_STEPS_MULTIPLIER", "2")),
     # Maximum draft steps buffer for ECHO proposer only (does not change target MTP).
     "VLLM_ECHO_MAX_SPEC_NUM": lambda: int(os.getenv("VLLM_ECHO_MAX_SPEC_NUM", "7")),
-    # Debug slot_mapping / positions / block_table at target-model prepare.
-    "VLLM_ECHO_DEBUG": lambda: bool(int(os.getenv("VLLM_ECHO_DEBUG", "0"))),
-    # Verbose ECHO debug: full block_table rows and extra KV layer sampling.
-    "VLLM_ECHO_DEBUG_VERBOSE": lambda: bool(int(os.getenv("VLLM_ECHO_DEBUG_VERBOSE", "0"))),
 }
 
 # end-env-vars-definition
