@@ -1953,6 +1953,14 @@ class NPUModelRunner(GPUModelRunner):
                 ),
             ) as kv_connector_output,
         ):
+            self._sync_device()
+            logger.info(
+                "[ECHO] target forward input_ids.gpu=%s",
+                self.input_ids.gpu[: scheduler_output.total_num_scheduled_tokens]
+                .detach()
+                .cpu()
+                .tolist(),
+            )
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
