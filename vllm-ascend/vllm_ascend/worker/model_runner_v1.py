@@ -472,6 +472,7 @@ class NPUModelRunner(GPUModelRunner):
                 block_size=self.block_size, device=self.device, vllm_config=self.vllm_config,
                 parallel_config=self.parallel_config, dtype=self.dtype)
         self.echo_cu_draft_tokens = []
+        self._echo_diag_step = 0
 
     @property
     def use_cp(self) -> bool:
@@ -1461,14 +1462,37 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        if (
+            envs.VLLM_ECHO_ENABLED
+            and scheduler_output.num_scheduled_tokens
+            and self.input_batch.req_ids
+        ):
+            self._echo_diag_step += 1
+
         if len(scheduler_output.num_scheduled_tokens) != 0 and len(self.input_batch.req_ids) != 0:
             if len(self.echo_cu_draft_tokens) == len(self.input_batch.req_ids):
                 req_ids = scheduler_output.num_scheduled_tokens.keys()
                 for req_id, draft_token_num in zip(req_ids, self.echo_cu_draft_tokens):
-                    scheduler_output.scheduled_spec_decode_tokens[req_id] = scheduler_output.scheduled_spec_decode_tokens[req_id][:draft_token_num]
+                    spec_before = scheduler_output.scheduled_spec_decode_tokens.get(req_id, [])
                     old_num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+                    scheduler_output.scheduled_spec_decode_tokens[req_id] = spec_before[:draft_token_num]
                     scheduler_output.num_scheduled_tokens[req_id] = draft_token_num + 1
-                    scheduler_output.total_num_scheduled_tokens -= (old_num_scheduled_tokens - (draft_token_num + 1))
+                    scheduler_output.total_num_scheduled_tokens -= (
+                        old_num_scheduled_tokens - (draft_token_num + 1)
+                    )
+                    if envs.VLLM_ECHO_ENABLED:
+                        spec_after = scheduler_output.scheduled_spec_decode_tokens.get(req_id, [])
+                        logger.info(
+                            "[ECHO diag] trim step=%s req=%s echo_cu=%s "
+                            "old_sched=%s spec_before=%s new_sched=%s spec_after=%s",
+                            self._echo_diag_step,
+                            req_id,
+                            draft_token_num,
+                            old_num_scheduled_tokens,
+                            len(spec_before),
+                            scheduler_output.num_scheduled_tokens[req_id],
+                            len(spec_after),
+                        )
         if self.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
@@ -1901,6 +1925,18 @@ class NPUModelRunner(GPUModelRunner):
             )
             mask = (self._draft_token_ids != -1)
             self.echo_cu_draft_tokens = mask.int().sum(dim=1).cpu().tolist()
+            if envs.VLLM_ECHO_ENABLED:
+                draft_cols = (
+                    self._draft_token_ids.shape[1]
+                    if torch.is_tensor(self._draft_token_ids)
+                    else None
+                )
+                logger.info(
+                    "[ECHO diag] propose step=%s echo_cu=%s draft_cols=%s",
+                    self._echo_diag_step,
+                    self.echo_cu_draft_tokens,
+                    draft_cols,
+                )
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         (
