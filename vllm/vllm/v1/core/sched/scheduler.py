@@ -1379,18 +1379,8 @@ class Scheduler(SchedulerInterface):
                     request.num_computed_tokens -= num_rejected
                 # If async scheduling, num_output_placeholders also includes
                 # the scheduled spec tokens count and so is similarly adjusted.
-                ph_before_reject = request.num_output_placeholders
                 if request.num_output_placeholders > 0:
                     request.num_output_placeholders -= num_rejected
-                logger.info(
-                    "[ECHO sched] req=%s pre_reject ph=%s spec=%s gen=%s rejected=%s ph_after=%s",
-                    req_id,
-                    ph_before_reject,
-                    num_draft_tokens,
-                    len(generated_token_ids),
-                    num_rejected,
-                    request.num_output_placeholders,
-                )
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
                     num_draft_tokens=num_draft_tokens,

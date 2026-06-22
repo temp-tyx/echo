@@ -37,12 +37,6 @@ class AsyncScheduler(Scheduler):
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int]
     ) -> tuple[list[int], bool]:
-        logger.info(
-            "[ECHO sched] req=%s ph=%s sub=%s",
-            request.request_id,
-            request.num_output_placeholders,
-            len(new_token_ids),
-        )
         if request.discard_latest_async_tokens:
             # If the request is force preempted in reset_prefix_cache, we
             # should discard the latest async token.

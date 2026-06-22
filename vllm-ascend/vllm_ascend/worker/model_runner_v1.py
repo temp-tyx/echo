@@ -67,6 +67,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
+    DraftTokenIds,
     ECConnectorOutput,
     LogprobsLists,
     LogprobsTensors,
@@ -1503,6 +1504,38 @@ class NPUModelRunner(GPUModelRunner):
             raise ValueError(f"Unknown speculative decoding method: {self.speculative_config.method}")
 
         return draft_token_ids
+
+    def _copy_draft_token_ids_to_cpu(
+        self, scheduler_output: "SchedulerOutput", zeros_only: bool = False
+    ) -> None:
+        if envs.VLLM_ECHO_ENABLED and self.use_async_scheduling:
+            self._draft_token_req_ids = self.input_batch.req_ids.copy()
+            draft_token_ids = self._draft_token_ids
+            if not torch.is_tensor(draft_token_ids):
+                return
+            assert self.draft_token_ids_event is not None
+            assert self.draft_token_ids_copy_stream is not None
+            assert self.draft_token_ids_cpu is not None
+            num_reqs = draft_token_ids.shape[0]
+            default_stream = torch.npu.current_stream()
+            with torch.npu.stream(self.draft_token_ids_copy_stream):
+                self.draft_token_ids_copy_stream.wait_stream(default_stream)
+                if not zeros_only:
+                    self.draft_token_ids_cpu[:num_reqs].copy_(
+                        draft_token_ids, non_blocking=True
+                    )
+                else:
+                    self.draft_token_ids_cpu[:num_reqs] = 0
+                self.draft_token_ids_event.record()
+            return
+        super()._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=zeros_only)
+
+    def take_draft_token_ids(self) -> DraftTokenIds | None:
+        draft = super().take_draft_token_ids()
+        if draft is None or not envs.VLLM_ECHO_ENABLED:
+            return draft
+        filtered = [[t for t in row if t != -1] for row in draft.draft_token_ids]
+        return DraftTokenIds(draft.req_ids, filtered)
 
     @staticmethod
     def _num_scheduled_tokens_per_req(num_reqs: int, cu_num_tokens: np.ndarray) -> np.ndarray:
