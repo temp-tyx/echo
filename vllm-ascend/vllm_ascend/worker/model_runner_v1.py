@@ -241,6 +241,18 @@ class NPUModelRunner(GPUModelRunner):
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
 
+        if (
+            envs.VLLM_ECHO_ENABLED
+            and self.draft_token_ids_cpu is not None
+            and self.draft_token_ids_cpu.shape[1] < envs.VLLM_ECHO_MAX_SPEC_NUM
+        ):
+            self.draft_token_ids_cpu = torch.empty(
+                (self.max_num_reqs, envs.VLLM_ECHO_MAX_SPEC_NUM),
+                dtype=torch.int64,
+                device="cpu",
+                pin_memory=self.pin_memory,
+            )
+
         # NOTE: For FULL mode we change +1 to +2 to reserve extra space for padding.
         # See _pad_query_start_loc_for_fia.
         self.query_start_loc = self._make_buffer(
@@ -1505,6 +1517,17 @@ class NPUModelRunner(GPUModelRunner):
 
         return draft_token_ids
 
+    def _ensure_draft_token_ids_cpu_capacity(self, num_cols: int) -> None:
+        assert self.draft_token_ids_cpu is not None
+        if self.draft_token_ids_cpu.shape[1] >= num_cols:
+            return
+        self.draft_token_ids_cpu = torch.empty(
+            (self.max_num_reqs, num_cols),
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=self.pin_memory,
+        )
+
     def _copy_draft_token_ids_to_cpu(
         self, scheduler_output: "SchedulerOutput", zeros_only: bool = False
     ) -> None:
@@ -1517,6 +1540,8 @@ class NPUModelRunner(GPUModelRunner):
             assert self.draft_token_ids_copy_stream is not None
             assert self.draft_token_ids_cpu is not None
             num_reqs = draft_token_ids.shape[0]
+            num_cols = draft_token_ids.shape[1]
+            self._ensure_draft_token_ids_cpu_capacity(num_cols)
             default_stream = torch.npu.current_stream()
             with torch.npu.stream(self.draft_token_ids_copy_stream):
                 self.draft_token_ids_copy_stream.wait_stream(default_stream)
