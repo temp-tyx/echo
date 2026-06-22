@@ -1857,6 +1857,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         pruned_draft_ids = draft_token_ids.clone()
         pruned_draft_ids[~mask] = -1
 
+        # Per-request kept draft count for scheduler / scatter alignment.
+        self._echo_per_req_draft_counts = mask.sum(dim=1)
+
         return pruned_draft_ids
 
 

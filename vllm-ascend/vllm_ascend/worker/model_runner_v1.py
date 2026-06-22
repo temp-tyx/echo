@@ -1381,6 +1381,7 @@ class NPUModelRunner(GPUModelRunner):
                 draft_max,
             )
             draft_num_spec_restore = self.drafter.num_speculative_tokens
+            runner_num_spec_restore = self.num_spec_tokens
             self.drafter.num_speculative_tokens = draft_step
             self.num_spec_tokens = draft_step
             common_attn_metadata = spec_decode_common_attn_metadata
@@ -1504,10 +1505,175 @@ class NPUModelRunner(GPUModelRunner):
                 )
             finally:
                 self.drafter.num_speculative_tokens = draft_num_spec_restore
+                self.num_spec_tokens = runner_num_spec_restore
         else:
             raise ValueError(f"Unknown speculative decoding method: {self.speculative_config.method}")
 
         return draft_token_ids
+
+    @staticmethod
+    def _num_scheduled_tokens_per_req(num_reqs: int, cu_num_tokens: np.ndarray) -> np.ndarray:
+        per_req = np.empty(num_reqs, dtype=np.int32)
+        per_req[0] = cu_num_tokens[0]
+        for i in range(1, num_reqs):
+            per_req[i] = cu_num_tokens[i] - cu_num_tokens[i - 1]
+        return per_req
+
+    def _echo_trim_scheduler_output(self, scheduler_output: "SchedulerOutput") -> None:
+        """Align num_scheduled_tokens with actual ECHO / draft counts.
+
+        Async scheduling may schedule num_spec placeholder slots while ECHO
+        pruning keeps fewer drafts in ``_draft_token_ids``. ``_prepare_input_ids``
+        must see consistent ``num_scheduled == draft_count + 1``.
+        """
+        if not scheduler_output.num_scheduled_tokens:
+            return
+
+        drafter = self.drafter
+        per_req_counts = (
+            getattr(drafter, "_echo_per_req_draft_counts", None) if drafter is not None else None
+        )
+
+        for req_id in list(scheduler_output.num_scheduled_tokens.keys()):
+            req_idx = self.input_batch.req_id_to_index.get(req_id)
+            if req_idx is None:
+                continue
+
+            draft_count: int | None = self.echo_cu_draft_tokens.get(req_id)
+            if per_req_counts is not None and req_idx < per_req_counts.shape[0]:
+                pruned_count = int(per_req_counts[req_idx].item())
+                draft_count = pruned_count if draft_count is None else min(draft_count, pruned_count)
+
+            draft_tensor = self._draft_token_ids
+            if isinstance(draft_tensor, torch.Tensor) and req_idx < draft_tensor.shape[0]:
+                valid_count = int((draft_tensor[req_idx] != -1).sum().item())
+                if valid_count > 0:
+                    draft_count = valid_count if draft_count is None else min(draft_count, valid_count)
+
+            spec_list = scheduler_output.scheduled_spec_decode_tokens.get(req_id, [])
+            if draft_count is None:
+                if not spec_list:
+                    continue
+                draft_count = len(spec_list)
+
+            if draft_count <= 0:
+                continue
+
+            if isinstance(draft_tensor, torch.Tensor) and req_idx < draft_tensor.shape[0]:
+                row = draft_tensor[req_idx]
+                valid_tokens = row[row != -1].tolist()
+                if valid_tokens:
+                    spec_list = valid_tokens[:draft_count]
+
+            spec_list = spec_list[:draft_count]
+            scheduler_output.scheduled_spec_decode_tokens[req_id] = spec_list
+            draft_count = len(spec_list)
+
+            old = scheduler_output.num_scheduled_tokens[req_id]
+            new = draft_count + 1
+            if old != new:
+                scheduler_output.total_num_scheduled_tokens += new - old
+                scheduler_output.num_scheduled_tokens[req_id] = new
+
+        self.echo_cu_draft_tokens = {}
+        if drafter is not None and hasattr(drafter, "_echo_per_req_draft_counts"):
+            drafter._echo_per_req_draft_counts = None
+
+    def _prepare_input_ids(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_reqs: int,
+        total_num_scheduled_tokens: int,
+        cu_num_tokens: np.ndarray,
+    ) -> None:
+        """Async spec-decode prepare with per-request draft_len from schedule."""
+        if self.input_batch.prev_sampled_token_ids is None:
+            self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
+            if self.enable_prompt_embeds:
+                self.inputs_embeds.copy_to_gpu(total_num_scheduled_tokens)
+                self.is_token_ids.copy_to_gpu(total_num_scheduled_tokens)
+            return
+
+        per_req_tokens = self._num_scheduled_tokens_per_req(num_reqs, cu_num_tokens)
+        prev_positions = self.prev_positions.np[:num_reqs]
+        scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        sample_flattened_indices: list[int] = []
+        spec_flattened_indices: list[int] = []
+        prev_draft_token_indices: list[int] = []
+        prev_indices: list[int] = []
+        common_indices_match = True
+        max_flattened_index = -1
+        total_num_spec_tokens = 0
+
+        for cur_index in range(num_reqs):
+            prev_index = prev_positions[cur_index]
+            if prev_index < 0:
+                continue
+            prev_indices.append(prev_index)
+            req_id = self.input_batch.req_ids[cur_index]
+            spec_list = scheduled_spec_tokens.get(req_id, ())
+            if spec_list:
+                draft_len = int(per_req_tokens[cur_index]) - 1
+            else:
+                draft_len = 0
+            total_num_spec_tokens += draft_len
+            flattened_index = cu_num_tokens[cur_index].item() - 1
+            sample_flattened_indices.append(flattened_index - draft_len)
+            if draft_len > 0:
+                spec_flattened_indices.extend(
+                    range(flattened_index - draft_len + 1, flattened_index + 1)
+                )
+            start = prev_index * self.num_spec_tokens
+            prev_draft_token_indices.extend(range(start, start + draft_len))
+            common_indices_match &= prev_index == flattened_index
+            max_flattened_index = max(max_flattened_index, flattened_index)
+
+        num_common_tokens = len(sample_flattened_indices)
+        total_without_spec = total_num_scheduled_tokens - total_num_spec_tokens
+        if num_common_tokens < total_without_spec:
+            self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
+            if self.enable_prompt_embeds:
+                self.inputs_embeds.copy_to_gpu(total_num_scheduled_tokens)
+                self.is_token_ids.copy_to_gpu(total_num_scheduled_tokens)
+        if num_common_tokens == 0:
+            return
+        if common_indices_match and max_flattened_index == (num_common_tokens - 1):
+            self.input_ids.gpu[:num_common_tokens].copy_(
+                self.input_batch.prev_sampled_token_ids[:num_common_tokens, 0],
+                non_blocking=True,
+            )
+            if self.enable_prompt_embeds:
+                self.is_token_ids.gpu[:num_common_tokens] = True
+            return
+
+        sampled_tokens_index_tensor = torch.tensor(
+            sample_flattened_indices, dtype=torch.int64, pin_memory=self.pin_memory
+        ).to(self.device, non_blocking=True)
+        prev_common_req_indices_tensor = torch.tensor(
+            prev_indices, dtype=torch.int64, pin_memory=self.pin_memory
+        ).to(self.device, non_blocking=True)
+        self.input_ids.gpu.scatter_(
+            dim=0,
+            index=sampled_tokens_index_tensor,
+            src=self.input_batch.prev_sampled_token_ids[prev_common_req_indices_tensor, 0],
+        )
+
+        if self._draft_token_ids is None or not spec_flattened_indices:
+            return
+
+        assert isinstance(self._draft_token_ids, torch.Tensor)
+        draft_tokens_index_tensor = torch.tensor(
+            spec_flattened_indices, dtype=torch.int64, pin_memory=self.pin_memory
+        ).to(self.device, non_blocking=True)
+        prev_draft_token_indices_tensor = torch.tensor(
+            prev_draft_token_indices, dtype=torch.int64, pin_memory=self.pin_memory
+        ).to(self.device, non_blocking=True)
+        draft_token_ids = self._draft_token_ids.to(dtype=torch.int32)
+        self.input_ids.gpu.scatter_(
+            dim=0,
+            index=draft_tokens_index_tensor,
+            src=draft_token_ids.flatten()[prev_draft_token_indices_tensor],
+        )
 
     @torch.inference_mode()
     def execute_model(
@@ -1515,29 +1681,12 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
-        if (
+        if len(scheduler_output.num_scheduled_tokens) != 0 and (
             envs.VLLM_ECHO_ENABLED
-            and self.echo_cu_draft_tokens
-            and len(scheduler_output.num_scheduled_tokens) != 0
+            or self.echo_cu_draft_tokens
+            or self._draft_token_ids is not None
         ):
-            for req_id in list(scheduler_output.num_scheduled_tokens.keys()):
-                draft_token_num = self.echo_cu_draft_tokens.get(req_id)
-                if draft_token_num is None:
-                    continue
-                spec_tokens = scheduler_output.scheduled_spec_decode_tokens.get(
-                    req_id, []
-                )
-                scheduler_output.scheduled_spec_decode_tokens[req_id] = spec_tokens[
-                    :draft_token_num
-                ]
-                old_num_scheduled_tokens = scheduler_output.num_scheduled_tokens[
-                    req_id
-                ]
-                scheduler_output.num_scheduled_tokens[req_id] = draft_token_num + 1
-                scheduler_output.total_num_scheduled_tokens -= (
-                    old_num_scheduled_tokens - (draft_token_num + 1)
-                )
-            self.echo_cu_draft_tokens = {}
+            self._echo_trim_scheduler_output(scheduler_output)
         if self.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
@@ -1968,13 +2117,15 @@ class NPUModelRunner(GPUModelRunner):
                 sample_hidden_states,
                 batch_desc,
             )
-            mask = (self._draft_token_ids != -1)
+            per_req_counts = getattr(self.drafter, "_echo_per_req_draft_counts", None)
+            if per_req_counts is not None:
+                counts = per_req_counts.cpu().tolist()
+            else:
+                mask = self._draft_token_ids != -1
+                counts = mask.int().sum(dim=1).cpu().tolist()
             self.echo_cu_draft_tokens = {
                 req_id: int(count)
-                for req_id, count in zip(
-                    self.input_batch.req_ids,
-                    mask.int().sum(dim=1).cpu().tolist(),
-                )
+                for req_id, count in zip(self.input_batch.req_ids, counts)
             }
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
