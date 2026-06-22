@@ -3467,7 +3467,7 @@ class NPUModelRunner(GPUModelRunner):
                             else:
                                 kv_cache_raw_tensors[layer_name_inner] = (k_tensor, v_tensor)
         layer_names = set()
-                for group in kv_cache_config.kv_cache_groups:
+        for group in kv_cache_config.kv_cache_groups:
             for layer_name in group.layer_names:
                 if layer_name in self.runner_only_attn_layers:
                     continue
