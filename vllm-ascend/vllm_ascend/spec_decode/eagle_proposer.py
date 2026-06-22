@@ -100,7 +100,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # Target model / runner must keep the user-configured MTP depth; only the
         # draft proposer expands buffers up to VLLM_ECHO_MAX_SPEC_NUM.
         super().__init__(vllm_config, device, pass_hidden_states_to_model, runner=runner)
-
         self._target_num_speculative_tokens = self.speculative_config.num_speculative_tokens
         if envs.VLLM_ECHO_ENABLED:
             self._echo_draft_max_tokens = envs.VLLM_ECHO_MAX_SPEC_NUM
@@ -526,7 +525,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 num_tokens=num_tokens,
             )
             forward_context = get_forward_context()
-            if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and not _EXTRA_CTX.capturing:
+                        if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and not _EXTRA_CTX.capturing:
                 self._update_full_graph_params(forward_context, num_tokens, multi_steps_attn_metadata)
 
     def _update_full_graph_params_if_needed(
@@ -854,7 +853,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if self.enable_enpu:
                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
                 draft_token_ids = run_draft()
-            else:
+                        else:
                 draft_token_ids = run_draft()
                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
 
