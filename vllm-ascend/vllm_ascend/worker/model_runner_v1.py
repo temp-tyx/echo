@@ -1792,6 +1792,35 @@ class NPUModelRunner(GPUModelRunner):
                 ),
             ) as kv_connector_output,
         ):
+            if envs.VLLM_ECHO_ENABLED and num_scheduled_tokens:
+                attn_max_query_len = (
+                    spec_decode_common_attn_metadata.max_query_len
+                    if spec_decode_common_attn_metadata is not None
+                    else max_num_scheduled_tokens
+                )
+                attn_decode_threshold = None
+                if self.attn_groups:
+                    try:
+                        attn_decode_threshold = self.attn_groups[0][0].get_metadata_builder(0).decode_threshold
+                    except AttributeError:
+                        pass
+                spec_lens = {
+                    rid: len(toks)
+                    for rid, toks in scheduler_output.scheduled_spec_decode_tokens.items()
+                }
+                logger.info(
+                    "[ECHO diag] target_forward max_query_len=%s "
+                    "runner_decode_threshold=%s attn_decode_threshold=%s "
+                    "uniform_decode_query_len=%s cudagraph_mode=%s "
+                    "per_req_scheduled=%s spec_lens=%s",
+                    attn_max_query_len,
+                    self.decode_threshold,
+                    attn_decode_threshold,
+                    self.uniform_decode_query_len,
+                    cudagraph_mode,
+                    dict(zip(req_ids, num_scheduled_tokens_np.tolist())),
+                    spec_lens,
+                )
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
