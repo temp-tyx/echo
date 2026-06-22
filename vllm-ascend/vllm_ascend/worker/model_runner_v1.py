@@ -1375,7 +1375,6 @@ class NPUModelRunner(GPUModelRunner):
                 draft_max,
             )
             draft_num_spec_restore = self.drafter.num_speculative_tokens
-            runner_num_spec_restore = self.num_spec_tokens
             self.drafter.num_speculative_tokens = draft_step
             self.num_spec_tokens = draft_step
             common_attn_metadata = spec_decode_common_attn_metadata
@@ -1496,6 +1495,10 @@ class NPUModelRunner(GPUModelRunner):
                 num_scheduled_tokens=num_scheduled_tokens,
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
             )
+            self.drafter.num_speculative_tokens = draft_num_spec_restore
+            if isinstance(draft_token_ids, torch.Tensor):
+                # Scatter stride must match the returned draft tensor width.
+                self.num_spec_tokens = draft_token_ids.shape[1]
         else:
             raise ValueError(f"Unknown speculative decoding method: {self.speculative_config.method}")
 
@@ -1524,25 +1527,34 @@ class NPUModelRunner(GPUModelRunner):
             getattr(drafter, "_echo_per_req_draft_counts", None) if drafter is not None else None
         )
 
+        draft_tensor = self._draft_token_ids
+
         for req_id in list(scheduler_output.num_scheduled_tokens.keys()):
             req_idx = self.input_batch.req_id_to_index.get(req_id)
             if req_idx is None:
                 continue
 
-            draft_count: int | None = self.echo_cu_draft_tokens.get(req_id)
+            spec_list = scheduler_output.scheduled_spec_decode_tokens.get(req_id, [])
+            has_spec = bool(spec_list)
+            has_echo_record = req_id in self.echo_cu_draft_tokens
+            # Only trim requests actively scheduled for spec decode.
+            if not has_spec and not has_echo_record:
+                continue
+
+            draft_count: int | None = (
+                self.echo_cu_draft_tokens.get(req_id) if has_echo_record else None
+            )
             if per_req_counts is not None and req_idx < per_req_counts.shape[0]:
                 pruned_count = int(per_req_counts[req_idx].item())
                 draft_count = pruned_count if draft_count is None else min(draft_count, pruned_count)
 
-            draft_tensor = self._draft_token_ids
             if isinstance(draft_tensor, torch.Tensor) and req_idx < draft_tensor.shape[0]:
                 valid_count = int((draft_tensor[req_idx] != -1).sum().item())
                 if valid_count > 0:
                     draft_count = valid_count if draft_count is None else min(draft_count, valid_count)
 
-            spec_list = scheduler_output.scheduled_spec_decode_tokens.get(req_id, [])
             if draft_count is None:
-                if not spec_list:
+                if not has_spec:
                     continue
                 draft_count = len(spec_list)
 
@@ -1602,10 +1614,8 @@ class NPUModelRunner(GPUModelRunner):
             prev_indices.append(prev_index)
             req_id = self.input_batch.req_ids[cur_index]
             spec_list = scheduled_spec_tokens.get(req_id, ())
-            if spec_list:
-                draft_len = int(per_req_tokens[cur_index]) - 1
-            else:
-                draft_len = 0
+            scheduled = int(per_req_tokens[cur_index])
+            draft_len = scheduled - 1 if spec_list and scheduled > 1 else 0
             total_num_spec_tokens += draft_len
             flattened_index = cu_num_tokens[cur_index].item() - 1
             sample_flattened_indices.append(flattened_index - draft_len)
@@ -1671,10 +1681,10 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
-        if len(scheduler_output.num_scheduled_tokens) != 0 and (
-                envs.VLLM_ECHO_ENABLED
-                or self.echo_cu_draft_tokens
-                or self._draft_token_ids is not None
+        if (
+            len(scheduler_output.num_scheduled_tokens) != 0
+            and scheduler_output.scheduled_spec_decode_tokens
+            and (envs.VLLM_ECHO_ENABLED or self.echo_cu_draft_tokens)
         ):
             self._echo_trim_scheduler_output(scheduler_output)
         if self.vllm_config.model_config.enable_return_routed_experts:
@@ -3802,7 +3812,7 @@ class NPUModelRunner(GPUModelRunner):
             # attention backend subclasses (e.g. ChunkedLocalAttention) unless
             # they are cached correctly, there will be different objects per
             # layer.
-                        for layer_name in kv_cache_group_spec.layer_names:
+            for layer_name in kv_cache_group_spec.layer_names:
                 attn_backend = layers[layer_name].get_attn_backend()
                 full_cls_name = attn_backend.full_cls_name()
                 layer_kv_cache_spec = kv_cache_group_spec.kv_cache_spec
@@ -4000,7 +4010,7 @@ class NPUModelRunner(GPUModelRunner):
             return
 
         req_ids = self.input_batch.req_ids
-                for req_id in req_ids:
+        for req_id in req_ids:
             req = self.requests.get(req_id)
             if req is None:
                 continue
