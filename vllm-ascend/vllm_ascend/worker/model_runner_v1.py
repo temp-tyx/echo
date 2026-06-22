@@ -67,6 +67,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
+    DraftTokenIds,
     ECConnectorOutput,
     LogprobsLists,
     LogprobsTensors,
@@ -239,6 +240,18 @@ class NPUModelRunner(GPUModelRunner):
         vllm_config.scheduler_config.max_num_batched_tokens += max_pcp_pad_tokens
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
+
+        if (
+            envs.VLLM_ECHO_ENABLED
+            and self.draft_token_ids_cpu is not None
+            and self.draft_token_ids_cpu.shape[1] < envs.VLLM_ECHO_MAX_SPEC_NUM
+        ):
+            self.draft_token_ids_cpu = torch.empty(
+                (self.max_num_reqs, envs.VLLM_ECHO_MAX_SPEC_NUM),
+                dtype=torch.int64,
+                device="cpu",
+                pin_memory=self.pin_memory,
+            )
 
         # NOTE: For FULL mode we change +1 to +2 to reserve extra space for padding.
         # See _pad_query_start_loc_for_fia.
@@ -472,7 +485,6 @@ class NPUModelRunner(GPUModelRunner):
                 block_size=self.block_size, device=self.device, vllm_config=self.vllm_config,
                 parallel_config=self.parallel_config, dtype=self.dtype)
         self.echo_cu_draft_tokens = []
-        self._echo_diag_step = 0
 
     @property
     def use_cp(self) -> bool:
@@ -1328,11 +1340,15 @@ class NPUModelRunner(GPUModelRunner):
         elif self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model():
             echo_k_max = envs.VLLM_ECHO_K_MAX
             batch_size = spec_decode_common_attn_metadata.batch_size()
-            draft_step = min(max(envs.VLLM_ECHO_STEPS_MULTIPLIER * echo_k_max // batch_size, 1), self.drafter.num_speculative_tokens)
+            draft_max = getattr(
+                self.drafter, "_echo_draft_max_tokens", self.drafter.num_speculative_tokens
+            )
+            draft_step = min(
+                max(envs.VLLM_ECHO_STEPS_MULTIPLIER * echo_k_max // batch_size, 1),
+                draft_max,
+            )
+            draft_num_spec_restore = self.drafter.num_speculative_tokens
             self.drafter.num_speculative_tokens = draft_step
-            # TODO: gpu_model_runner
-            self.num_spec_tokens = draft_step
-            self.speculative_config.num_speculative_tokens = draft_step
             common_attn_metadata = spec_decode_common_attn_metadata
             sampled_token_ids = valid_sampled_token_ids
 
@@ -1451,10 +1467,58 @@ class NPUModelRunner(GPUModelRunner):
                 num_scheduled_tokens=num_scheduled_tokens,
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
             )
+            self.drafter.num_speculative_tokens = draft_num_spec_restore
+            if isinstance(draft_token_ids, torch.Tensor):
+                self.num_spec_tokens = draft_token_ids.shape[1]
         else:
             raise ValueError(f"Unknown speculative decoding method: {self.speculative_config.method}")
 
         return draft_token_ids
+
+    def _ensure_draft_token_ids_cpu_capacity(self, num_cols: int) -> None:
+        assert self.draft_token_ids_cpu is not None
+        if self.draft_token_ids_cpu.shape[1] >= num_cols:
+            return
+        self.draft_token_ids_cpu = torch.empty(
+            (self.max_num_reqs, num_cols),
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=self.pin_memory,
+        )
+
+    def _copy_draft_token_ids_to_cpu(
+        self, scheduler_output: "SchedulerOutput", zeros_only: bool = False
+    ) -> None:
+        if envs.VLLM_ECHO_ENABLED and self.use_async_scheduling:
+            self._draft_token_req_ids = self.input_batch.req_ids.copy()
+            draft_token_ids = self._draft_token_ids
+            if not torch.is_tensor(draft_token_ids):
+                return
+            assert self.draft_token_ids_event is not None
+            assert self.draft_token_ids_copy_stream is not None
+            assert self.draft_token_ids_cpu is not None
+            num_reqs = draft_token_ids.shape[0]
+            num_cols = draft_token_ids.shape[1]
+            self._ensure_draft_token_ids_cpu_capacity(num_cols)
+            default_stream = torch.npu.current_stream()
+            with torch.npu.stream(self.draft_token_ids_copy_stream):
+                self.draft_token_ids_copy_stream.wait_stream(default_stream)
+                if not zeros_only:
+                    self.draft_token_ids_cpu[:num_reqs].copy_(
+                        draft_token_ids, non_blocking=True
+                    )
+                else:
+                    self.draft_token_ids_cpu[:num_reqs] = 0
+                self.draft_token_ids_event.record()
+            return
+        super()._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=zeros_only)
+
+    def take_draft_token_ids(self) -> DraftTokenIds | None:
+        draft = super().take_draft_token_ids()
+        if draft is None or not envs.VLLM_ECHO_ENABLED:
+            return draft
+        filtered = [[t for t in row if t != -1] for row in draft.draft_token_ids]
+        return DraftTokenIds(draft.req_ids, filtered)
 
     @torch.inference_mode()
     def execute_model(
@@ -1462,37 +1526,6 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
-        if (
-            envs.VLLM_ECHO_ENABLED
-            and scheduler_output.num_scheduled_tokens
-            and self.input_batch.req_ids
-        ):
-            self._echo_diag_step += 1
-
-        if len(scheduler_output.num_scheduled_tokens) != 0 and len(self.input_batch.req_ids) != 0:
-            if len(self.echo_cu_draft_tokens) == len(self.input_batch.req_ids):
-                req_ids = scheduler_output.num_scheduled_tokens.keys()
-                for req_id, draft_token_num in zip(req_ids, self.echo_cu_draft_tokens):
-                    spec_before = scheduler_output.scheduled_spec_decode_tokens.get(req_id, [])
-                    old_num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
-                    scheduler_output.scheduled_spec_decode_tokens[req_id] = spec_before[:draft_token_num]
-                    scheduler_output.num_scheduled_tokens[req_id] = draft_token_num + 1
-                    scheduler_output.total_num_scheduled_tokens -= (
-                        old_num_scheduled_tokens - (draft_token_num + 1)
-                    )
-                    if envs.VLLM_ECHO_ENABLED:
-                        spec_after = scheduler_output.scheduled_spec_decode_tokens.get(req_id, [])
-                        logger.info(
-                            "[ECHO diag] trim step=%s req=%s echo_cu=%s "
-                            "old_sched=%s spec_before=%s new_sched=%s spec_after=%s",
-                            self._echo_diag_step,
-                            req_id,
-                            draft_token_num,
-                            old_num_scheduled_tokens,
-                            len(spec_before),
-                            scheduler_output.num_scheduled_tokens[req_id],
-                            len(spec_after),
-                        )
         if self.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
@@ -1925,18 +1958,6 @@ class NPUModelRunner(GPUModelRunner):
             )
             mask = (self._draft_token_ids != -1)
             self.echo_cu_draft_tokens = mask.int().sum(dim=1).cpu().tolist()
-            if envs.VLLM_ECHO_ENABLED:
-                draft_cols = (
-                    self._draft_token_ids.shape[1]
-                    if torch.is_tensor(self._draft_token_ids)
-                    else None
-                )
-                logger.info(
-                    "[ECHO diag] propose step=%s echo_cu=%s draft_cols=%s",
-                    self._echo_diag_step,
-                    self.echo_cu_draft_tokens,
-                    draft_cols,
-                )
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         (

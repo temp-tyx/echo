@@ -1853,8 +1853,21 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         pruned_draft_ids = draft_token_ids.clone()
         pruned_draft_ids[~mask] = -1
+        self._echo_per_req_draft_counts = mask.sum(dim=1)
 
-        return pruned_draft_ids
+        return self._compact_echo_draft_rows(pruned_draft_ids)
+
+    @staticmethod
+    def _compact_echo_draft_rows(draft_token_ids: torch.Tensor) -> torch.Tensor:
+        """Left-align valid drafts so async scatter prefix indices stay correct."""
+        batch_size, width = draft_token_ids.shape
+        compact = torch.full_like(draft_token_ids, -1)
+        for row in range(batch_size):
+            valid = draft_token_ids[row][draft_token_ids[row] != -1]
+            n = int(valid.numel())
+            if n:
+                compact[row, :n] = valid
+        return compact
 
 
 class AscendEagleProposer(EagleProposer, AscendSpecDecodeBaseProposer):

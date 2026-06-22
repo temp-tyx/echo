@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
-import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -63,8 +62,6 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
-
-_ECHO_DIAG_ENGINE_STEP = 0
 
 
 class Scheduler(SchedulerInterface):
@@ -1370,12 +1367,9 @@ class Scheduler(SchedulerInterface):
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             )
             if scheduled_spec_token_ids and generated_token_ids:
-                global _ECHO_DIAG_ENGINE_STEP
-                _ECHO_DIAG_ENGINE_STEP += 1
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_accepted = len(generated_token_ids) - 1
                 num_rejected = num_draft_tokens - num_accepted
-                num_computed_before = request.num_computed_tokens
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled
                 # tokens and rejections. If some tokens are rejected,
@@ -1387,20 +1381,6 @@ class Scheduler(SchedulerInterface):
                 # the scheduled spec tokens count and so is similarly adjusted.
                 if request.num_output_placeholders > 0:
                     request.num_output_placeholders -= num_rejected
-                if os.getenv("VLLM_ECHO_ENABLED", "1") == "1":
-                    logger.info(
-                        "[ECHO diag] reject step=%s req=%s engine_spec=%s "
-                        "num_accepted=%s num_rejected=%s num_computed %s->%s "
-                        "generated_len=%s",
-                        _ECHO_DIAG_ENGINE_STEP,
-                        req_id,
-                        num_draft_tokens,
-                        num_accepted,
-                        num_rejected,
-                        num_computed_before,
-                        request.num_computed_tokens,
-                        len(generated_token_ids),
-                    )
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
                     num_draft_tokens=num_draft_tokens,
@@ -1707,12 +1687,6 @@ class Scheduler(SchedulerInterface):
                 metadata = request.structured_output_request
                 spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
             request.spec_token_ids = spec_token_ids
-            if os.getenv("VLLM_ECHO_ENABLED", "1") == "1":
-                logger.info(
-                    "[ECHO diag] sync req=%s synced_spec_len=%s",
-                    req_id,
-                    len(spec_token_ids),
-                )
 
     def update_draft_token_ids_in_output(
         self, draft_token_ids: DraftTokenIds, scheduler_output: SchedulerOutput
