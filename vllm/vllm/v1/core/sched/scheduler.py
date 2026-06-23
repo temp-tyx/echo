@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -220,6 +221,27 @@ class Scheduler(SchedulerInterface):
                 self.num_lookahead_tokens = self.num_spec_tokens
             if speculative_config.uses_draft_model():
                 self.num_lookahead_tokens = self.num_spec_tokens
+
+            # [ECHO experiment B] Surgically widen KV lookahead reservation so it
+            # matches ECHO's actual draft propose width (VLLM_ECHO_MAX_SPEC_NUM),
+            # WITHOUT touching num_speculative_tokens. num_lookahead_tokens is only
+            # consumed by allocate_slots for KV reservation, so widening it cannot
+            # reintroduce the input/draft buffer (slot_mapping) divergence that the
+            # earlier num_speculative_tokens override caused. Goal: confirm whether
+            # the low-quality output comes from KV under-reservation (lookahead=3
+            # while verify reads up to VLLM_ECHO_MAX_SPEC_NUM drafts).
+            if (
+                self.num_lookahead_tokens > 0
+                and int(os.getenv("VLLM_ECHO_ENABLED", "1"))
+            ):
+                _echo_lookahead = int(os.getenv("VLLM_ECHO_MAX_SPEC_NUM", "3"))
+                if _echo_lookahead > self.num_lookahead_tokens:
+                    logger.info(
+                        "[ECHO expB] override num_lookahead_tokens %d -> %d",
+                        self.num_lookahead_tokens,
+                        _echo_lookahead,
+                    )
+                    self.num_lookahead_tokens = _echo_lookahead
 
         # Create the KV cache manager.
         self.kv_cache_manager = KVCacheManager(
