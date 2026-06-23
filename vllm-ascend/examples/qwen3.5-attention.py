@@ -60,14 +60,20 @@ def main():
         model=MODEL_PATH,
         max_model_len=24576,
         tensor_parallel_size=1,
-        enforce_eager=False,
-        compilation_config=CompilationConfig(
-            cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
-            # cudagraph_capture_sizes=[4,8,12,16,24,32,36,40,44,48,52,56,60,64,68,72,76,80]
-        ),
+        enforce_eager=True,
+        # compilation_config=CompilationConfig(
+        #     cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+        #     # cudagraph_capture_sizes=[4,8,12,16,24,32,36,40,44,48,52,56,60,64,68,72,76,80]
+        # ),
         speculative_config={
             "method": "qwen3_5_mtp",
-            "num_speculative_tokens": 3,
+            # ECHO: set the static spec width to VLLM_ECHO_MAX_SPEC_NUM so that
+            # EVERY component (scheduler lookahead, KV/graph/buffer sizing,
+            # decode_token_per_req, attention decode_threshold) is consistently
+            # sized for the full ECHO verify width from process start. ECHO then
+            # prunes via global top-k and syncs the kept count back to the
+            # scheduler. Keep this equal to VLLM_ECHO_MAX_SPEC_NUM.
+            "num_speculative_tokens": 7,
         },
     )
 

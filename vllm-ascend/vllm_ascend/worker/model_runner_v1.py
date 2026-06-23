@@ -1547,7 +1547,14 @@ class NPUModelRunner(GPUModelRunner):
             with torch.npu.stream(self.draft_token_ids_copy_stream):
                 self.draft_token_ids_copy_stream.wait_stream(default_stream)
                 if not zeros_only:
-                    self.draft_token_ids_cpu[:num_reqs].copy_(
+                    # ECHO emits a dynamic draft width (draft_step shrinks with
+                    # batch size), which can be narrower than the statically sized
+                    # cpu buffer (num_speculative_tokens). Copy into the matching
+                    # prefix and pad the unused trailing columns with -1 so that
+                    # take_draft_token_ids drops them instead of leaking stale ids.
+                    if num_cols < self.draft_token_ids_cpu.shape[1]:
+                        self.draft_token_ids_cpu[:num_reqs, num_cols:] = -1
+                    self.draft_token_ids_cpu[:num_reqs, :num_cols].copy_(
                         draft_token_ids, non_blocking=True
                     )
                 else:
