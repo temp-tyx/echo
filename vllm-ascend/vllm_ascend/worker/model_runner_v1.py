@@ -18,6 +18,7 @@
 #
 
 import math
+import os
 import sys
 import time
 from collections import defaultdict
@@ -2149,7 +2150,60 @@ class NPUModelRunner(GPUModelRunner):
             logits,
             sampling_metadata,
         )
+        self._echo_dump_lossless(logits, spec_decode_metadata, sampler_output)
         return sampler_output
+
+    def _echo_dump_lossless(self, logits, spec_decode_metadata, sampler_output) -> None:
+        """[ECHO debug] Verify greedy losslessness: every committed token must
+        equal the target model's argmax at that position. Dumps draft tokens,
+        per-position target argmax, bonus argmax and the sampler output so we can
+        tell whether (a) target logits go garbage beyond a certain draft index
+        (-> forward/graph/attn width bug) or (b) acceptance diverges from the
+        greedy rule (-> rejection sampler bug). Gated by VLLM_ECHO_DEBUG_LOSSLESS.
+        """
+        if not int(os.getenv("VLLM_ECHO_DEBUG_LOSSLESS", "0")):
+            return
+        if logits is None or spec_decode_metadata is None:
+            return
+        try:
+            md = spec_decode_metadata
+            draft = md.draft_token_ids.tolist()
+            tgt_at_draft = logits[md.target_logits_indices].argmax(dim=-1).tolist()
+            bonus = logits[md.bonus_logits_indices].argmax(dim=-1).tolist()
+            accepted = sampler_output.sampled_token_ids
+            accepted = accepted.tolist() if hasattr(accepted, "tolist") else accepted
+            logger.info(
+                "[ECHO lossless] num_draft=%s\n  draft        =%s\n  tgt@draft    =%s\n  bonus        =%s\n  accepted     =%s",
+                md.num_draft_tokens,
+                draft,
+                tgt_at_draft,
+                bonus,
+                accepted,
+            )
+            # Greedy expectation per request: accept draft[i] while it equals the
+            # target argmax; at first mismatch emit target argmax and stop; if all
+            # drafts accepted, emit bonus. Flag the first index where the actually
+            # committed token disagrees with the target argmax (losslessness break).
+            off = 0
+            for req_idx, n in enumerate(md.num_draft_tokens):
+                row = accepted[req_idx] if req_idx < len(accepted) else []
+                for i in range(n):
+                    committed = row[i] if i < len(row) else None
+                    if committed is None or committed == -1:
+                        break
+                    if committed != tgt_at_draft[off + i]:
+                        logger.warning(
+                            "[ECHO lossless] VIOLATION req=%d pos=%d committed=%s tgt_argmax=%s draft=%s",
+                            req_idx,
+                            i,
+                            committed,
+                            tgt_at_draft[off + i],
+                            draft[off + i],
+                        )
+                        break
+                off += n
+        except Exception as exc:  # pragma: no cover - debug only
+            logger.warning("[ECHO lossless] dump failed: %s", exc)
 
     # TODO: remove this func after eagle_proposer is refactored and
     #  _bookkeeping_sync is moved after propose_draft_token_ids
