@@ -377,6 +377,8 @@ class NPUModelRunner(GPUModelRunner):
 
         self._set_up_drafter()
 
+        self._apply_echo_runtime_decode_width()
+
         # Event for async GPU→CPU copy of corrected seq_lens in async
         # spec decode mode. Recorded in _prepare_inputs, synchronized
         # in _build_attention_metadata. Created once, reused each iteration.
@@ -398,7 +400,11 @@ class NPUModelRunner(GPUModelRunner):
         set_cos_and_sin(vllm_config, self.max_num_reqs, self.uniform_decode_query_len, self.dtype, self.device)
         set_mc2_tokens_capacity(vllm_config, self.max_num_reqs, self.uniform_decode_query_len)
         set_mc2_mask(vllm_config, self.device)
-        self.decode_threshold = 1 + (self.speculative_config.num_speculative_tokens if self.speculative_config else 0)
+        if not envs.VLLM_ECHO_ENABLED or not self.speculative_config:
+            self.decode_threshold = 1 + (
+                self.speculative_config.num_speculative_tokens if self.speculative_config else 0
+            )
+        # else: decode_threshold already set in _apply_echo_runtime_decode_width
 
         self.use_aclgraph = self._use_aclgraph()
 
@@ -485,6 +491,38 @@ class NPUModelRunner(GPUModelRunner):
                 block_size=self.block_size, device=self.device, vllm_config=self.vllm_config,
                 parallel_config=self.parallel_config, dtype=self.dtype)
         self.echo_cu_draft_tokens = []
+
+    @staticmethod
+    def _echo_verify_query_len(speculative_config) -> int | None:
+        if not envs.VLLM_ECHO_ENABLED or speculative_config is None:
+            return None
+        return max(
+            1 + speculative_config.num_speculative_tokens,
+            1 + envs.VLLM_ECHO_MAX_SPEC_NUM,
+        )
+
+    def _apply_echo_runtime_decode_width(self) -> None:
+        echo_query_len = self._echo_verify_query_len(self.speculative_config)
+        if echo_query_len is None:
+            return
+        self.uniform_decode_query_len = echo_query_len
+        self.decode_threshold = echo_query_len
+        self.decode_token_per_req = echo_query_len
+        self.cudagraph_dispatcher.uniform_decode_query_len = echo_query_len
+        if getattr(self, "pcp_manager", None) is not None:
+            self.pcp_manager.decode_threshold = echo_query_len
+
+    def _patch_attn_builders_echo_decode_width(self) -> None:
+        echo_query_len = self._echo_verify_query_len(self.speculative_config)
+        if echo_query_len is None:
+            return
+        for group in self.attn_groups:
+            for builder in group.metadata_builders:
+                if hasattr(builder, "decode_threshold"):
+                    builder.decode_threshold = echo_query_len
+                if hasattr(builder, "reorder_batch_threshold"):
+                    builder.reorder_batch_threshold = echo_query_len
+        self.reorder_batch_threshold = echo_query_len
 
     @property
     def use_cp(self) -> bool:
@@ -3723,6 +3761,8 @@ class NPUModelRunner(GPUModelRunner):
                 kv_cache_group_spec
             )
             self.attn_groups.append(create_attn_groups(attn_backends[0], i))
+
+        self._patch_attn_builders_echo_decode_width()
 
         # Calculate reorder batch threshold (if needed)
         self.calculate_reorder_batch_threshold()
