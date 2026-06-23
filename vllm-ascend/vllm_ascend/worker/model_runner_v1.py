@@ -517,8 +517,12 @@ class NPUModelRunner(GPUModelRunner):
         echo_query_len = self._echo_verify_query_len(self.speculative_config)
         if echo_query_len is None:
             return
-        for group in self.attn_groups:
-            for builder in group.metadata_builders:
+        for group in self._attn_group_iterator():
+            builders = getattr(group, "metadata_builders", None)
+            if builders is None:
+                builder = group.get_metadata_builder()
+                builders = [builder] if builder is not None else []
+            for builder in builders:
                 if hasattr(builder, "decode_threshold"):
                     builder.decode_threshold = echo_query_len
                 if hasattr(builder, "reorder_batch_threshold"):
