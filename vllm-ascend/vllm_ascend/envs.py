@@ -122,9 +122,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Multiplier for extending speculation steps in ECHO.
     # The actual number of draft steps will be k * steps_multiplier.
     "VLLM_ECHO_STEPS_MULTIPLIER": lambda: int(os.getenv("VLLM_ECHO_STEPS_MULTIPLIER", "1")),
-    # Maximum number of speculative steps in ECHO draft generation.
-    # Used to pre-allocate slot_mapping_group buffers for extended draft length.
-    "VLLM_ECHO_MAX_SPEC_NUM": lambda: int(os.getenv("VLLM_ECHO_MAX_SPEC_NUM", "3")),
 }
 
 # end-env-vars-definition

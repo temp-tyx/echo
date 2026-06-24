@@ -67,12 +67,12 @@ def main():
         # ),
         speculative_config={
             "method": "qwen3_5_mtp",
-            # ECHO: set the static spec width to VLLM_ECHO_MAX_SPEC_NUM so that
-            # EVERY component (scheduler lookahead, KV/graph/buffer sizing,
+            # ECHO uses num_speculative_tokens as the MAXIMUM draft/verify width.
+            # Set it to the largest speculation width you want ECHO to explore so
+            # that EVERY component (scheduler lookahead, KV/graph/buffer sizing,
             # decode_token_per_req, attention decode_threshold) is consistently
-            # sized for the full ECHO verify width from process start. ECHO then
-            # prunes via global top-k and syncs the kept count back to the
-            # scheduler. Keep this equal to VLLM_ECHO_MAX_SPEC_NUM.
+            # sized from process start. ECHO then prunes via global top-k below
+            # this bound and syncs the kept count back to the scheduler.
             "num_speculative_tokens": 7,
         },
     )

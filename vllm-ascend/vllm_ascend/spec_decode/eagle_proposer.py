@@ -96,17 +96,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     _runnable: ACLGraphWrapper | Callable
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device, pass_hidden_states_to_model: bool, runner=None):
-        # vllm_config.speculative_config.num_speculative_tokens = envs.VLLM_ECHO_MAX_SPEC_NUM
         super().__init__(vllm_config, device, pass_hidden_states_to_model, runner=runner)
+        # ECHO's max draft propose width is bounded by the static
+        # num_speculative_tokens. Deployments must set num_speculative_tokens to
+        # the maximum ECHO verify width so that every component (scheduler
+        # lookahead, KV/graph/buffer sizing, decode_threshold) is consistently
+        # sized; ECHO then prunes via global top-k below this bound.
         self._target_num_speculative_tokens = self.speculative_config.num_speculative_tokens
-        if envs.VLLM_ECHO_ENABLED:
-            self._echo_draft_max_tokens = envs.VLLM_ECHO_MAX_SPEC_NUM
-            self.num_speculative_tokens = max(
-                self._echo_draft_max_tokens,
-                self._target_num_speculative_tokens,
-            )
-        else:
-            self._echo_draft_max_tokens = self.num_speculative_tokens
+        self._echo_draft_max_tokens = self.num_speculative_tokens
 
         # Assign runner before it's used in the methods below
         self.runner = runner
