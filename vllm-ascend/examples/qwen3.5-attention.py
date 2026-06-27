@@ -1,17 +1,20 @@
+import argparse
+import logging
 import os
-import json
 from transformers import AutoProcessor
 from vllm import LLM, SamplingParams
 from qwen_vl_utils import process_vision_info
 from vllm.config import CompilationConfig, CUDAGraphMode
 
 
+logger = logging.getLogger(__name__)
+
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-image_path1 = ["/cache/t00932669/aisf-dataset/generalModel/business/VLM/AISF/AIHomeHub/seatDetection/screenshot/screenshot_123050_20260401_091010571.jpg",
-               "/cache/t00932669/aisf-dataset/generalModel/business/VLM/AISF/AIHomeHub/seatDetection/screenshot/screenshot_123050_20260401_091014161.jpg",               ]
-image_path2 = ["/cache/t00932669/aisf-dataset/generalModel/business/VLM/AISF/AIHomeHub/seatDetection/screenshot/screenshot_123050_20260401_091012441.jpg",
-               "/cache/t00932669/aisf-dataset/generalModel/business/VLM/AISF/AIHomeHub/seatDetection/screenshot/screenshot_123050_20260401_091015888.jpg"]
+image_path1 = ["screenshot/screenshot_123050_20260401_091010571.jpg",
+               "screenshot/screenshot_123050_20260401_091014161.jpg"]
+image_path2 = ["screenshot/screenshot_123050_20260401_091012441.jpg",
+               "screenshot/screenshot_123050_20260401_091015888.jpg"]
 
 SYSTEM_PROMPT = """### 任务：人物学习场景注意力状态判定
 **核心指令：** 你必须作为一个严格的逻辑分类器。请按以下分类标准按顺序逐条检查，判定是否属于该类别。
@@ -53,18 +56,21 @@ SYSTEM_PROMPT = """### 任务：人物学习场景注意力状态判定
 """
 
 
-def main():
+def main(base_image_dir: str):
     MODEL_PATH = "/softwarePlatform/c00879303/Qwen3-5/Qwen3.5-4B"
+
+    global image_path1, image_path2
+    image_path1 = [os.path.join(base_image_dir, p) for p in image_path1]
+    image_path2 = [os.path.join(base_image_dir, p) for p in image_path2]
 
     llm = LLM(
         model=MODEL_PATH,
         max_model_len=24576,
         tensor_parallel_size=1,
-        enforce_eager=True,
-        # compilation_config=CompilationConfig(
-        #     cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
-        #     # cudagraph_capture_sizes=[4,8,12,16,24,32,36,40,44,48,52,56,60,64,68,72,76,80]
-        # ),
+        enforce_eager=False,
+        compilation_config=CompilationConfig(
+            cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+        ),
         speculative_config={
             "method": "qwen3_5_mtp",
             # ECHO uses num_speculative_tokens as the MAXIMUM draft/verify width.
@@ -77,7 +83,7 @@ def main():
         },
     )
 
-    sampling_params = SamplingParams(max_tokens=128,temperature=0)
+    sampling_params = SamplingParams(max_tokens=100,temperature=0)
     processor = AutoProcessor.from_pretrained(MODEL_PATH)
 
     send_request(processor, llm, sampling_params, 2)
@@ -121,14 +127,21 @@ def send_request(processor, llm, sampling_params, bs):
         }
         requests_data.append(llm_inputs)
 
-    print("\n" + "=" * 60)
+    logger.info("=" * 60)
     outputs = llm.generate(requests_data, sampling_params=sampling_params)
 
     for output in outputs:
         generated_text = output.outputs[0].text
-        print("Generated text:", generated_text)
+        logger.info("Generated text: %s", generated_text)
 
 
 
 if __name__ == "__main__":
-    main()
+    # parser = argparse.ArgumentParser()
+    # parser.add_argument("base_image_dir", type=str)
+    # args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    # 使用方法 python qwen3.5_attention.py /cache/xxx
+    base_image_dir = "/cache/t00932669/aisf-dataset/generalModel/business/VLM/AISF/AIHomeHub/seatDetection"
+    main(base_image_dir)

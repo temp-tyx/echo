@@ -18,7 +18,6 @@
 #
 
 import math
-import os
 import sys
 import time
 from collections import defaultdict
@@ -387,9 +386,7 @@ class NPUModelRunner(GPUModelRunner):
         set_cos_and_sin(vllm_config, self.max_num_reqs, self.uniform_decode_query_len, self.dtype, self.device)
         set_mc2_tokens_capacity(vllm_config, self.max_num_reqs, self.uniform_decode_query_len)
         set_mc2_mask(vllm_config, self.device)
-        self.decode_threshold = 1 + (
-            self.speculative_config.num_speculative_tokens if self.speculative_config else 0
-        )
+        self.decode_threshold = 1 + (self.speculative_config.num_speculative_tokens if self.speculative_config else 0)
 
         self.use_aclgraph = self._use_aclgraph()
 
@@ -1073,7 +1070,6 @@ class NPUModelRunner(GPUModelRunner):
             total_num_scheduled_tokens,
         )
 
-
     def _preprocess(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1334,10 +1330,7 @@ class NPUModelRunner(GPUModelRunner):
             draft_max = getattr(
                 self.drafter, "_echo_draft_max_tokens", self.drafter.num_speculative_tokens
             )
-            draft_step = min(
-                max(envs.VLLM_ECHO_STEPS_MULTIPLIER * echo_k_max // batch_size, 1),
-                draft_max,
-            )
+            draft_step = min(max(int(envs.VLLM_ECHO_STEPS_MULTIPLIER * echo_k_max // batch_size), 1), draft_max)
             draft_num_spec_restore = self.drafter.num_speculative_tokens
             self.drafter.num_speculative_tokens = draft_step
             common_attn_metadata = spec_decode_common_attn_metadata
@@ -1467,16 +1460,13 @@ class NPUModelRunner(GPUModelRunner):
         return draft_token_ids
 
     def _copy_draft_token_ids_to_cpu(
-        self, scheduler_output: "SchedulerOutput", zeros_only: bool = False
+            self, scheduler_output: "SchedulerOutput", zeros_only: bool = False
     ) -> None:
         if envs.VLLM_ECHO_ENABLED and self.use_async_scheduling:
             self._draft_token_req_ids = self.input_batch.req_ids.copy()
             draft_token_ids = self._draft_token_ids
             if not torch.is_tensor(draft_token_ids):
                 return
-            assert self.draft_token_ids_event is not None
-            assert self.draft_token_ids_copy_stream is not None
-            assert self.draft_token_ids_cpu is not None
             num_reqs = draft_token_ids.shape[0]
             num_cols = draft_token_ids.shape[1]
             default_stream = torch.npu.current_stream()
@@ -1778,35 +1768,6 @@ class NPUModelRunner(GPUModelRunner):
                 ),
             ) as kv_connector_output,
         ):
-            if envs.VLLM_ECHO_ENABLED and num_scheduled_tokens:
-                attn_max_query_len = (
-                    spec_decode_common_attn_metadata.max_query_len
-                    if spec_decode_common_attn_metadata is not None
-                    else max_num_scheduled_tokens
-                )
-                attn_decode_threshold = None
-                if self.attn_groups:
-                    try:
-                        attn_decode_threshold = self.attn_groups[0][0].get_metadata_builder(0).decode_threshold
-                    except AttributeError:
-                        pass
-                spec_lens = {
-                    rid: len(toks)
-                    for rid, toks in scheduler_output.scheduled_spec_decode_tokens.items()
-                }
-                logger.info(
-                    "[ECHO diag] target_forward max_query_len=%s "
-                    "runner_decode_threshold=%s attn_decode_threshold=%s "
-                    "uniform_decode_query_len=%s cudagraph_mode=%s "
-                    "per_req_scheduled=%s spec_lens=%s",
-                    attn_max_query_len,
-                    self.decode_threshold,
-                    attn_decode_threshold,
-                    self.uniform_decode_query_len,
-                    cudagraph_mode,
-                    dict(zip(req_ids, num_scheduled_tokens_np.tolist())),
-                    spec_lens,
-                )
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
@@ -2097,60 +2058,7 @@ class NPUModelRunner(GPUModelRunner):
             logits,
             sampling_metadata,
         )
-        self._echo_dump_lossless(logits, spec_decode_metadata, sampler_output)
         return sampler_output
-
-    def _echo_dump_lossless(self, logits, spec_decode_metadata, sampler_output) -> None:
-        """[ECHO debug] Verify greedy losslessness: every committed token must
-        equal the target model's argmax at that position. Dumps draft tokens,
-        per-position target argmax, bonus argmax and the sampler output so we can
-        tell whether (a) target logits go garbage beyond a certain draft index
-        (-> forward/graph/attn width bug) or (b) acceptance diverges from the
-        greedy rule (-> rejection sampler bug). Gated by VLLM_ECHO_DEBUG_LOSSLESS.
-        """
-        if not int(os.getenv("VLLM_ECHO_DEBUG_LOSSLESS", "0")):
-            return
-        if logits is None or spec_decode_metadata is None:
-            return
-        try:
-            md = spec_decode_metadata
-            draft = md.draft_token_ids.tolist()
-            tgt_at_draft = logits[md.target_logits_indices].argmax(dim=-1).tolist()
-            bonus = logits[md.bonus_logits_indices].argmax(dim=-1).tolist()
-            accepted = sampler_output.sampled_token_ids
-            accepted = accepted.tolist() if hasattr(accepted, "tolist") else accepted
-            logger.info(
-                "[ECHO lossless] num_draft=%s\n  draft        =%s\n  tgt@draft    =%s\n  bonus        =%s\n  accepted     =%s",
-                md.num_draft_tokens,
-                draft,
-                tgt_at_draft,
-                bonus,
-                accepted,
-            )
-            # Greedy expectation per request: accept draft[i] while it equals the
-            # target argmax; at first mismatch emit target argmax and stop; if all
-            # drafts accepted, emit bonus. Flag the first index where the actually
-            # committed token disagrees with the target argmax (losslessness break).
-            off = 0
-            for req_idx, n in enumerate(md.num_draft_tokens):
-                row = accepted[req_idx] if req_idx < len(accepted) else []
-                for i in range(n):
-                    committed = row[i] if i < len(row) else None
-                    if committed is None or committed == -1:
-                        break
-                    if committed != tgt_at_draft[off + i]:
-                        logger.warning(
-                            "[ECHO lossless] VIOLATION req=%d pos=%d committed=%s tgt_argmax=%s draft=%s",
-                            req_idx,
-                            i,
-                            committed,
-                            tgt_at_draft[off + i],
-                            draft[off + i],
-                        )
-                        break
-                off += n
-        except Exception as exc:  # pragma: no cover - debug only
-            logger.warning("[ECHO lossless] dump failed: %s", exc)
 
     # TODO: remove this func after eagle_proposer is refactored and
     #  _bookkeeping_sync is moved after propose_draft_token_ids
@@ -3170,7 +3078,6 @@ class NPUModelRunner(GPUModelRunner):
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
 
-
     def _align_memory(self, tensor: torch.Tensor, alignment: int) -> torch.Tensor:
         data_ptr = tensor.data_ptr()
         aligned_addr = (data_ptr + alignment - 1) // alignment * alignment
@@ -3214,7 +3121,6 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         return kv_caches
-
 
     def _get_layer_kv_cache_specs(self, kv_cache_config: KVCacheConfig) -> dict[str, KVCacheSpec]:
         layer_kv_cache_spec: dict[str, KVCacheSpec] = {}
@@ -3594,7 +3500,6 @@ class NPUModelRunner(GPUModelRunner):
                     raise ValueError("Unknown KV cache spec type.")
 
         return kv_caches
-
 
     def may_reinitialize_input_batch(self, kv_cache_config: KVCacheConfig) -> None:
         """

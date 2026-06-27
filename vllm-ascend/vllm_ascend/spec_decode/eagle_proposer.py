@@ -853,7 +853,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
 
             if envs.VLLM_ECHO_ENABLED:
-                draft_token_ids = self._apply_echo_pruning(draft_token_ids, batch_size)
+                draft_token_ids = self._apply_echo_pruning(draft_token_ids)
 
         return draft_token_ids
 
@@ -1818,53 +1818,40 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states.contiguous(), True)
         return last_hidden_states, positions, hidden_states
 
-    def _apply_echo_pruning(self, draft_token_ids: torch.Tensor, batch_size: int) -> torch.Tensor:
+    def _apply_echo_pruning(self, draft_token_ids: torch.Tensor) -> torch.Tensor:
         if not hasattr(self, "_echo_logits_list") or not self._echo_logits_list:
             return draft_token_ids
 
-        actual_batch_size = draft_token_ids.shape[0]
-        total_steps = draft_token_ids.shape[1]
+        actual_batch_size, total_steps = draft_token_ids.shape
+        logits_stack = torch.stack(self._echo_logits_list, dim=0)  # [T, B, V]
 
-        logits_list = self._echo_logits_list
-        log_probs_per_step = []
+        log_probs = F.log_softmax(logits_stack, dim=-1)  # [T, B, V]
+        step_tokens = draft_token_ids.transpose(0, 1)  # [T, B]
 
-        for step_idx in range(total_steps):
-            logits = logits_list[step_idx]
-            log_probs = F.log_softmax(logits, dim=-1)
-            step_tokens = draft_token_ids[:, step_idx]
-            step_log_probs = log_probs.gather(1, step_tokens.unsqueeze(1)).squeeze(1)
-            log_probs_per_step.append(step_log_probs)
+        step_log_probs = log_probs.gather(dim=2, index=step_tokens.unsqueeze(-1)).squeeze(-1)  # [T, B]
+        cond_log_probs = step_log_probs.transpose(0, 1)  # [B, T]
+        cum_log_probs = torch.cumsum(cond_log_probs, dim=1)  # [B, T]
 
-        cond_log_probs = torch.stack(log_probs_per_step, dim=1)
-        cum_log_probs = torch.cumsum(cond_log_probs, dim=1)
-
-        k_max = envs.VLLM_ECHO_K_MAX
-        k_max = min(k_max, cum_log_probs.numel())
-
+        k_max = min(envs.VLLM_ECHO_K_MAX - actual_batch_size, cum_log_probs.numel())
         flat_log_probs = cum_log_probs.flatten()
-        _, top_flat_indices = torch.topk(flat_log_probs, k=k_max)
+        top_flat_indices = torch.topk(flat_log_probs, k=k_max, sorted=False).indices
 
         mask = torch.zeros_like(flat_log_probs, dtype=torch.bool)
         mask[top_flat_indices] = True
         mask = mask.view(actual_batch_size, total_steps)
 
-        pruned_draft_ids = draft_token_ids.clone()
-        pruned_draft_ids[~mask] = -1
+        pruned = torch.where(mask, draft_token_ids, -1)
         self._echo_per_req_draft_counts = mask.sum(dim=1)
 
-        return self._compact_echo_draft_rows(pruned_draft_ids)
+        result = self._compact_echo_draft_rows(pruned)
+        return result
 
     @staticmethod
     def _compact_echo_draft_rows(draft_token_ids: torch.Tensor) -> torch.Tensor:
-        """Left-align valid drafts so async scatter prefix indices stay correct."""
-        batch_size, width = draft_token_ids.shape
-        compact = torch.full_like(draft_token_ids, -1)
-        for row in range(batch_size):
-            valid = draft_token_ids[row][draft_token_ids[row] != -1]
-            n = int(valid.numel())
-            if n:
-                compact[row, :n] = valid
-        return compact
+        mask = (draft_token_ids != -1).to(torch.int32)
+        sorted_indices = torch.argsort(mask, dim=1, descending=True, stable=True)
+        result = torch.gather(draft_token_ids, 1, sorted_indices)
+        return result
 
 
 class AscendEagleProposer(EagleProposer, AscendSpecDecodeBaseProposer):
