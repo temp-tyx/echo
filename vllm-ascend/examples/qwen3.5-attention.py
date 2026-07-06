@@ -13,8 +13,10 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 image_path1 = ["screenshot/screenshot_123050_20260401_091010571.jpg",
                "screenshot/screenshot_123050_20260401_091014161.jpg"]
-image_path2 = ["screenshot/screenshot_123050_20260401_091012441.jpg",
-               "screenshot/screenshot_123050_20260401_091015888.jpg"]
+image_path2 = ["screenshot/screenshot_123050_20260401_091010571.jpg",
+               "screenshot/screenshot_123050_20260401_091014161.jpg"]
+# image_path2 = ["screenshot/screenshot_123050_20260401_091012441.jpg",
+#                "screenshot/screenshot_123050_20260401_091015888.jpg"]
 
 SYSTEM_PROMPT = """### 任务：人物学习场景注意力状态判定
 **核心指令：** 你必须作为一个严格的逻辑分类器。请按以下分类标准按顺序逐条检查，判定是否属于该类别。
@@ -65,9 +67,13 @@ def main(base_image_dir: str):
 
     llm = LLM(
         model=MODEL_PATH,
-        max_model_len=24576,
+        max_model_len=3072,
+        max_num_batched_tokens=40000,
         tensor_parallel_size=1,
+        max_num_seqs=32,
+        gpu_memory_utilization=0.9,
         enforce_eager=False,
+        # async_scheduling=True,vim
         compilation_config=CompilationConfig(
             cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
         ),
@@ -134,6 +140,17 @@ def send_request(processor, llm, sampling_params, bs):
         generated_text = output.outputs[0].text
         logger.info("Generated text: %s", generated_text)
 
+
+
+if __name__ == "__main__":
+    # parser = argparse.ArgumentParser()
+    # parser.add_argument("base_image_dir", type=str)
+    # args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    # 使用方法 python qwen3.5_attention.py /cache/xxx
+    base_image_dir = "/cache/t00932669/aisf-dataset/generalModel/business/VLM/AISF/AIHomeHub/seatDetection"
+    main(base_image_dir)
 
 
 if __name__ == "__main__":
