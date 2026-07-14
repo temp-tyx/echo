@@ -263,6 +263,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         if spec_sequence_masks is not None:
             cu_seqlens = spec_query_start_loc[: attn_metadata.num_spec_decodes + 1]
             actual_seq_lengths = torch.cat([cu_seqlens[:1], cu_seqlens[1:] - cu_seqlens[:-1]])
+            actual_lens = actual_seq_lengths[1:]
+            num_accepted_tokens = torch.clamp(num_accepted_tokens, max=actual_lens)
             query_spec = l2norm_fwd(query_spec)
             key_spec = l2norm_fwd(key_spec)
             # Dispatches to the vllm-ascend AscendC custom operator

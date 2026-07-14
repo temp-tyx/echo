@@ -231,8 +231,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 num_decode_tokens = 0
 
             if num_prefills == 0 and num_decodes == 0:
+                max_spec_len = query_lens_cpu[spec_sequence_masks_cpu].max().item()
                 spec_token_size = min(
-                    num_spec_decodes * (self.num_spec + 1),
+                    num_spec_decodes * max_spec_len,
                     query_start_loc_cpu[-1].item(),
                 )
                 spec_token_indx = torch.arange(
@@ -245,7 +246,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 )
                 # Filter by spec_sequence_masks to exclude padded sequences
                 spec_state_indices_tensor = block_table_tensor[
-                    spec_sequence_masks, : self.num_spec + 1
+                    spec_sequence_masks, :max_spec_len
                 ]
                 non_spec_state_indices_tensor = None
                 # Padded sequences are always at the back, so the first

@@ -73,7 +73,7 @@ def main(base_image_dir: str):
         max_num_seqs=32,
         gpu_memory_utilization=0.9,
         enforce_eager=False,
-        # async_scheduling=True,vim
+        async_scheduling=True,
         compilation_config=CompilationConfig(
             cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
         ),
