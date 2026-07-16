@@ -232,6 +232,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
             if num_prefills == 0 and num_decodes == 0:
                 max_spec_len = query_lens_cpu[spec_sequence_masks_cpu].max().item()
+                if num_accepted_tokens is not None:
+                    spec_accepted_cpu = num_accepted_tokens[spec_sequence_masks_cpu]
+                    max_accepted = int(spec_accepted_cpu.max().item())
+                    max_spec_len = max(max_spec_len, max_accepted)
                 spec_token_size = min(
                     num_spec_decodes * max_spec_len,
                     query_start_loc_cpu[-1].item(),
@@ -256,6 +260,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 non_spec_query_start_loc = None
                 non_spec_query_start_loc_cpu = None
             else:
+                max_spec_len = query_lens_cpu[spec_sequence_masks_cpu].max().item()
+                if num_accepted_tokens is not None:
+                    spec_accepted_cpu = num_accepted_tokens[spec_sequence_masks_cpu]
+                    max_accepted = int(spec_accepted_cpu.max().item())
+                    max_spec_len = max(max_spec_len, max_accepted)
                 spec_token_masks = torch.repeat_interleave(
                     spec_sequence_masks, query_lens
                 )

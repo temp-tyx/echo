@@ -282,6 +282,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 actual_seq_lengths=actual_seq_lengths,
                 ssm_state_indices=spec_state_indices_tensor.flatten(),
                 num_accepted_tokens=num_accepted_tokens.to(torch.int32),
+                col_count=spec_state_indices_tensor.shape[1],
             ).unsqueeze(0)
         else:
             core_attn_out_spec, last_recurrent_state = None, None

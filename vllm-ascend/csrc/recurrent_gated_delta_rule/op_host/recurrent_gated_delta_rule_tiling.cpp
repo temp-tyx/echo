@@ -464,6 +464,8 @@ ge::graphStatus RecurrentGatedDeltaRuleTiling::GetScale()
     auto attrs = context_->GetAttrs();
     float scaleValue = *attrs->GetAttrPointer<float>(0);
     tilingData_.scale = scaleValue;
+    int64_t colCount = *attrs->GetAttrPointer<int64_t>(1);
+    tilingData_.colCount = static_cast<uint32_t>(colCount);
 
     return ge::GRAPH_SUCCESS;
 }

@@ -79,6 +79,7 @@ public:
             .Format({ge::FORMAT_ND, ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
         this->Attr("scale_value").AttrType(OPTIONAL).Float(1.0);
+        this->Attr("col_count").AttrType(OPTIONAL).Int(0);
         
         OpAICoreConfig aicConfig;
         aicConfig.DynamicCompileStaticFlag(true)

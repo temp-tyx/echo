@@ -56,6 +56,7 @@ struct RecurrentGatedDeltaRuleParams {
     const aclTensor *num_accepted_tokens {nullptr};
     // attrs
     float scale {1.0f};
+    int64_t col_count {0};
     //output
     const aclTensor *out {nullptr};
 };
@@ -140,18 +141,18 @@ aclnnStatus aclnnRecurrentGatedDeltaRuleGetWorkspaceSize(const aclTensor *query,
                                                          aclTensor *stateRef, const aclTensor *actualSeqLengths,
                                                          const aclTensor *ssmStateIndices, const aclTensor *g,
                                                          const aclTensor *gk, const aclTensor *numAcceptedTokens,
-                                                         float scaleValue, aclTensor *out, uint64_t *workspaceSize,
+                                                         float scaleValue, int64_t colCount, aclTensor *out, uint64_t *workspaceSize,
                                                          aclOpExecutor **executor)
 {
     L2_DFX_PHASE_1(aclnnRecurrentGatedDeltaRule,
                    DFX_IN(query, key, value, beta, stateRef, actualSeqLengths, ssmStateIndices, g, gk,
-                          numAcceptedTokens, scaleValue),
+                          numAcceptedTokens, scaleValue, colCount),
                    DFX_OUT(out, stateRef));
 
     auto uniqueExecutor = CREATE_EXECUTOR();
     CHECK_RET(uniqueExecutor.get() != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
 
-    RecurrentGatedDeltaRuleParams params {query, key, value, beta, stateRef, actualSeqLengths, ssmStateIndices, g, gk, numAcceptedTokens,scaleValue, out};
+    RecurrentGatedDeltaRuleParams params {query, key, value, beta, stateRef, actualSeqLengths, ssmStateIndices, g, gk, numAcceptedTokens,scaleValue, colCount, out};
 
     CHECK_RET(CheckNotNull(params), ACLNN_ERR_PARAM_INVALID);
     CHECK_RET(CheckParams(params) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID);
@@ -179,7 +180,7 @@ aclnnStatus aclnnRecurrentGatedDeltaRuleGetWorkspaceSize(const aclTensor *query,
     // 调用l0接口
     auto outRet =
         l0op::RecurrentGatedDeltaRule(query_, key_, value_, beta_, stateRef, actualSeqLengths_, ssmStateIndices_, g, gk,
-                                      numAcceptedTokens, scaleValue, uniqueExecutor.get());
+                                      numAcceptedTokens, scaleValue, colCount, uniqueExecutor.get());
     if (outRet == nullptr) {
         return ACLNN_ERR_INNER_NULLPTR;
     }
