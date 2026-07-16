@@ -207,6 +207,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_query_start_loc = query_start_loc
             non_spec_query_start_loc_cpu = query_start_loc_cpu
             num_accepted_tokens = None
+            non_spec_num_accepted_tokens = None
         else:
             query_lens = query_start_loc[1:] - query_start_loc[:-1]
             assert spec_sequence_masks_cpu is not None
@@ -320,8 +321,6 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
             assert num_accepted_tokens is not None
             num_accepted_tokens = num_accepted_tokens[spec_sequence_masks]
-        else:
-            non_spec_num_accepted_tokens = None
 
         if num_prefills > 0:
             has_initial_state = context_lens_tensor > 0
