@@ -265,7 +265,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 spec_token_indx = index[num_non_spec_tokens:]
 
                 spec_state_indices_tensor = block_table_tensor[
-                    spec_sequence_masks, : self.num_spec + 1
+                    spec_sequence_masks, :max_spec_len
                 ]
                 non_spec_state_indices_tensor = block_table_tensor[
                     ~spec_sequence_masks, 0

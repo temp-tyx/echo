@@ -181,8 +181,11 @@ public:
                     int32_t stateTokenIdx = seq0;
                     if (hasAcceptedTokens_) {
                         int32_t acceptedTokenNum = numAcceptedTokensGm_.GetValue(batch_i);
-                        if (acceptedTokenNum <= 0 || acceptedTokenNum > seqLen) {
+                        if (acceptedTokenNum <= 0) {
                             return;
+                        }
+                        if (acceptedTokenNum > seqLen) {
+                            acceptedTokenNum = seqLen;
                         }
                         stateTokenIdx = seq0 + acceptedTokenNum - 1;
                     }

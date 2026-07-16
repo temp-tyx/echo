@@ -188,6 +188,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
+            conv_spec_qlens = spec_query_start_loc[1:] - spec_query_start_loc[:-1]
+            conv_max_q = int(conv_spec_qlens.max().item())
             mixed_qkv_spec = causal_conv1d_update_npu(
                 mixed_qkv_spec,
                 conv_state,
@@ -197,7 +199,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 conv_state_indices=spec_state_indices_tensor[:, 0][: attn_metadata.num_spec_decodes],
                 num_accepted_tokens=num_accepted_tokens,
                 query_start_loc=spec_query_start_loc,
-                max_query_len=spec_state_indices_tensor.size(-1),
+                max_query_len=conv_max_q,
                 validate_data=False,
             )
 
@@ -263,17 +265,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         if spec_sequence_masks is not None:
             cu_seqlens = spec_query_start_loc[: attn_metadata.num_spec_decodes + 1]
             actual_seq_lengths = torch.cat([cu_seqlens[:1], cu_seqlens[1:] - cu_seqlens[:-1]])
-            spec_lens = actual_seq_lengths[1:]  # per-req actual token 数
-            new_ssm_list = []
-            for i in range(attn_metadata.num_spec_decodes):
-                accepted = int(num_accepted_tokens[i].item())
-                actual = int(spec_lens[i])
-                row = spec_state_indices_tensor[i, :actual].cpu().tolist()
-                if accepted > actual and actual > 0:
-                    if accepted <= spec_state_indices_tensor.shape[1]:
-                        row[actual - 1] = int(spec_state_indices_tensor[i, accepted - 1].item())
-                new_ssm_list.extend(row)
-            new_ssm_indices = torch.tensor(new_ssm_list, dtype=torch.int32, device=spec_state_indices_tensor.device)
             query_spec = l2norm_fwd(query_spec)
             key_spec = l2norm_fwd(key_spec)
             # Dispatches to the vllm-ascend AscendC custom operator
@@ -289,8 +280,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 state=ssm_state,
                 scale=key_spec.shape[-1] ** -0.5,
                 actual_seq_lengths=actual_seq_lengths,
-                ssm_state_indices=new_ssm_indices,  # ← 改成新的
-                num_accepted_tokens=torch.clamp(num_accepted_tokens, max=spec_lens).to(torch.int32),  # ← clamp
+                ssm_state_indices=spec_state_indices_tensor.flatten(),
+                num_accepted_tokens=num_accepted_tokens.to(torch.int32),
             ).unsqueeze(0)
         else:
             core_attn_out_spec, last_recurrent_state = None, None
