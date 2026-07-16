@@ -213,6 +213,10 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     cache_indices_opt,
                     initial_state_mode_opt,
                 ) = get_non_spec_causal_conv1d_host_args(attn_metadata)
+                if attn_metadata.non_spec_num_accepted_tokens is not None:
+                    non_spec_acc_list = attn_metadata.non_spec_num_accepted_tokens.cpu().tolist()
+                else:
+                    non_spec_acc_list = []
                 mixed_qkv_non_spec = torch.ops._C_ascend.npu_causal_conv1d_custom(
                     mixed_qkv_non_spec,
                     conv_weights_T,
@@ -221,7 +225,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     query_start_loc_opt=query_start_loc_opt,
                     cache_indices_opt=cache_indices_opt,
                     initial_state_mode_opt=initial_state_mode_opt,
-                    num_accepted_tokens_opt=[],
+                    num_accepted_tokens_opt=non_spec_acc_list,
                     activation_mode=activation_num,
                     pad_slot_id=PAD_SLOT_ID,
                     run_mode=0,
@@ -292,7 +296,20 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 2.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
-            initial_state = ssm_state[non_spec_state_indices_tensor[:, 0]].transpose(-1, -2).contiguous()
+            if attn_metadata.non_spec_num_accepted_tokens is not None:
+                non_spec_accepted = attn_metadata.non_spec_num_accepted_tokens
+                num_non_spec = non_spec_state_indices_tensor.shape[0]
+                read_slots = []
+                for i in range(num_non_spec):
+                    acc_val = int(non_spec_accepted[i])
+                    if acc_val > 0 and acc_val <= non_spec_state_indices_tensor.shape[1]:
+                        read_slots.append(non_spec_state_indices_tensor[i, acc_val - 1])
+                    else:
+                        read_slots.append(non_spec_state_indices_tensor[i, 0])
+                read_slots_tensor = torch.stack(read_slots)
+                initial_state = ssm_state[read_slots_tensor].transpose(-1, -2).contiguous()
+            else:
+                initial_state = ssm_state[non_spec_state_indices_tensor[:, 0]].transpose(-1, -2).contiguous()
             clear_ssm_states(initial_state, has_initial_state)
             (core_attn_out_non_spec, last_recurrent_state) = chunk_gated_delta_rule(
                 q=query_non_spec,
