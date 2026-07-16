@@ -298,6 +298,10 @@ void RecurrentGatedDeltaRuleTiling::FillTilingShapeData(const gert::Shape &query
     tilingData_.dv = valueShape.GetDim(DIM_2);
     tilingData_.sBlockNum = stateShape.GetDim(DIM_0);
     tilingData_.b = cuSeqlensShape.GetDim(DIM_0) - 1;
+    const auto &ssmStateShape = context_->GetInputShape(SSM_STATE_INDICES_INDEX)->GetOriginShape();
+    uint32_t ssmTotal = ssmStateShape.GetDim(0);
+    uint32_t b = tilingData_.b;
+    tilingData_.colCount = (b > 0) ? (ssmTotal / b) : 0;
 }
 
 ge::graphStatus RecurrentGatedDeltaRuleTiling::CheckShapeValueRangeAndRule()
@@ -464,8 +468,6 @@ ge::graphStatus RecurrentGatedDeltaRuleTiling::GetScale()
     auto attrs = context_->GetAttrs();
     float scaleValue = *attrs->GetAttrPointer<float>(0);
     tilingData_.scale = scaleValue;
-    int64_t colCount = *attrs->GetAttrPointer<int64_t>(1);
-    tilingData_.colCount = static_cast<uint32_t>(colCount);
 
     return ge::GRAPH_SUCCESS;
 }

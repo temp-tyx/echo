@@ -37,7 +37,7 @@ extern "C" {
 __attribute__((visibility("default"))) aclnnStatus aclnnRecurrentGatedDeltaRuleGetWorkspaceSize(
     const aclTensor *query, const aclTensor *key, const aclTensor *value, const aclTensor *beta, aclTensor *stateRef,
     const aclTensor *actualSeqLengths, const aclTensor *ssmStateIndices, const aclTensor *g, const aclTensor *gk,
-    const aclTensor *numAcceptedTokens, float scaleValue, int64_t colCount, aclTensor *out, uint64_t *workspaceSize,
+    const aclTensor *numAcceptedTokens, float scaleValue, aclTensor *out, uint64_t *workspaceSize,
     aclOpExecutor **executor);
 
 /**
