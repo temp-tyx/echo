@@ -227,13 +227,17 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     run_mode=0,
                 )
         elif attn_metadata.num_decodes > 0:
+            non_spec_accepted = attn_metadata.non_spec_num_accepted_tokens
             mixed_qkv_non_spec = causal_conv1d_update_npu(
                 mixed_qkv_non_spec,
                 conv_state,
                 conv_weights,
                 self.conv1d.bias,
                 self.activation,
-                conv_state_indices=non_spec_state_indices_tensor[: attn_metadata.num_actual_tokens],
+                conv_state_indices=non_spec_state_indices_tensor[:, 0][: attn_metadata.num_decodes],
+                num_accepted_tokens=non_spec_accepted,
+                query_start_loc=non_spec_query_start_loc[: attn_metadata.num_decodes + 1],
+                max_query_len=int((non_spec_query_start_loc[1:] - non_spec_query_start_loc[:-1]).max().item()),
                 validate_data=True,
             )
         else:
@@ -288,7 +292,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 2.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
-            initial_state = ssm_state[non_spec_state_indices_tensor].transpose(-1, -2).contiguous()
+            initial_state = ssm_state[non_spec_state_indices_tensor[:, 0]].transpose(-1, -2).contiguous()
             clear_ssm_states(initial_state, has_initial_state)
             (core_attn_out_non_spec, last_recurrent_state) = chunk_gated_delta_rule(
                 q=query_non_spec,
@@ -303,7 +307,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 head_first=False,
                 use_qk_l2norm_in_kernel=True,
             )
-            ssm_state[non_spec_state_indices_tensor] = (
+            ssm_state[non_spec_state_indices_tensor[:, 0]] = (
                 last_recurrent_state.transpose(-1, -2).contiguous().to(ssm_state.dtype)
             )
         elif attn_metadata.num_decodes > 0:
@@ -322,7 +326,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 state=ssm_state,
                 scale=key_non_spec.shape[-1] ** -0.5,
                 actual_seq_lengths=actual_seq_lengths,
-                ssm_state_indices=non_spec_state_indices_tensor,
+                ssm_state_indices=non_spec_state_indices_tensor.flatten(),
+                num_accepted_tokens=attn_metadata.non_spec_num_accepted_tokens.to(torch.int32),
             ).unsqueeze(0)
         else:
             core_attn_out_non_spec, last_recurrent_state = None, None

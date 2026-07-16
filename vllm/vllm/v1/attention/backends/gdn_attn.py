@@ -57,7 +57,8 @@ class GDNAttentionMetadata:
     spec_token_indx: torch.Tensor | None = None
     non_spec_token_indx: torch.Tensor | None = None
 
-    num_accepted_tokens: torch.Tensor | None = None  # shape: [batch,]
+    num_accepted_tokens: torch.Tensor | None = None  # shape: [num_spec_decodes,]
+    non_spec_num_accepted_tokens: torch.Tensor | None = None  # shape: [num_decodes,]
 
     # The following attributes are for triton implementation of causal_conv1d
     nums_dict: dict | None = None
@@ -110,6 +111,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             device=device,
         )
         self.non_spec_state_indices_tensor: torch.Tensor = torch.empty(
+            (self.decode_cudagraph_max_bs, self.num_spec + 1),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.non_spec_num_accepted_tokens: torch.Tensor = torch.empty(
             (self.decode_cudagraph_max_bs,),
             dtype=torch.int32,
             device=device,
@@ -276,9 +282,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 spec_state_indices_tensor = block_table_tensor[
                     spec_sequence_masks, :max_spec_len
                 ]
+                non_spec_accepted_cpu = num_accepted_tokens[~spec_sequence_masks_cpu]
+                max_non_spec_accepted = int(non_spec_accepted_cpu.max().item()) if non_spec_accepted_cpu.numel() > 0 else 1
+                non_spec_col = max(1, max_non_spec_accepted)
                 non_spec_state_indices_tensor = block_table_tensor[
-                    ~spec_sequence_masks, 0
+                    ~spec_sequence_masks, :non_spec_col
                 ]
+                non_spec_num_accepted_tokens = non_spec_accepted_cpu.to(device=query_start_loc.device)
 
                 spec_query_start_loc = torch.zeros(
                     num_spec_decodes + 1,
@@ -310,6 +320,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
             assert num_accepted_tokens is not None
             num_accepted_tokens = num_accepted_tokens[spec_sequence_masks]
+        else:
+            non_spec_num_accepted_tokens = None
 
         if num_prefills > 0:
             has_initial_state = context_lens_tensor > 0
@@ -395,6 +407,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             ]
             non_spec_state_indices_tensor[num_decodes:].fill_(PAD_SLOT_ID)
 
+            if non_spec_num_accepted_tokens is not None:
+                self.non_spec_num_accepted_tokens[:num_decodes].copy_(
+                    non_spec_num_accepted_tokens, non_blocking=True
+                )
+                non_spec_num_accepted_tokens = self.non_spec_num_accepted_tokens[:batch_size]
+                non_spec_num_accepted_tokens[num_decodes:].fill_(1)
+
             self.non_spec_query_start_loc[: num_decodes + 1].copy_(
                 non_spec_query_start_loc, non_blocking=True
             )
@@ -419,6 +438,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_token_indx=spec_token_indx,
             non_spec_token_indx=non_spec_token_indx,
             num_accepted_tokens=num_accepted_tokens,
+            non_spec_num_accepted_tokens=non_spec_num_accepted_tokens,
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
