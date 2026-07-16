@@ -206,54 +206,36 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         # 1.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
             if mixed_qkv_non_spec is not None:
+                conv_weights_T = conv_weights.transpose(0, 1)
+                activation_num = 1 if self.activation else 0
+                (
+                    query_start_loc_opt,
+                    cache_indices_opt,
+                    initial_state_mode_opt,
+                ) = get_non_spec_causal_conv1d_host_args(attn_metadata)
                 if attn_metadata.non_spec_num_accepted_tokens is not None:
                     non_spec_acc = attn_metadata.non_spec_num_accepted_tokens
-                    non_spec_qsl = non_spec_query_start_loc[:attn_metadata.num_prefills + 1] if non_spec_query_start_loc is not None else None
-                    if non_spec_qsl is not None:
-                        mixed_qkv_non_spec = causal_conv1d_update_npu(
-                            mixed_qkv_non_spec,
-                            conv_state,
-                            conv_weights,
-                            self.conv1d.bias,
-                            self.activation,
-                            conv_state_indices=non_spec_state_indices_tensor[:, 0][:attn_metadata.num_prefills],
-                            num_accepted_tokens=non_spec_acc,
-                            query_start_loc=non_spec_qsl,
-                            max_query_len=int((non_spec_qsl[1:] - non_spec_qsl[:-1]).max().item()),
-                            validate_data=True,
-                        )
-                    else:
-                        mixed_qkv_non_spec = causal_conv1d_update_npu(
-                            mixed_qkv_non_spec,
-                            conv_state,
-                            conv_weights,
-                            self.conv1d.bias,
-                            self.activation,
-                            conv_state_indices=non_spec_state_indices_tensor[:, 0][:attn_metadata.num_prefills],
-                            num_accepted_tokens=non_spec_acc,
-                            validate_data=True,
-                        )
-                else:
-                    conv_weights_T = conv_weights.transpose(0, 1)
-                    activation_num = 1 if self.activation else 0
-                    (
-                        query_start_loc_opt,
-                        cache_indices_opt,
-                        initial_state_mode_opt,
-                    ) = get_non_spec_causal_conv1d_host_args(attn_metadata)
-                    mixed_qkv_non_spec = torch.ops._C_ascend.npu_causal_conv1d_custom(
-                        mixed_qkv_non_spec,
-                        conv_weights_T,
-                        conv_state=self_kv_cache[0],
-                        bias_opt=self.conv1d.bias,
-                        query_start_loc_opt=query_start_loc_opt,
-                        cache_indices_opt=cache_indices_opt,
-                        initial_state_mode_opt=initial_state_mode_opt,
-                        num_accepted_tokens_opt=[],
-                        activation_mode=activation_num,
-                        pad_slot_id=PAD_SLOT_ID,
-                        run_mode=0,
-                    )
+                    conv_width = self.conv1d.weight.size(-1)
+                    hist_len = conv_width - 1
+                    for j in range(non_spec_state_indices_tensor.shape[0]):
+                        acc_val = int(non_spec_acc[j])
+                        shift = acc_val - 1
+                        if shift > 0:
+                            slot_j = int(non_spec_state_indices_tensor[j, 0])
+                            conv_state[slot_j, :hist_len] = conv_state[slot_j, shift:shift + hist_len].clone()
+                mixed_qkv_non_spec = torch.ops._C_ascend.npu_causal_conv1d_custom(
+                    mixed_qkv_non_spec,
+                    conv_weights_T,
+                    conv_state=self_kv_cache[0],
+                    bias_opt=self.conv1d.bias,
+                    query_start_loc_opt=query_start_loc_opt,
+                    cache_indices_opt=cache_indices_opt,
+                    initial_state_mode_opt=initial_state_mode_opt,
+                    num_accepted_tokens_opt=[],
+                    activation_mode=activation_num,
+                    pad_slot_id=PAD_SLOT_ID,
+                    run_mode=0,
+                )
         elif attn_metadata.num_decodes > 0:
             non_spec_accepted = attn_metadata.non_spec_num_accepted_tokens
             mixed_qkv_non_spec = causal_conv1d_update_npu(
