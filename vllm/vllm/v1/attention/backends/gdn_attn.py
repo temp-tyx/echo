@@ -41,6 +41,8 @@ class GDNAttentionMetadata:
     num_spec_decodes: int
     num_spec_decode_tokens: int
     num_actual_tokens: int
+    spec_conv_max_query_len: int = 0
+    non_spec_decode_max_query_len: int = 0
 
     has_initial_state: torch.Tensor | None = None
 
@@ -333,6 +335,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_accepted_tokens_full = num_accepted_tokens
             num_accepted_tokens = num_accepted_tokens[spec_sequence_masks]
 
+            # Precompute max_query_len for conv1d (avoid .item() during graph capture)
+            spec_conv_max_query_len = int((spec_query_start_loc[1:] - spec_query_start_loc[:-1]).max().item()) if spec_query_start_loc is not None else 0
+
             # When non-spec decodes coexist with spec decodes, separate
             # the decode requests from prefill requests within non-spec.
             # The non_spec_query_start_loc and non_spec_token_indx include
@@ -373,11 +378,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                         decode_token_positions.append(pos)
                     pos += ql
                 non_spec_decode_token_indx = torch.tensor(decode_token_positions, dtype=torch.int32, device=query_start_loc.device)
+                non_spec_decode_max_query_len = int((non_spec_decode_query_start_loc[1:] - non_spec_decode_query_start_loc[:-1]).max().item())
             else:
                 non_spec_decode_query_start_loc = None
                 non_spec_decode_token_indx = None
                 non_spec_decode_state_indices_tensor = None
                 non_spec_decode_num_accepted_tokens = None
+                non_spec_decode_max_query_len = 0
 
         if num_prefills > 0:
             has_initial_state = context_lens_tensor > 0
@@ -497,6 +504,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_decode_token_indx=non_spec_decode_token_indx,
             non_spec_decode_state_indices_tensor=non_spec_decode_state_indices_tensor,
             non_spec_decode_num_accepted_tokens=non_spec_decode_num_accepted_tokens,
+            spec_conv_max_query_len=spec_conv_max_query_len,
+            non_spec_decode_max_query_len=non_spec_decode_max_query_len,
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,

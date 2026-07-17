@@ -188,8 +188,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
-            conv_spec_qlens = spec_query_start_loc[1:] - spec_query_start_loc[:-1]
-            conv_max_q = int(conv_spec_qlens.max().item())
             mixed_qkv_spec = causal_conv1d_update_npu(
                 mixed_qkv_spec,
                 conv_state,
@@ -199,7 +197,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 conv_state_indices=spec_state_indices_tensor[:, 0][: attn_metadata.num_spec_decodes],
                 num_accepted_tokens=num_accepted_tokens,
                 query_start_loc=spec_query_start_loc,
-                max_query_len=conv_max_q,
+                max_query_len=attn_metadata.spec_conv_max_query_len,
                 validate_data=False,
             )
 
@@ -247,7 +245,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     conv_state_indices=attn_metadata.non_spec_decode_state_indices_tensor[:, 0],
                     num_accepted_tokens=attn_metadata.non_spec_decode_num_accepted_tokens,
                     query_start_loc=attn_metadata.non_spec_decode_query_start_loc,
-                    max_query_len=int((attn_metadata.non_spec_decode_query_start_loc[1:] - attn_metadata.non_spec_decode_query_start_loc[:-1]).max().item()),
+                    max_query_len=attn_metadata.non_spec_decode_max_query_len,
                     validate_data=True,
                 )
                 # Write back decode conv1d output into mixed_qkv
@@ -265,7 +263,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     conv_state_indices=non_spec_state_indices_tensor[:, 0][: attn_metadata.num_decodes],
                     num_accepted_tokens=attn_metadata.non_spec_num_accepted_tokens,
                     query_start_loc=non_spec_query_start_loc[: attn_metadata.num_decodes + 1],
-                    max_query_len=int((non_spec_query_start_loc[1:] - non_spec_query_start_loc[:-1]).max().item()),
+                    max_query_len=attn_metadata.spec_conv_max_query_len if attn_metadata.spec_conv_max_query_len > 0 else int((non_spec_query_start_loc[1:] - non_spec_query_start_loc[:-1]).max().item()),
                     validate_data=True,
                 )
 
