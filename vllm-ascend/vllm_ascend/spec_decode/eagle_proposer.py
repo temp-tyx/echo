@@ -1836,17 +1836,59 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             log_probs_per_step.append(step_log_probs)
 
         cond_log_probs = torch.stack(log_probs_per_step, dim=1)
+        cond_log_probs = torch.where(
+            torch.isfinite(cond_log_probs),
+            cond_log_probs,
+            torch.tensor(
+                float("-inf"),
+                device=cond_log_probs.device,
+                dtype=cond_log_probs.dtype,
+            ),
+        )
         cum_log_probs = torch.cumsum(cond_log_probs, dim=1)
 
         k_max = envs.VLLM_ECHO_K_MAX
-        k_max = min(k_max, cum_log_probs.numel())
-
         flat_log_probs = cum_log_probs.flatten()
-        _, top_flat_indices = torch.topk(flat_log_probs, k=k_max)
+        num_finite = int(torch.isfinite(flat_log_probs).sum().item())
+        if num_finite == 0:
+            return torch.full_like(draft_token_ids, -1)
+        k_max = min(k_max, num_finite)
+
+        flat_for_topk = flat_log_probs.clone()
+        flat_for_topk[~torch.isfinite(flat_for_topk)] = float("-inf")
+        _, top_flat_indices = torch.topk(flat_for_topk, k=k_max)
 
         mask = torch.zeros_like(flat_log_probs, dtype=torch.bool)
         mask[top_flat_indices] = True
         mask = mask.view(actual_batch_size, total_steps)
+
+        if envs.VLLM_ECHO_DEBUG:
+            if total_steps > 1:
+                monotonic = (cum_log_probs[:, 1:] <= cum_log_probs[:, :-1] + 1e-5).all().item()
+                if not monotonic:
+                    logger.warning(
+                        "ECHO [prune] cum_log_probs not monotonic per request: %s",
+                        cum_log_probs.detach().cpu().tolist(),
+                    )
+            req_ids = self.runner.input_batch.req_ids[:actual_batch_size]
+            kept_per_req = mask.int().sum(dim=1).cpu().tolist()
+            top_cells = [
+                (req_ids[idx // total_steps], idx % total_steps, float(flat_log_probs[idx].item()))
+                for idx in top_flat_indices.detach().cpu().tolist()
+            ]
+            logger.info(
+                "ECHO [prune] k_max=%s steps=%s req_ids=%s "
+                "cum_log_probs=%s mask=%s kept=%s top_cells=%s "
+                "draft_before=%s",
+                k_max,
+                total_steps,
+                req_ids,
+                cum_log_probs.detach().cpu().tolist(),
+                mask.detach().cpu().tolist(),
+                kept_per_req,
+                top_cells,
+                draft_token_ids.detach().cpu().tolist(),
+            )
 
         pruned_draft_ids = draft_token_ids.clone()
         pruned_draft_ids[~mask] = -1
