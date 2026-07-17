@@ -219,6 +219,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_decode_token_indx = None
             non_spec_decode_state_indices_tensor = None
             non_spec_decode_num_accepted_tokens = None
+            spec_conv_max_query_len = 0
+            non_spec_decode_max_query_len = 0
         else:
             query_lens = query_start_loc[1:] - query_start_loc[:-1]
             assert spec_sequence_masks_cpu is not None
@@ -272,10 +274,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 non_spec_decode_token_indx = None
                 non_spec_decode_state_indices_tensor = None
                 non_spec_decode_num_accepted_tokens = None
+                non_spec_decode_max_query_len = 0
                 # Padded sequences are always at the back, so the first
                 # num_spec_decodes + 1 entries of query_start_loc already
                 # contain the correct cumulative token counts.
                 spec_query_start_loc = query_start_loc[: num_spec_decodes + 1]
+                spec_conv_max_query_len = int((spec_query_start_loc[1:] - spec_query_start_loc[:-1]).max().item()) if num_spec_decodes > 0 else 0
                 non_spec_query_start_loc = None
                 non_spec_query_start_loc_cpu = None
             else:
