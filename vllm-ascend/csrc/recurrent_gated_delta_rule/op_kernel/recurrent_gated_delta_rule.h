@@ -63,6 +63,7 @@ public:
         realV_ = tilingData->dv;
         scale_ = tilingData->scale;
         hasAcceptedTokens_ = (tilingData->hasAcceptedTokens == 1);
+        colCount_ = tilingData->colCount;
         hasGama_ = (tilingData->hasGama == 1);
         hasGamaK_ = (tilingData->hasGamaK == 1);
         useAddFoldReduce_ = (RGDR_ENABLE_ADD_FOLD_REDUCE != 0);
@@ -170,6 +171,7 @@ public:
             }
             int32_t seq0 = seq1;
             seq1 += seqLen;
+            int32_t ssmSeq0 = cuSeqlensGm_.GetValue(0) + static_cast<int32_t>(batch_i * colCount_);
             uint32_t copyFlag = 0;
             uint64_t stateOffset;
             for (uint64_t head_i = 0; head_i < NV_; head_i++) {
@@ -178,18 +180,18 @@ public:
                 }
                 copyFlag++;
                 if (copyFlag == 1) {
-                    int32_t stateTokenIdx = seq0;
+                    int32_t stateTokenIdx = ssmSeq0;
                     if (hasAcceptedTokens_) {
                         int32_t acceptedTokenNum = numAcceptedTokensGm_.GetValue(batch_i);
-                        if (acceptedTokenNum <= 0 || acceptedTokenNum > seqLen) {
+                        if (acceptedTokenNum <= 0) {
                             return;
                         }
-                        stateTokenIdx = seq0 + acceptedTokenNum - 1;
+                        stateTokenIdx = ssmSeq0 + acceptedTokenNum - 1;
                     }
                     stateOffset = ssmStateIndicesGm_.GetValue(stateTokenIdx);
                     CopyInGamaBeta(seq0, seq1);
                 }
-                ProcessHead(seq0, seq1, head_i, stateOffset);
+                ProcessHead(seq0, seq1, head_i, stateOffset, ssmSeq0);
             }
             if (hasGama_ && copyFlag != 0) {
                 gamaInQueue_.FreeTensor(gamaInUb);
@@ -439,7 +441,8 @@ private:
         }
     }
 
-    __aicore__ inline void ProcessHead(int32_t seq0, int32_t seq1, uint64_t head_i, uint64_t stateOffset)
+    __aicore__ inline void ProcessHead(int32_t seq0, int32_t seq1, uint64_t head_i, uint64_t stateOffset,
+                                       int32_t ssmSeq0)
     {
         uint64_t vOffset = (seq0 * NV_ + head_i) * realV_;
         uint64_t qkOffset = (seq0 * NK_ + head_i / (NV_ / NK_)) * realK_;
@@ -472,8 +475,9 @@ private:
                 uint64_t curQKOffset = (seq_i - seq0) * alignK_;
                 uint64_t curVOffset = (seq_i - seq0) * alignV_ + v_i;
                 uint64_t attnOffset = (seq_i * NV_ + head_i) * realV_ + v_i;
+                uint64_t ssmSeq_i = ssmSeq0 + (seq_i - seq0);
                 uint64_t curStateOutOffset =
-                    ((ssmStateIndicesGm_.GetValue(seq_i) * NV_ + head_i) * realV_ + v_i) * realK_;
+                    ((ssmStateIndicesGm_.GetValue(ssmSeq_i) * NV_ + head_i) * realV_ + v_i) * realK_;
                 gama_ = hasGama_ ? gamaInUb.GetValue(gbOffset) : 1;
                 beta_ = betaInUb.GetValue(gbOffset);
                 Compute(curSingleV, curQKOffset, curVOffset);
@@ -572,6 +576,7 @@ private:
     bool hasGama_;
     bool hasGamaK_;
     bool useAddFoldReduce_;
+    uint32_t colCount_;
     float gama_;
     float beta_;
     float scale_;

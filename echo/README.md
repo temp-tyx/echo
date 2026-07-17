@@ -1,48 +1,32 @@
-# ECHO on vLLM-Ascend — Wiki
+# ECHO × vLLM-Ascend 调试 Wiki
 
-> **ECHO**（Enhanced Concurrency with High-confidence prOuning）：在高并发场景下，通过全局 top-k 置信度剪枝 speculative draft token，提升吞吐。
->
-> 本文档汇总在 **vLLM-Ascend + Qwen3.5-4B MTP3** 上实现与调试 ECHO 的全部修改、问题与排查方法。
+vLLM-Ascend + Qwen MTP + ECHO + (async) spec decode 集成过程中的问题定位、根因与**最终方案**。
 
-## 目录
+## 文档索引
 
 | 文档 | 内容 |
 |------|------|
-| [01-背景与目标](./01-背景与目标.md) | ECHO 原理、测试场景、环境变量 |
-| [02-数据流与架构](./02-数据流与架构.md) | Pipeline、状态字典、trim 规则、num_computed 校正 |
-| [03-代码修改清单](./03-代码修改清单.md) | 涉及文件、函数、关键代码片段 |
-| [04-Bug 修复历史](./04-Bug修复历史.md) | 多并发乱码/NaN 等问题根因与修复 |
-| [05-调试指南](./05-调试指南.md) | `VLLM_ECHO_DEBUG` 日志阶段与排查 checklist |
-| [06-已知问题与待办](./06-已知问题与待办.md) | 当前状态与待验证项 |
+| [01-背景与配置](./01-背景与配置.md) | 场景、单旋钮配置、三套宽度必须一致 |
+| [02-问题分层与根因](./02-问题分层与根因.md) | 排查历程、被推翻的旧思路、统一根因 |
+| [03-当前方案与代码改动](./03-当前方案与代码改动.md) | 最终设计、相对 `22ee2248` 的改动、为何不能回退 |
+| [04-验证与诊断日志](./04-验证与诊断日志.md) | lossless dump、diag log、验证标准 |
 
-## 快速开始
+## 一句话结论（最终）
 
-```bash
-export VLLM_ECHO_ENABLED=1
-export VLLM_ECHO_K_MAX=5
-export VLLM_ECHO_STEPS_MULTIPLIER=2
-export VLLM_ECHO_MAX_SPEC_NUM=7
-export VLLM_ECHO_DEBUG=1
+**ECHO 的实际 verify 宽度（最多 = 投机步数）必须与静态 `num_speculative_tokens` 一致。**
+做法:在**启动配置**里把 `num_speculative_tokens` 设成你要的最大投机宽度（单旋钮),让 scheduler lookahead / KV / ACL graph / decode_threshold / 各 buffer **从进程启动起就按同一个宽度分配**;ECHO 再在此上限内做 global top-k 剪枝,并把剪枝后的真实 draft 数 sync 回 scheduler。
 
-python your_script.py 2>&1 | grep "ECHO \["
-```
+> ⚠️ 历史教训:曾经尝试"保持 `num_speculative_tokens=3`,只在 runtime 逐个 patch 派生宽度",这是 **whack-a-mole**,永远补不全(eager 下直接 MTE DDR 越界崩溃)。该思路已废弃。
 
-## 涉及仓库与分支
+## 当前状态（2026-06）
 
-- 代码路径：`vllm-ascend/vllm_ascend/`
-- 主要修改文件：
-  - `envs.py`
-  - `spec_decode/eagle_proposer.py`
-  - `worker/model_runner_v1.py`
+| 场景 | 状态 |
+|------|------|
+| 单并发(`num_speculative_tokens = max`) | ✅ 质量正常、无 OOB |
+| 多并发(`num_speculative_tokens = max`) | ✅ 质量正常、无 KV 脏页 |
+| 配置约束 | 部署必须 `num_speculative_tokens ≥ ECHO 最大投机宽度`(取相等最简单) |
 
-## 一句话总结
+## 与早期版本的关系
 
-ECHO 在 **propose** 阶段做 global top-k 剪枝，在 **`_update_states`** 开头按 `req_id` 裁剪 scheduler（**跳过 prefill**），并通过 **`echo_overcount_pending`** 修正 scheduler 乐观 `num_computed`；**`_prepare_input_ids`** 绕过 async scatter 直接写入 trim 后的 token（含 `echo_keep=0` 的 sample 回退）。
-
-## 多并发关键修复（2026-06）
-
-1. prefill 不参与 trim（`req_id not in echo_cu_draft_tokens` → `continue`）
-2. `total_num_scheduled_tokens = sum(schedule.values())`
-3. trim 移至 `_update_states` 开头
-4. 过计数修正：`over = old_sched - valid_count`
-5. `echo_keep=0` 时仍写入 sample token（含 token 0 回退）
+- `VLLM_ECHO_MAX_SPEC_NUM` 环境变量**已删除**,统一由 `num_speculative_tokens` 表示最大宽度。
+- 早期 commit `22ee2248`(单并发 OK、多并发 KV 脏页)**不可回退**,原因见 [03 文档](./03-当前方案与代码改动.md#为什么不能回退到-22ee2248)。

@@ -96,8 +96,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     _runnable: ACLGraphWrapper | Callable
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device, pass_hidden_states_to_model: bool, runner=None):
-        vllm_config.speculative_config.num_speculative_tokens = envs.VLLM_ECHO_MAX_SPEC_NUM
         super().__init__(vllm_config, device, pass_hidden_states_to_model, runner=runner)
+        # ECHO's max draft propose width is bounded by the static
+        # num_speculative_tokens. Deployments must set num_speculative_tokens to
+        # the maximum ECHO verify width so that every component (scheduler
+        # lookahead, KV/graph/buffer sizing, decode_threshold) is consistently
+        # sized; ECHO then prunes via global top-k below this bound.
+        self._target_num_speculative_tokens = self.speculative_config.num_speculative_tokens
+        self._echo_draft_max_tokens = self.num_speculative_tokens
 
         # Assign runner before it's used in the methods below
         self.runner = runner
@@ -847,8 +853,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
 
             if envs.VLLM_ECHO_ENABLED:
-                draft_token_ids = self._apply_echo_pruning(draft_token_ids, batch_size)
-
+                draft_token_ids = self._apply_echo_pruning(draft_token_ids)
+        print(f'========== [eagle_proposer.py] draft_token_ids:{draft_token_ids}')
         return draft_token_ids
 
     def _run_merged_draft(
@@ -1812,7 +1818,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states.contiguous(), True)
         return last_hidden_states, positions, hidden_states
 
-    def _apply_echo_pruning(self, draft_token_ids: torch.Tensor, batch_size: int) -> torch.Tensor:
+    def _apply_echo_pruning(self, draft_token_ids: torch.Tensor) -> torch.Tensor:
         if not hasattr(self, "_echo_logits_list") or not self._echo_logits_list:
             return draft_token_ids
 
@@ -1886,14 +1892,21 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         pruned_draft_ids = draft_token_ids.clone()
         pruned_draft_ids[~mask] = -1
+        self._echo_per_req_draft_counts = mask.sum(dim=1)
 
-        if envs.VLLM_ECHO_DEBUG:
-            logger.info(
-                "ECHO [prune] draft_after=%s",
-                pruned_draft_ids.detach().cpu().tolist(),
-            )
+        return self._compact_echo_draft_rows(pruned_draft_ids)
 
-        return pruned_draft_ids
+    @staticmethod
+    def _compact_echo_draft_rows(draft_token_ids: torch.Tensor) -> torch.Tensor:
+        """Left-align valid drafts so async scatter prefix indices stay correct."""
+        batch_size, width = draft_token_ids.shape
+        compact = torch.full_like(draft_token_ids, -1)
+        for row in range(batch_size):
+            valid = draft_token_ids[row][draft_token_ids[row] != -1]
+            n = int(valid.numel())
+            if n:
+                compact[row, :n] = valid
+        return compact
 
 
 class AscendEagleProposer(EagleProposer, AscendSpecDecodeBaseProposer):

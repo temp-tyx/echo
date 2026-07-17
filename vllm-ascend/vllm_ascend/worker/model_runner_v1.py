@@ -67,6 +67,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
+    DraftTokenIds,
     ECConnectorOutput,
     LogprobsLists,
     LogprobsTensors,
@@ -1235,418 +1236,6 @@ class NPUModelRunner(GPUModelRunner):
             total_num_scheduled_tokens,
         )
 
-    def _apply_echo_scheduler_trim(self, scheduler_output: "SchedulerOutput") -> None:
-        """Trim scheduler spec-decode schedule using per-request ECHO keep counts.
-
-        echo_trim_plan maps req_id -> number of kept drafts from the previous
-        propose step. echo_draft_tokens holds the actual filtered draft token
-        ids (scheduler spec may be padded with -1 placeholders).
-
-        The plan persists across multiple _update_states invocations within
-        one async step; each req is popped once trimmed.
-        """
-        if not envs.VLLM_ECHO_ENABLED or not self.echo_trim_plan:
-            return
-
-        if envs.VLLM_ECHO_DEBUG:
-            logger.info(
-                "ECHO [trim] before echo_trim_plan=%s echo_draft_tokens=%s "
-                "total=%s schedule=%s spec=%s",
-                self.echo_trim_plan,
-                self.echo_draft_tokens,
-                scheduler_output.total_num_scheduled_tokens,
-                dict(scheduler_output.num_scheduled_tokens),
-                dict(scheduler_output.scheduled_spec_decode_tokens),
-            )
-
-        trim_details = []
-        trimmed_req_ids: list[str] = []
-        for req_id, old_num_scheduled_tokens in list(
-            scheduler_output.num_scheduled_tokens.items()
-        ):
-            if req_id not in self.echo_trim_plan:
-                continue
-
-            draft_token_num = self.echo_trim_plan[req_id]
-            proposed_drafts = self.echo_draft_tokens.get(req_id, [])
-            spec_tokens = scheduler_output.scheduled_spec_decode_tokens.get(req_id, [])
-            kept_spec_tokens = proposed_drafts[:draft_token_num]
-            if kept_spec_tokens:
-                scheduler_output.scheduled_spec_decode_tokens[req_id] = kept_spec_tokens
-            elif req_id in scheduler_output.scheduled_spec_decode_tokens:
-                del scheduler_output.scheduled_spec_decode_tokens[req_id]
-
-            new_num_scheduled_tokens = len(kept_spec_tokens) + 1
-            scheduler_output.num_scheduled_tokens[req_id] = new_num_scheduled_tokens
-            self.echo_prev_scheduled[req_id] = old_num_scheduled_tokens
-            trimmed_req_ids.append(req_id)
-            if envs.VLLM_ECHO_DEBUG:
-                trim_details.append(
-                    {
-                        "req_id": req_id,
-                        "echo_keep": draft_token_num,
-                        "old_sched": old_num_scheduled_tokens,
-                        "raw_spec": spec_tokens,
-                        "proposed_drafts": proposed_drafts,
-                        "kept_spec": kept_spec_tokens,
-                        "new_sched": new_num_scheduled_tokens,
-                    }
-                )
-        for req_id in trimmed_req_ids:
-            self.echo_trim_plan.pop(req_id, None)
-            self.echo_cu_draft_tokens.pop(req_id, None)
-
-        scheduler_output.total_num_scheduled_tokens = sum(
-            scheduler_output.num_scheduled_tokens.values()
-        )
-
-        if envs.VLLM_ECHO_DEBUG:
-            logger.info(
-                "ECHO [trim] after total=%s schedule=%s spec=%s details=%s "
-                "pending_plan=%s",
-                scheduler_output.total_num_scheduled_tokens,
-                dict(scheduler_output.num_scheduled_tokens),
-                dict(scheduler_output.scheduled_spec_decode_tokens),
-                trim_details,
-                dict(self.echo_trim_plan),
-            )
-
-    def _echo_get_kept_spec_tokens(
-        self, req_id: str, scheduled_spec_tokens: dict[str, list[int]]
-    ) -> list[int]:
-        """Return trimmed spec tokens, falling back to echo_draft_tokens."""
-        spec_tokens = list(scheduled_spec_tokens.get(req_id, []))
-        if spec_tokens and not all(t == -1 for t in spec_tokens):
-            return spec_tokens
-        keep = self.echo_trim_plan.get(req_id)
-        if keep is None:
-            keep = self.echo_cu_draft_tokens.get(req_id)
-        proposed = self.echo_draft_tokens.get(req_id, [])
-        if keep is not None and proposed:
-            return proposed[:keep]
-        return spec_tokens
-
-    def _echo_resolve_sample_token(self, cur_index: int, req_id: str) -> tuple[int, str]:
-        """Resolve the sample token for ECHO spec-decode input_ids scatter."""
-        req_state = self.requests.get(req_id)
-        num_computed = int(self.input_batch.num_computed_tokens_cpu[cur_index])
-        num_prompt = int(self.input_batch.num_prompt_tokens[cur_index])
-        kv_unconfirmed = req_id in self.echo_kv_unconfirmed
-
-        if (
-            kv_unconfirmed
-            and num_computed <= num_prompt
-            and req_state is not None
-            and num_prompt > 0
-        ):
-            tok = req_state.get_token_id(num_prompt - 1)
-            if tok > 0:
-                return tok, "kv_unconfirmed_prompt_last"
-
-        if req_state is not None and num_computed > 0:
-            tok = req_state.get_token_id(num_computed - 1)
-            if tok > 0:
-                return tok, "get_token_id"
-
-        if req_state is not None:
-            for t in reversed(req_state.output_token_ids):
-                if t > 0:
-                    return t, "output_token_ids"
-
-        if self.input_batch.prev_sampled_token_ids is not None:
-            prev_index = self.prev_positions.np[cur_index]
-            if prev_index >= 0:
-                tok = int(
-                    self.input_batch.prev_sampled_token_ids[prev_index, 0].item()
-                )
-                if tok > 0:
-                    return tok, "prev_sampled"
-
-        num_out = int(self.input_batch.num_tokens_no_spec[cur_index])
-        if num_out > 0:
-            tok = int(self.input_batch.token_ids_cpu[cur_index, num_out - 1])
-            if tok > 0:
-                return tok, "token_ids_cpu"
-        return -1, "none"
-
-    def _sync_echo_spec_to_batch_state(
-        self, scheduler_output: "SchedulerOutput"
-    ) -> None:
-        """Align prev_num_draft_len with ECHO-trimmed spec after super()._update_states."""
-        if not envs.VLLM_ECHO_ENABLED:
-            return
-        spec_map = scheduler_output.scheduled_spec_decode_tokens
-        for req_id in self.input_batch.req_ids:
-            req_state = self.requests.get(req_id)
-            if req_state is None:
-                continue
-            kept = self._echo_get_kept_spec_tokens(req_id, spec_map)
-            if kept:
-                self.input_batch.update_req_spec_token_ids(req_state, {req_id: kept})
-            else:
-                req_state.prev_num_draft_len = 0
-                req_index = self.input_batch.req_id_to_index.get(req_id)
-                if req_index is not None:
-                    self.input_batch.spec_token_ids[req_index].clear()
-
-    def _echo_reconcile_async_output(
-        self, scheduler_output: "SchedulerOutput"
-    ) -> None:
-        """Recover output_token_ids cleared by async scheduling.
-
-        When num_output > 0 but output_token_ids are empty placeholders,
-        prev_sampled holds the last accepted token from the previous step.
-        """
-        if not envs.VLLM_ECHO_ENABLED:
-            return
-        if self.input_batch.prev_sampled_token_ids is None:
-            return
-        req_data = scheduler_output.scheduled_cached_reqs
-        for i, req_id in enumerate(req_data.req_ids):
-            req_state = self.requests.get(req_id)
-            if req_state is None:
-                continue
-            num_output = int(req_data.num_output_tokens[i])
-            if num_output <= 0:
-                continue
-            valid_out = self._echo_sanitize_output_ids(req_state)
-            if valid_out > 0:
-                continue
-            req_index = self.input_batch.req_id_to_index.get(req_id)
-            if req_index is None:
-                continue
-            prev_idx = self.input_batch.prev_req_id_to_index.get(req_id, -1)
-            if prev_idx < 0:
-                continue
-            tok = int(
-                self.input_batch.prev_sampled_token_ids[prev_idx, 0].item()
-            )
-            if tok <= 0:
-                continue
-            req_state.output_token_ids.append(tok)
-            self.echo_kv_unconfirmed.add(req_id)
-            if envs.VLLM_ECHO_DEBUG:
-                logger.info(
-                    "ECHO [async_reconcile] req_id=%s num_output=%s "
-                    "valid_out=%s recovered=%s output_len=%s",
-                    req_id,
-                    num_output,
-                    valid_out,
-                    tok,
-                    len(req_state.output_token_ids),
-                )
-
-    def _echo_sync_num_computed(
-        self, scheduler_output: "SchedulerOutput"
-    ) -> None:
-        """Keep num_computed aligned with recovered output_token_ids.
-
-        Async scheduling can leave num_computed ahead of KV (overshoot) or
-        stuck at prompt_len (lag). Positions and slot_mapping derive from
-        num_computed, so both directions must be corrected.
-        """
-        if not envs.VLLM_ECHO_ENABLED:
-            return
-        self.echo_num_computed_fixed.clear()
-        req_data = scheduler_output.scheduled_cached_reqs
-        for i, req_id in enumerate(req_data.req_ids):
-            req_state = self.requests.get(req_id)
-            if req_state is None:
-                continue
-            req_index = self.input_batch.req_id_to_index.get(req_id)
-            num_prompt = int(req_state.num_prompt_tokens)
-            num_output = int(req_data.num_output_tokens[i])
-            current = int(req_data.num_computed_tokens[i])
-            valid_out = self._echo_sanitize_output_ids(req_state)
-            if req_id in self.echo_kv_unconfirmed and valid_out > 1:
-                req_state.output_token_ids = req_state.output_token_ids[:1]
-                valid_out = 1
-            max_valid = max(0, current - num_prompt)
-            if max_valid > 0 and valid_out > max_valid:
-                req_state.output_token_ids = req_state.output_token_ids[:max_valid]
-                valid_out = max_valid
-            expected = num_prompt + valid_out
-
-            if current == expected:
-                continue
-            if current > expected:
-                new_val = expected
-                reason = "clamp"
-            elif current == num_prompt and valid_out > 0:
-                if req_id in self.echo_kv_unconfirmed:
-                    if envs.VLLM_ECHO_DEBUG:
-                        logger.info(
-                            "ECHO [num_computed_sync] req_id=%s skip_bump "
-                            "kv_unconfirmed num_prompt=%s valid_out=%s "
-                            "keep_num_computed=%s",
-                            req_id,
-                            num_prompt,
-                            valid_out,
-                            current,
-                        )
-                    continue
-                new_val = expected
-                reason = "fix_lag"
-            else:
-                continue
-
-            req_data.num_computed_tokens[i] = new_val
-            req_state.num_computed_tokens = new_val
-            if req_index is not None:
-                self.input_batch.num_computed_tokens_cpu[req_index] = new_val
-            self.echo_num_computed_fixed.add(req_id)
-            if envs.VLLM_ECHO_DEBUG:
-                logger.info(
-                    "ECHO [num_computed_sync] req_id=%s %s->%s reason=%s "
-                    "num_prompt=%s num_output=%s valid_out=%s",
-                    req_id,
-                    current,
-                    new_val,
-                    reason,
-                    num_prompt,
-                    num_output,
-                    valid_out,
-                )
-
-    def _prepare_input_ids(
-        self,
-        scheduler_output: "SchedulerOutput",
-        num_reqs: int,
-        total_num_scheduled_tokens: int,
-        cu_num_tokens: np.ndarray,
-    ) -> None:
-        super()._prepare_input_ids(
-            scheduler_output,
-            num_reqs,
-            total_num_scheduled_tokens,
-            cu_num_tokens,
-        )
-        if not envs.VLLM_ECHO_ENABLED:
-            return
-
-        scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
-
-        # Async spec-decode scatter can miss ECHO-trimmed drafts; write the
-        # scheduler spec tokens (populated by _apply_echo_scheduler_trim) and
-        # the per-request sampled token directly into input_ids. Also handle
-        # echo_keep=0 (no spec tokens) where only the sampled token is scheduled.
-        input_ids_cpu = self.input_ids.cpu[:total_num_scheduled_tokens]
-        needs_gpu_copy = False
-        for cur_index in range(num_reqs):
-            req_id = self.input_batch.req_ids[cur_index]
-            req_state = self.requests.get(req_id)
-            kept_spec = self._echo_get_kept_spec_tokens(req_id, scheduled_spec_tokens)
-
-            flat_end = int(cu_num_tokens[cur_index]) - 1
-            draft_len = len(kept_spec)
-            sample_idx = flat_end - draft_len
-
-            if kept_spec:
-                spec_start = sample_idx + 1
-                input_ids_cpu[spec_start : flat_end + 1] = torch.tensor(
-                    kept_spec, dtype=input_ids_cpu.dtype
-                )
-                needs_gpu_copy = True
-
-            sampled, sample_src = self._echo_resolve_sample_token(cur_index, req_id)
-            if sampled <= 0 and req_state is not None:
-                num_prompt = int(self.input_batch.num_prompt_tokens[cur_index])
-                if num_prompt > 0:
-                    sampled = req_state.get_token_id(num_prompt - 1)
-                    sample_src = "fallback_prompt_last"
-            if sampled > 0:
-                input_ids_cpu[sample_idx] = sampled
-                needs_gpu_copy = True
-                if envs.VLLM_ECHO_DEBUG:
-                    echo_keep = self.echo_trim_plan.get(req_id)
-                    if echo_keep is None:
-                        echo_keep = self.echo_cu_draft_tokens.get(req_id, draft_len)
-                    logger.info(
-                        "ECHO [input_ids] req_id=%s sample_idx=%s sampled=%s "
-                        "source=%s num_computed=%s num_prompt=%s echo_keep=%s "
-                        "num_output=%s",
-                        req_id,
-                        sample_idx,
-                        sampled,
-                        sample_src,
-                        int(self.input_batch.num_computed_tokens_cpu[cur_index]),
-                        int(self.input_batch.num_prompt_tokens[cur_index]),
-                        echo_keep,
-                        len(self.requests[req_id].output_token_ids)
-                        if req_id in self.requests
-                        else 0,
-                    )
-            elif envs.VLLM_ECHO_DEBUG:
-                logger.info(
-                    "ECHO [input_ids] req_id=%s sample_idx=%s MISSING sample "
-                    "num_computed=%s num_prompt=%s",
-                    req_id,
-                    sample_idx,
-                    int(self.input_batch.num_computed_tokens_cpu[cur_index]),
-                    int(self.input_batch.num_prompt_tokens[cur_index]),
-                )
-
-        if needs_gpu_copy:
-            self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
-
-    def _record_echo_overcount(self, valid_sampled_tokens_count: torch.Tensor) -> None:
-        if not envs.VLLM_ECHO_ENABLED or not self.echo_prev_scheduled:
-            return
-        counts = valid_sampled_tokens_count.detach().cpu().tolist()
-        for batch_idx, req_id in enumerate(self.input_batch.req_ids):
-            old_sched = self.echo_prev_scheduled.get(req_id)
-            if old_sched is None:
-                continue
-            valid = counts[batch_idx] if batch_idx < len(counts) else 0
-            over = old_sched - int(valid)
-            if over > 0:
-                self.echo_overcount_pending[req_id] = over
-        self.echo_prev_scheduled = {}
-
-    def _update_states(self, scheduler_output: "SchedulerOutput"):
-        # ECHO trim runs in _prepare_inputs (after super) so that
-        # update_req_spec_token_ids in super() is corrected by
-        # _sync_echo_spec_to_batch_state before forward.
-
-        if envs.VLLM_ECHO_ENABLED and self.echo_overcount_pending:
-            pending = self.echo_overcount_pending
-            self.echo_overcount_pending = {}
-            req_data = scheduler_output.scheduled_cached_reqs
-            for req_id, over in pending.items():
-                if over <= 0:
-                    continue
-                for i, rid in enumerate(req_data.req_ids):
-                    if rid == req_id:
-                        req_data.num_computed_tokens[i] -= over
-                        break
-                req_state = self.requests.get(req_id)
-                if req_state is not None:
-                    req_state.num_computed_tokens -= over
-                req_index = self.input_batch.req_id_to_index.get(req_id)
-                if req_index is not None:
-                    self.input_batch.num_computed_tokens_cpu[req_index] -= over
-                if envs.VLLM_ECHO_DEBUG:
-                    logger.info(
-                        "ECHO [overcount] req_id=%s subtract=%s "
-                        "num_computed_after=%s",
-                        req_id,
-                        over,
-                        req_state.num_computed_tokens if req_state else None,
-                    )
-
-        return super()._update_states(scheduler_output)
-
-    def _get_draft_token_ids_cpu(self) -> tuple[list[list[int]], list[str]]:
-        if envs.VLLM_ECHO_ENABLED and isinstance(self._draft_token_ids, torch.Tensor):
-            req_ids = self._draft_token_req_ids
-            if req_ids is None:
-                req_ids = self.input_batch.req_ids
-            num_reqs = len(req_ids)
-            draft_rows = self._draft_token_ids[:num_reqs].detach().cpu().tolist()
-            filtered_rows = [[tok for tok in row if tok != -1] for row in draft_rows]
-            return filtered_rows, req_ids
-        return super()._get_draft_token_ids_cpu()
-
     def _preprocess(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1902,21 +1491,15 @@ class NPUModelRunner(GPUModelRunner):
                 valid_sampled_token_ids, sampling_metadata, spec_decode_metadata, sample_hidden_states
             )
         elif self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model():
-            echo_k_max = envs.VLLM_ECHO_K_MAX
-            batch_size = spec_decode_common_attn_metadata.batch_size()
-            draft_step = min(max(envs.VLLM_ECHO_STEPS_MULTIPLIER * echo_k_max // batch_size, 1), self.drafter.num_speculative_tokens)
-            self.drafter.num_speculative_tokens = draft_step
-            # TODO: gpu_model_runner
-            self.num_spec_tokens = draft_step
-            self.speculative_config.num_speculative_tokens = draft_step
-            if envs.VLLM_ECHO_DEBUG and envs.VLLM_ECHO_ENABLED:
-                logger.info(
-                    "ECHO [draft_propose] echo_k_max=%s batch_size=%s draft_step=%s req_ids=%s",
-                    echo_k_max,
-                    batch_size,
-                    draft_step,
-                    self.input_batch.req_ids,
+            if envs.VLLM_ECHO_ENABLED:
+                echo_k_max = envs.VLLM_ECHO_K_MAX
+                batch_size = spec_decode_common_attn_metadata.batch_size()
+                draft_max = getattr(
+                    self.drafter, "_echo_draft_max_tokens", self.drafter.num_speculative_tokens
                 )
+                draft_step = min(max(int(envs.VLLM_ECHO_STEPS_MULTIPLIER * echo_k_max // batch_size), 1), draft_max)
+                draft_num_spec_restore = self.drafter.num_speculative_tokens
+                self.drafter.num_speculative_tokens = draft_step
             common_attn_metadata = spec_decode_common_attn_metadata
             sampled_token_ids = valid_sampled_token_ids
 
@@ -2036,10 +1619,51 @@ class NPUModelRunner(GPUModelRunner):
                 num_scheduled_tokens=num_scheduled_tokens,
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
             )
+            if envs.VLLM_ECHO_ENABLED:
+                self.drafter.num_speculative_tokens = draft_num_spec_restore
+                if isinstance(draft_token_ids, torch.Tensor):
+                    self.num_spec_tokens = draft_token_ids.shape[1]
         else:
             raise ValueError(f"Unknown speculative decoding method: {self.speculative_config.method}")
 
         return draft_token_ids
+
+    def _copy_draft_token_ids_to_cpu(
+            self, scheduler_output: "SchedulerOutput", zeros_only: bool = False
+    ) -> None:
+        if envs.VLLM_ECHO_ENABLED and self.use_async_scheduling:
+            self._draft_token_req_ids = self.input_batch.req_ids.copy()
+            draft_token_ids = self._draft_token_ids
+            if not torch.is_tensor(draft_token_ids):
+                return
+            num_reqs = draft_token_ids.shape[0]
+            num_cols = draft_token_ids.shape[1]
+            default_stream = torch.npu.current_stream()
+            with torch.npu.stream(self.draft_token_ids_copy_stream):
+                self.draft_token_ids_copy_stream.wait_stream(default_stream)
+                if not zeros_only:
+                    # ECHO emits a dynamic draft width (draft_step shrinks with
+                    # batch size), which can be narrower than the statically sized
+                    # cpu buffer (num_speculative_tokens). Copy into the matching
+                    # prefix and pad the unused trailing columns with -1 so that
+                    # take_draft_token_ids drops them instead of leaking stale ids.
+                    if num_cols < self.draft_token_ids_cpu.shape[1]:
+                        self.draft_token_ids_cpu[:num_reqs, num_cols:] = -1
+                    self.draft_token_ids_cpu[:num_reqs, :num_cols].copy_(
+                        draft_token_ids, non_blocking=True
+                    )
+                else:
+                    self.draft_token_ids_cpu[:num_reqs] = 0
+                self.draft_token_ids_event.record()
+            return
+        super()._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=zeros_only)
+
+    def take_draft_token_ids(self) -> DraftTokenIds | None:
+        draft = super().take_draft_token_ids()
+        if draft is None or not envs.VLLM_ECHO_ENABLED:
+            return draft
+        filtered = [[t for t in row if t != -1] for row in draft.draft_token_ids]
+        return DraftTokenIds(draft.req_ids, filtered)
 
     @torch.inference_mode()
     def execute_model(
@@ -3715,7 +3339,6 @@ class NPUModelRunner(GPUModelRunner):
 
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
-
 
     def _align_memory(self, tensor: torch.Tensor, alignment: int) -> torch.Tensor:
         data_ptr = tensor.data_ptr()
