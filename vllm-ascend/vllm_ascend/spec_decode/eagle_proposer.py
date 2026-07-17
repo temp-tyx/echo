@@ -854,7 +854,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
             if envs.VLLM_ECHO_ENABLED:
                 draft_token_ids = self._apply_echo_pruning(draft_token_ids)
-
+        print(f'========== [eagle_proposer.py] draft_token_ids:{draft_token_ids}')
         return draft_token_ids
 
     def _run_merged_draft(
@@ -1865,6 +1865,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if n:
                 compact[row, :n] = valid
         return compact
+
 
 class AscendEagleProposer(EagleProposer, AscendSpecDecodeBaseProposer):
     def __init__(

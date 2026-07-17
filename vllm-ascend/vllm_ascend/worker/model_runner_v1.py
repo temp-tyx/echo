@@ -1325,14 +1325,15 @@ class NPUModelRunner(GPUModelRunner):
                 valid_sampled_token_ids, sampling_metadata, spec_decode_metadata, sample_hidden_states
             )
         elif self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model():
-            echo_k_max = envs.VLLM_ECHO_K_MAX
-            batch_size = spec_decode_common_attn_metadata.batch_size()
-            draft_max = getattr(
-                self.drafter, "_echo_draft_max_tokens", self.drafter.num_speculative_tokens
-            )
-            draft_step = min(max(int(envs.VLLM_ECHO_STEPS_MULTIPLIER * echo_k_max // batch_size), 1), draft_max)
-            draft_num_spec_restore = self.drafter.num_speculative_tokens
-            self.drafter.num_speculative_tokens = draft_step
+            if envs.VLLM_ECHO_ENABLED:
+                echo_k_max = envs.VLLM_ECHO_K_MAX
+                batch_size = spec_decode_common_attn_metadata.batch_size()
+                draft_max = getattr(
+                    self.drafter, "_echo_draft_max_tokens", self.drafter.num_speculative_tokens
+                )
+                draft_step = min(max(int(envs.VLLM_ECHO_STEPS_MULTIPLIER * echo_k_max // batch_size), 1), draft_max)
+                draft_num_spec_restore = self.drafter.num_speculative_tokens
+                self.drafter.num_speculative_tokens = draft_step
             common_attn_metadata = spec_decode_common_attn_metadata
             sampled_token_ids = valid_sampled_token_ids
 
@@ -1451,9 +1452,10 @@ class NPUModelRunner(GPUModelRunner):
                 num_scheduled_tokens=num_scheduled_tokens,
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
             )
-            self.drafter.num_speculative_tokens = draft_num_spec_restore
-            if isinstance(draft_token_ids, torch.Tensor):
-                self.num_spec_tokens = draft_token_ids.shape[1]
+            if envs.VLLM_ECHO_ENABLED:
+                self.drafter.num_speculative_tokens = draft_num_spec_restore
+                if isinstance(draft_token_ids, torch.Tensor):
+                    self.num_spec_tokens = draft_token_ids.shape[1]
         else:
             raise ValueError(f"Unknown speculative decoding method: {self.speculative_config.method}")
 

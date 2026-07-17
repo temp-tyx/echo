@@ -230,7 +230,10 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     run_mode=0,
                 )
                 # Write prefill conv1d output back to mixed_qkv
-                mixed_qkv.index_copy_(0, non_spec_token_indx, mixed_qkv_non_spec)
+                if non_spec_token_indx is not None:
+                    mixed_qkv.index_copy_(0, non_spec_token_indx, mixed_qkv_non_spec)
+                else:
+                    mixed_qkv[:mixed_qkv_non_spec.shape[0]] = mixed_qkv_non_spec
         if attn_metadata.num_decodes > 0:
             if attn_metadata.non_spec_decode_token_indx is not None:
                 # Non-spec decodes coexist with spec decodes: use separate metadata
@@ -265,8 +268,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     max_query_len=int((non_spec_query_start_loc[1:] - non_spec_query_start_loc[:-1]).max().item()),
                     validate_data=True,
                 )
-        else:
-            mixed_qkv_non_spec = None
 
         query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
         query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
