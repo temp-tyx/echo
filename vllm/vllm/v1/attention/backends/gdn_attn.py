@@ -420,6 +420,18 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             and num_spec_decode_tokens <= self.decode_cudagraph_max_bs
         ):
             assert spec_sequence_masks is not None
+            # spec_state_indices_tensor may have fewer columns than the
+            # pre-allocated buffer (max_spec_len < num_spec + 1 when ECHO
+            # prunes). Pad with PAD_SLOT_ID before copying to match shapes.
+            runtime_cols = spec_state_indices_tensor.shape[1]
+            buf_cols = self.spec_state_indices_tensor.shape[1]
+            if runtime_cols < buf_cols:
+                padded = torch.full(
+                    (spec_state_indices_tensor.shape[0], buf_cols),
+                    PAD_SLOT_ID, dtype=torch.int32, device=spec_state_indices_tensor.device
+                )
+                padded[:, :runtime_cols] = spec_state_indices_tensor
+                spec_state_indices_tensor = padded
             self.spec_state_indices_tensor[:num_spec_decodes].copy_(
                 spec_state_indices_tensor, non_blocking=True
             )
