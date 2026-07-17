@@ -472,53 +472,7 @@ class NPUModelRunner(GPUModelRunner):
             self.kvcomp_meta_data = initialize_kvcomp_metadata(max_num_reqs=self.max_num_reqs,
                 block_size=self.block_size, device=self.device, vllm_config=self.vllm_config,
                 parallel_config=self.parallel_config, dtype=self.dtype)
-        self.echo_cu_draft_tokens: dict[str, int] = {}
-        self.echo_draft_tokens: dict[str, list[int]] = {}
-        # Persists until every req in the plan is trimmed; survives multiple
-        # _update_states calls within one async scheduling step.
-        self.echo_trim_plan: dict[str, int] = {}
-        # Scheduler optimistic advance uses pre-trim schedule; track delta for
-        # correction on the next _update_states.
-        self.echo_prev_scheduled: dict[str, int] = {}
-        self.echo_overcount_pending: dict[str, int] = {}
-        self.echo_num_computed_fixed: set[str] = set()
-        # Reqs whose output_token_ids were recovered from prev_sampled but KV
-        # at num_prompt may not have been written yet; skip num_computed bump.
-        self.echo_kv_unconfirmed: set[str] = set()
-
-    def _echo_sanitize_output_ids(self, req_state) -> int:
-        """Drop async -1 placeholders; return count of valid output tokens."""
-        positives = [t for t in req_state.output_token_ids if t > 0]
-        if len(positives) != len(req_state.output_token_ids):
-            req_state.output_token_ids = positives
-        return len(positives)
-
-    def _echo_reset_decode_state(
-        self, req_id: str, scheduler_output: "SchedulerOutput"
-    ) -> None:
-        """Reset req to prompt boundary after failed KV-unconfirmed decode."""
-        req_state = self.requests.get(req_id)
-        if req_state is None:
-            return
-        num_prompt = int(req_state.num_prompt_tokens)
-        req_state.output_token_ids.clear()
-        req_state.num_computed_tokens = num_prompt
-        req_data = scheduler_output.scheduled_cached_reqs
-        for i, rid in enumerate(req_data.req_ids):
-            if rid == req_id:
-                req_data.num_computed_tokens[i] = num_prompt
-                break
-        req_index = self.input_batch.req_id_to_index.get(req_id)
-        if req_index is not None:
-            self.input_batch.num_computed_tokens_cpu[req_index] = num_prompt
-            self.input_batch.num_tokens_no_spec[req_index] = num_prompt
-        self.echo_kv_unconfirmed.discard(req_id)
-        if envs.VLLM_ECHO_DEBUG:
-            logger.info(
-                "ECHO [decode_reset] req_id=%s num_computed=%s",
-                req_id,
-                num_prompt,
-            )
+        self.echo_cu_draft_tokens = []
 
     @property
     def use_cp(self) -> bool:
@@ -664,26 +618,7 @@ class NPUModelRunner(GPUModelRunner):
             total_num_scheduled_tokens,
         ]
         """
-        if envs.VLLM_ECHO_ENABLED and self.echo_trim_plan:
-            self._apply_echo_scheduler_trim(scheduler_output)
-            for i, req_id in enumerate(self.input_batch.req_ids):
-                if req_id in scheduler_output.num_scheduled_tokens:
-                    num_scheduled_tokens[i] = (
-                        scheduler_output.num_scheduled_tokens[req_id]
-                    )
-            total_num_scheduled_tokens = (
-                scheduler_output.total_num_scheduled_tokens
-            )
-            self._sync_echo_spec_to_batch_state(scheduler_output)
-        else:
-            total_num_scheduled_tokens = (
-                scheduler_output.total_num_scheduled_tokens
-            )
-
-        if envs.VLLM_ECHO_ENABLED:
-            self._echo_reconcile_async_output(scheduler_output)
-            self._echo_sync_num_computed(scheduler_output)
-
+        total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
@@ -960,30 +895,7 @@ class NPUModelRunner(GPUModelRunner):
         # CPU values are optimistic (all drafts accepted). The kernel
         # corrects on GPU using the previous step's
         # valid_sampled_token_count_gpu. Otherwise, just copy from CPU.
-        # ECHO: skip the GPU drift kernel; num_computed is managed on CPU
-        # via overcount/lag fixes. The kernel + M-RoPE drift would otherwise
-        # overwrite corrected CPU values (e.g. req1 stuck at prompt_len).
         if (
-            envs.VLLM_ECHO_ENABLED
-            and self.use_async_spec_decode
-            and self.valid_sampled_token_count_gpu is not None
-            and prev_req_id_to_index
-        ):
-            self.prev_positions.copy_to_gpu(num_reqs)
-            self.prev_num_draft_tokens.copy_to_gpu()
-            self.num_computed_tokens[:num_reqs].copy_(
-                self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
-            )
-            if envs.VLLM_ECHO_DEBUG:
-                logger.info(
-                    "ECHO [num_computed_sync] cpu=%s prev_positions=%s "
-                    "prev_drafts=%s fixed=%s",
-                    self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist(),
-                    self.prev_positions.np[:num_reqs].tolist(),
-                    self.prev_num_draft_tokens.np[:num_reqs].tolist(),
-                    list(self.echo_num_computed_fixed),
-                )
-        elif (
             self.use_async_spec_decode
             and self.valid_sampled_token_count_gpu is not None
             and prev_req_id_to_index
@@ -1068,58 +980,6 @@ class NPUModelRunner(GPUModelRunner):
                 self.query_start_loc.gpu[: num_reqs + 1],
                 self.positions[:total_num_scheduled_tokens],
             )
-            if envs.VLLM_ECHO_DEBUG and envs.VLLM_ECHO_ENABLED:
-                slot_map = self.input_batch.block_table[0].slot_mapping.gpu[
-                    :total_num_scheduled_tokens
-                ]
-                blk_tbl = self.input_batch.block_table[0]
-                block_size = blk_tbl.block_size
-                req_bt_info = []
-                for r_idx, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
-                    nc = int(self.input_batch.num_computed_tokens_cpu[r_idx])
-                    num_prompt = int(self.input_batch.num_prompt_tokens[r_idx])
-                    bi = nc // block_size
-                    phys = blk_tbl.block_table.cpu[r_idx, bi : bi + 2].tolist()
-                    slot_at_nc = (
-                        int(phys[0]) * block_size + (nc % block_size)
-                        if phys and phys[0] > 0
-                        else None
-                    )
-                    bi_prompt = num_prompt // block_size
-                    phys_prompt = blk_tbl.block_table.cpu[
-                        r_idx, bi_prompt : bi_prompt + 1
-                    ].tolist()
-                    slot_at_num_prompt = (
-                        int(phys_prompt[0]) * block_size + (num_prompt % block_size)
-                        if phys_prompt and phys_prompt[0] > 0
-                        else None
-                    )
-                    req_bt_info.append(
-                        {
-                            "req_id": req_id,
-                            "num_computed": nc,
-                            "num_prompt": num_prompt,
-                            "block_idx": bi,
-                            "phys_blocks": phys,
-                            "slot_at_num_computed": slot_at_nc,
-                            "slot_at_num_prompt": slot_at_num_prompt,
-                        }
-                    )
-                logger.info(
-                    "ECHO [slot_mapping] req_ids=%s num_scheduled=%s "
-                    "num_computed=%s positions_1d=%s slot_mapping=%s "
-                    "block_table=%s block_size=%s",
-                    self.input_batch.req_ids,
-                    num_scheduled_tokens.tolist(),
-                    self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist(),
-                    self.positions[:total_num_scheduled_tokens]
-                    .detach()
-                    .cpu()
-                    .tolist(),
-                    slot_map.detach().cpu().tolist(),
-                    req_bt_info,
-                    block_size,
-                )
 
         if self.use_async_spec_decode and (self.uses_mrope or self.uses_xdrope_dim > 0):
             drift = self.num_computed_tokens[req_indices_gpu].to(
@@ -1175,32 +1035,6 @@ class NPUModelRunner(GPUModelRunner):
             )
             logits_indices = spec_decode_metadata.logits_indices
             num_sampled_tokens = num_draft_tokens + 1
-
-            if envs.VLLM_ECHO_DEBUG and envs.VLLM_ECHO_ENABLED:
-                req_draft_info = [
-                    {
-                        "req_id": self.input_batch.req_ids[i],
-                        "num_scheduled": int(num_scheduled_tokens[i]),
-                        "num_draft": int(num_draft_tokens[i]),
-                        "spec_tokens": scheduler_output.scheduled_spec_decode_tokens.get(
-                            self.input_batch.req_ids[i], []
-                        ),
-                    }
-                    for i in range(num_reqs)
-                ]
-                logger.info(
-                    "ECHO [target_prepare] total=%s num_draft_tokens=%s "
-                    "logits_indices=%s draft_token_ids=%s req_info=%s",
-                    total_num_scheduled_tokens,
-                    num_draft_tokens.tolist(),
-                    logits_indices.detach().cpu().tolist()
-                    if torch.is_tensor(logits_indices)
-                    else logits_indices,
-                    spec_decode_metadata.draft_token_ids.detach().cpu().tolist()
-                    if torch.is_tensor(spec_decode_metadata.draft_token_ids)
-                    else spec_decode_metadata.draft_token_ids,
-                    req_draft_info,
-                )
 
             # For DECODE only cuda graph of some attention backends (e.g., GDN).
             self.num_decode_draft_tokens.np[:num_reqs] = num_decode_draft_tokens
@@ -1531,7 +1365,6 @@ class NPUModelRunner(GPUModelRunner):
                     self.num_discarded_requests,
                 )
                 self._copy_valid_sampled_token_count(next_token_ids, valid_sampled_tokens_count)
-                self._record_echo_overcount(valid_sampled_tokens_count)
 
             req_scheduled_tokens = scheduler_output.num_scheduled_tokens
             if self.use_cp:
@@ -1791,26 +1624,6 @@ class NPUModelRunner(GPUModelRunner):
                     num_tokens_across_dp,
                 )
 
-                if envs.VLLM_ECHO_DEBUG and envs.VLLM_ECHO_ENABLED:
-                    uniform_decode = (
-                        max_num_scheduled_tokens == self.uniform_decode_query_len
-                        and num_tokens_unpadded == max_num_scheduled_tokens * num_reqs
-                    )
-                    logger.info(
-                        "ECHO [target_batch] req_ids=%s num_scheduled=%s "
-                        "total_unpadded=%s padded=%s uniform_decode=%s "
-                        "uniform_decode_query_len=%s cudagraph_mode=%s "
-                        "num_computed_tokens=%s",
-                        req_ids,
-                        num_scheduled_tokens_np.tolist(),
-                        num_tokens_unpadded,
-                        batch_desc.num_tokens,
-                        uniform_decode,
-                        self.uniform_decode_query_len,
-                        cudagraph_mode,
-                        self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist(),
-                    )
-
                 num_tokens_padded = batch_desc.num_tokens
                 num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
                 ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
@@ -1998,28 +1811,6 @@ class NPUModelRunner(GPUModelRunner):
 
                 sample_hidden_states = hidden_states[logits_indices]
                 logits = self.model.compute_logits(sample_hidden_states)
-
-                if envs.VLLM_ECHO_DEBUG and envs.VLLM_ECHO_ENABLED:
-                    has_nan = torch.isnan(sample_hidden_states).any(dim=-1).cpu().tolist()
-                    logger.info(
-                        "ECHO [target_forward] req_ids=%s logits_indices=%s "
-                        "positions=%s input_ids=%s sample_hidden_nan=%s "
-                        "slot_mapping=%s",
-                        self.input_batch.req_ids,
-                        logits_indices.detach().cpu().tolist(),
-                        positions[: scheduler_output.total_num_scheduled_tokens]
-                        .detach()
-                        .cpu()
-                        .tolist(),
-                        self.input_ids.cpu[: scheduler_output.total_num_scheduled_tokens]
-                        .detach()
-                        .cpu()
-                        .tolist(),
-                        dict(zip(self.input_batch.req_ids, has_nan)),
-                        self.cpu_slot_mapping.tolist()
-                        if self.cpu_slot_mapping is not None
-                        else None,
-                    )
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -2144,24 +1935,7 @@ class NPUModelRunner(GPUModelRunner):
                 batch_desc,
             )
             mask = (self._draft_token_ids != -1)
-            kept_counts = mask.int().sum(dim=1).cpu().tolist()
-            filtered_drafts, draft_req_ids = self._get_draft_token_ids_cpu()
-            req_ids_for_echo = (
-                draft_req_ids if draft_req_ids else self.input_batch.req_ids
-            )
-            self.echo_trim_plan = dict(zip(req_ids_for_echo, kept_counts))
-            self.echo_cu_draft_tokens = dict(self.echo_trim_plan)
-            self.echo_draft_tokens = dict(zip(req_ids_for_echo, filtered_drafts))
-            if envs.VLLM_ECHO_DEBUG and envs.VLLM_ECHO_ENABLED:
-                logger.info(
-                    "ECHO [draft_result] echo_trim_plan=%s "
-                    "echo_draft_tokens=%s raw_drafts=%s",
-                    self.echo_trim_plan,
-                    self.echo_draft_tokens,
-                    self._draft_token_ids.detach().cpu().tolist()
-                    if torch.is_tensor(self._draft_token_ids)
-                    else self._draft_token_ids,
-                )
+            self.echo_cu_draft_tokens = mask.int().sum(dim=1).cpu().tolist()
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         (
@@ -2179,40 +1953,6 @@ class NPUModelRunner(GPUModelRunner):
             scheduler_output.total_num_scheduled_tokens,
             spec_decode_metadata,
         )
-
-        if envs.VLLM_ECHO_DEBUG and envs.VLLM_ECHO_ENABLED:
-            accepted = dict(zip(req_ids_output_copy, valid_sampled_token_ids))
-            raw_sampled = (
-                sampler_output.sampled_token_ids.detach().cpu().tolist()
-                if torch.is_tensor(sampler_output.sampled_token_ids)
-                else sampler_output.sampled_token_ids
-            )
-            logger.info(
-                "ECHO [verify] accepted_tokens=%s raw_sampled=%s "
-                "spec_num_draft=%s",
-                accepted,
-                raw_sampled,
-                spec_decode_metadata.num_draft_tokens
-                if spec_decode_metadata is not None
-                else None,
-            )
-
-        if envs.VLLM_ECHO_ENABLED:
-            for req_id, tokens in zip(
-                req_ids_output_copy, valid_sampled_token_ids
-            ):
-                if req_id not in self.echo_kv_unconfirmed:
-                    continue
-                if tokens and tokens[0] > 0:
-                    self.echo_kv_unconfirmed.discard(req_id)
-                    if envs.VLLM_ECHO_DEBUG:
-                        logger.info(
-                            "ECHO [kv_confirmed] req_id=%s first_token=%s",
-                            req_id,
-                            tokens[0],
-                        )
-                else:
-                    self._echo_reset_decode_state(req_id, scheduler_output)
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
