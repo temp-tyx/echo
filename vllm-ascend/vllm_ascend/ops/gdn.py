@@ -204,6 +204,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
 
         # 1.2: Process the remaining part
+        # When ECHO prunes some reqs' drafts to -1, those reqs become
+        # non-spec decodes. If spec decodes also exist, the non-spec decodes
+        # use the decode kernel (same as spec) via separate metadata.
         if attn_metadata.num_prefills > 0:
             if mixed_qkv_non_spec is not None:
                 conv_weights_T = conv_weights.transpose(0, 1)
@@ -213,16 +216,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     cache_indices_opt,
                     initial_state_mode_opt,
                 ) = get_non_spec_causal_conv1d_host_args(attn_metadata)
-                if attn_metadata.non_spec_num_accepted_tokens is not None:
-                    non_spec_acc = attn_metadata.non_spec_num_accepted_tokens
-                    conv_width = self.conv1d.weight.size(-1)
-                    hist_len = conv_width - 1
-                    for j in range(non_spec_state_indices_tensor.shape[0]):
-                        acc_val = int(non_spec_acc[j])
-                        shift = acc_val - 1
-                        if shift > 0:
-                            slot_j = int(non_spec_state_indices_tensor[j, 0])
-                            conv_state[slot_j, :hist_len] = conv_state[slot_j, shift:shift + hist_len].clone()
                 mixed_qkv_non_spec = torch.ops._C_ascend.npu_causal_conv1d_custom(
                     mixed_qkv_non_spec,
                     conv_weights_T,
@@ -236,20 +229,42 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     pad_slot_id=PAD_SLOT_ID,
                     run_mode=0,
                 )
-        elif attn_metadata.num_decodes > 0:
-            non_spec_accepted = attn_metadata.non_spec_num_accepted_tokens
-            mixed_qkv_non_spec = causal_conv1d_update_npu(
-                mixed_qkv_non_spec,
-                conv_state,
-                conv_weights,
-                self.conv1d.bias,
-                self.activation,
-                conv_state_indices=non_spec_state_indices_tensor[:, 0][: attn_metadata.num_decodes],
-                num_accepted_tokens=non_spec_accepted,
-                query_start_loc=non_spec_query_start_loc[: attn_metadata.num_decodes + 1],
-                max_query_len=int((non_spec_query_start_loc[1:] - non_spec_query_start_loc[:-1]).max().item()),
-                validate_data=True,
-            )
+                # Write prefill conv1d output back to mixed_qkv
+                mixed_qkv.index_copy_(0, non_spec_token_indx, mixed_qkv_non_spec)
+        if attn_metadata.num_decodes > 0:
+            if attn_metadata.non_spec_decode_token_indx is not None:
+                # Non-spec decodes coexist with spec decodes: use separate metadata
+                mixed_qkv_decode = mixed_qkv.index_select(0, attn_metadata.non_spec_decode_token_indx)
+                mixed_qkv_decode = causal_conv1d_update_npu(
+                    mixed_qkv_decode,
+                    conv_state,
+                    conv_weights,
+                    self.conv1d.bias,
+                    self.activation,
+                    conv_state_indices=attn_metadata.non_spec_decode_state_indices_tensor[:, 0],
+                    num_accepted_tokens=attn_metadata.non_spec_decode_num_accepted_tokens,
+                    query_start_loc=attn_metadata.non_spec_decode_query_start_loc,
+                    max_query_len=int((attn_metadata.non_spec_decode_query_start_loc[1:] - attn_metadata.non_spec_decode_query_start_loc[:-1]).max().item()),
+                    validate_data=True,
+                )
+                # Write back decode conv1d output into mixed_qkv
+                mixed_qkv.index_copy_(0, attn_metadata.non_spec_decode_token_indx, mixed_qkv_decode)
+                # Re-select mixed_qkv_non_spec from updated mixed_qkv
+                mixed_qkv_non_spec = mixed_qkv.index_select(0, non_spec_token_indx)
+            else:
+                # No spec decodes, all non-spec are decodes
+                mixed_qkv_non_spec = causal_conv1d_update_npu(
+                    mixed_qkv_non_spec,
+                    conv_state,
+                    conv_weights,
+                    self.conv1d.bias,
+                    self.activation,
+                    conv_state_indices=non_spec_state_indices_tensor[:, 0][: attn_metadata.num_decodes],
+                    num_accepted_tokens=attn_metadata.non_spec_num_accepted_tokens,
+                    query_start_loc=non_spec_query_start_loc[: attn_metadata.num_decodes + 1],
+                    max_query_len=int((non_spec_query_start_loc[1:] - non_spec_query_start_loc[:-1]).max().item()),
+                    validate_data=True,
+                )
         else:
             mixed_qkv_non_spec = None
 
@@ -301,21 +316,10 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out_spec, last_recurrent_state = None, None
 
         # 2.2: Process the remaining part
+        core_attn_out_non_spec = None
+        core_attn_out_decode = None
         if attn_metadata.num_prefills > 0:
-            if attn_metadata.non_spec_num_accepted_tokens is not None:
-                non_spec_accepted = attn_metadata.non_spec_num_accepted_tokens
-                num_non_spec = non_spec_state_indices_tensor.shape[0]
-                read_slots = []
-                for i in range(num_non_spec):
-                    acc_val = int(non_spec_accepted[i])
-                    if acc_val > 0 and acc_val <= non_spec_state_indices_tensor.shape[1]:
-                        read_slots.append(non_spec_state_indices_tensor[i, acc_val - 1])
-                    else:
-                        read_slots.append(non_spec_state_indices_tensor[i, 0])
-                read_slots_tensor = torch.stack(read_slots)
-                initial_state = ssm_state[read_slots_tensor].transpose(-1, -2).contiguous()
-            else:
-                initial_state = ssm_state[non_spec_state_indices_tensor[:, 0]].transpose(-1, -2).contiguous()
+            initial_state = ssm_state[non_spec_state_indices_tensor[:, 0]].transpose(-1, -2).contiguous()
             clear_ssm_states(initial_state, has_initial_state)
             (core_attn_out_non_spec, last_recurrent_state) = chunk_gated_delta_rule(
                 q=query_non_spec,
@@ -333,37 +337,63 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             ssm_state[non_spec_state_indices_tensor[:, 0]] = (
                 last_recurrent_state.transpose(-1, -2).contiguous().to(ssm_state.dtype)
             )
-        elif attn_metadata.num_decodes > 0:
-            cu_seqlens = non_spec_query_start_loc[: attn_metadata.num_decodes + 1]
-            actual_seq_lengths = torch.cat([cu_seqlens[:1], cu_seqlens[1:] - cu_seqlens[:-1]])
-            query_non_spec = l2norm_fwd(query_non_spec)
-            key_non_spec = l2norm_fwd(key_non_spec)
-            # Dispatches to the vllm-ascend AscendC custom operator
-            # (csrc/recurrent_gated_delta_rule), NOT the built-in CANN operator.
-            core_attn_out_non_spec = torch_npu.npu_recurrent_gated_delta_rule(
-                query=query_non_spec.squeeze(0),
-                key=key_non_spec.squeeze(0),
-                value=value_non_spec.squeeze(0),
-                g=g_non_spec.squeeze(0) if g_non_spec is not None else g_non_spec,
-                beta=beta_non_spec.squeeze(0) if beta_non_spec is not None else beta_non_spec,
-                state=ssm_state,
-                scale=key_non_spec.shape[-1] ** -0.5,
-                actual_seq_lengths=actual_seq_lengths,
-                ssm_state_indices=non_spec_state_indices_tensor.flatten(),
-                num_accepted_tokens=attn_metadata.non_spec_num_accepted_tokens.to(torch.int32),
-            ).unsqueeze(0)
-        else:
-            core_attn_out_non_spec, last_recurrent_state = None, None
+        if attn_metadata.num_decodes > 0:
+            if attn_metadata.non_spec_decode_token_indx is not None:
+                # Non-spec decodes coexist with spec decodes
+                decode_q = mixed_qkv.index_select(0, attn_metadata.non_spec_decode_token_indx)
+                decode_qkv = decode_q
+                # Split qkv (rearrange is 3-way split of last dim)
+                # The mixed_qkv has shape [num_tokens, dim], need to use rearrange
+                q_dec, k_dec, v_dec = self.rearrange_mixed_qkv(decode_qkv)
+                g_dec = g.index_select(1, attn_metadata.non_spec_decode_token_indx)
+                beta_dec = beta.index_select(1, attn_metadata.non_spec_decode_token_indx)
+                q_dec = l2norm_fwd(q_dec)
+                k_dec = l2norm_fwd(k_dec)
+                cu_seqlens_dec = attn_metadata.non_spec_decode_query_start_loc
+                actual_seq_lengths_dec = torch.cat([cu_seqlens_dec[:1], cu_seqlens_dec[1:] - cu_seqlens_dec[:-1]])
+                core_attn_out_decode = torch_npu.npu_recurrent_gated_delta_rule(
+                    query=q_dec.squeeze(0),
+                    key=k_dec.squeeze(0),
+                    value=v_dec.squeeze(0),
+                    g=g_dec.squeeze(0),
+                    beta=beta_dec.squeeze(0),
+                    state=ssm_state,
+                    scale=k_dec.shape[-1] ** -0.5,
+                    actual_seq_lengths=actual_seq_lengths_dec,
+                    ssm_state_indices=attn_metadata.non_spec_decode_state_indices_tensor.flatten(),
+                    num_accepted_tokens=attn_metadata.non_spec_decode_num_accepted_tokens.to(torch.int32),
+                ).unsqueeze(0)
+            else:
+                # No spec decodes, all non-spec are decodes
+                cu_seqlens = non_spec_query_start_loc[: attn_metadata.num_decodes + 1]
+                actual_seq_lengths = torch.cat([cu_seqlens[:1], cu_seqlens[1:] - cu_seqlens[:-1]])
+                query_non_spec = l2norm_fwd(query_non_spec)
+                key_non_spec = l2norm_fwd(key_non_spec)
+                core_attn_out_non_spec = torch_npu.npu_recurrent_gated_delta_rule(
+                    query=query_non_spec.squeeze(0),
+                    key=key_non_spec.squeeze(0),
+                    value=value_non_spec.squeeze(0),
+                    g=g_non_spec.squeeze(0) if g_non_spec is not None else g_non_spec,
+                    beta=beta_non_spec.squeeze(0) if beta_non_spec is not None else beta_non_spec,
+                    state=ssm_state,
+                    scale=key_non_spec.shape[-1] ** -0.5,
+                    actual_seq_lengths=actual_seq_lengths,
+                    ssm_state_indices=non_spec_state_indices_tensor.flatten(),
+                    num_accepted_tokens=attn_metadata.non_spec_num_accepted_tokens.to(torch.int32),
+                ).unsqueeze(0)
 
         # 3. Merge core attention output
-        if spec_sequence_masks is not None and core_attn_out_non_spec is not None:
-            merged_out = torch.empty(
+        if spec_sequence_masks is not None and (core_attn_out_non_spec is not None or core_attn_out_decode is not None):
+            merged_out = torch.zeros(
                 (1, num_actual_tokens, *core_attn_out_spec.shape[2:]),
-                dtype=core_attn_out_non_spec.dtype,
-                device=core_attn_out_non_spec.device,
+                dtype=core_attn_out_spec.dtype,
+                device=core_attn_out_spec.device,
             )
             merged_out.index_copy_(1, spec_token_indx, core_attn_out_spec)
-            merged_out.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
+            if core_attn_out_non_spec is not None:
+                merged_out.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
+            if core_attn_out_decode is not None:
+                merged_out.index_copy_(1, attn_metadata.non_spec_decode_token_indx, core_attn_out_decode)
             core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
         elif spec_sequence_masks is not None:
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
