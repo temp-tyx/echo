@@ -435,8 +435,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             self.spec_state_indices_tensor[:num_spec_decodes].copy_(
                 spec_state_indices_tensor, non_blocking=True
             )
-            spec_state_indices_tensor = self.spec_state_indices_tensor[:batch_size]
-            spec_state_indices_tensor[num_spec_decodes:].fill_(PAD_SLOT_ID)
+            spec_state_indices_tensor = self.spec_state_indices_tensor[:num_spec_decodes]
 
             self.spec_sequence_masks[:num_spec_decodes].copy_(
                 spec_sequence_masks[:num_spec_decodes], non_blocking=True
