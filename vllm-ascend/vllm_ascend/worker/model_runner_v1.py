@@ -2328,15 +2328,28 @@ class NPUModelRunner(GPUModelRunner):
     ) -> tuple[CUDAGraphMode, BatchDescriptor, bool, torch.Tensor | None, CUDAGraphStat | None]:
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
         is_all_decode = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
-        uniform_decode = (
-            (
-                (is_all_decode if self.speculative_config else True)
-                and (max_num_scheduled_tokens == self.uniform_decode_query_len)
-                and (num_tokens == max_num_scheduled_tokens * num_reqs)
+        if envs.VLLM_ECHO_ENABLED and self.speculative_config and force_uniform_decode is None:
+            # ECHO pure-decode verify has a fixed total token count
+            # (base + kept drafts = K_MAX) but non-uniform per-req draft
+            # counts. Flag uniform_decode=True so dispatch routes to the
+            # ECHO FULL wildcard (num_reqs=None + max_query_len) in
+            # _create_padded_batch_descriptor; that branch short-circuits
+            # before the legacy num_reqs = num_tokens // udql division that
+            # would mis-count reqs for a non-uniform batch.
+            # Prefill-bearing batches keep uniform_decode=False
+            # (is_all_decode=False) and skip ECHO FULL, matching upstream
+            # PR #48692's "prefills use fixed-K fallback" behaviour.
+            uniform_decode = is_all_decode and (num_tokens == envs.VLLM_ECHO_K_MAX)
+        else:
+            uniform_decode = (
+                (
+                    (is_all_decode if self.speculative_config else True)
+                    and (max_num_scheduled_tokens == self.uniform_decode_query_len)
+                    and (num_tokens == max_num_scheduled_tokens * num_reqs)
+                )
+                if force_uniform_decode is None
+                else force_uniform_decode
             )
-            if force_uniform_decode is None
-            else force_uniform_decode
-        )
         # Encoder-decoder models only support CG for decoder_step > 0 (no enc_output
         # is present). Also, chunked-prefill is disabled, so batch are uniform.
         has_encoder_output = self.model_config.is_encoder_decoder and num_encoder_reqs > 0

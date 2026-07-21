@@ -35,7 +35,7 @@ def _create_padded_batch_descriptor(
     # cu_seqlens, so uniform=True here is a capture-shape hint, not a claim
     # that the runtime batch is uniform. Mirrors upstream PR #48692's
     # adaptive-verification max_query_len mechanism.
-    if envs.VLLM_ECHO_ENABLED and is_full_decode_only:
+    if envs.VLLM_ECHO_ENABLED and is_full_decode_only and uniform_decode:
         num_reqs = None
         uniform = True
         max_query_len = uniform_decode_query_len
