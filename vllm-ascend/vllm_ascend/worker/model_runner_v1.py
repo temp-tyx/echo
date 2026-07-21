@@ -2328,15 +2328,24 @@ class NPUModelRunner(GPUModelRunner):
     ) -> tuple[CUDAGraphMode, BatchDescriptor, bool, torch.Tensor | None, CUDAGraphStat | None]:
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
         is_all_decode = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
-        uniform_decode = (
-            (
-                (is_all_decode if self.speculative_config else True)
-                and (max_num_scheduled_tokens == self.uniform_decode_query_len)
-                and (num_tokens == max_num_scheduled_tokens * num_reqs)
+        if envs.VLLM_ECHO_ENABLED and self.speculative_config and force_uniform_decode is None:
+            # ECHO keeps K_MAX - bs drafts globally via global top-k, so the
+            # total forward token count is fixed at K_MAX regardless of per-req
+            # distribution. Graph capture/replay only requires the total to
+            # match a capture size; per-req metadata (cu_seqlens, spec masks,
+            # state indices) is copied into static buffers before replay by
+            # GDNAttentionMetadataBuilder, so non-uniform per-req widths are OK.
+            uniform_decode = is_all_decode and (num_tokens == envs.VLLM_ECHO_K_MAX)
+        else:
+            uniform_decode = (
+                (
+                    (is_all_decode if self.speculative_config else True)
+                    and (max_num_scheduled_tokens == self.uniform_decode_query_len)
+                    and (num_tokens == max_num_scheduled_tokens * num_reqs)
+                )
+                if force_uniform_decode is None
+                else force_uniform_decode
             )
-            if force_uniform_decode is None
-            else force_uniform_decode
-        )
         # Encoder-decoder models only support CG for decoder_step > 0 (no enc_output
         # is present). Also, chunked-prefill is disabled, so batch are uniform.
         has_encoder_output = self.model_config.is_encoder_decoder and num_encoder_reqs > 0
@@ -2722,10 +2731,25 @@ class NPUModelRunner(GPUModelRunner):
         if create_mixed_batch:
             raise NotImplementedError("create_mixed_batch is used for warmup deepgemm, vllm-ascend does not need it")
         elif uniform_decode:
-            num_reqs = min(max_num_reqs, cdiv(num_tokens, max_query_len))
-            num_scheduled_tokens_list = [max_query_len] * num_reqs
-            if num_tokens % max_query_len != 0:
-                num_scheduled_tokens_list[-1] = num_tokens % max_query_len
+            if (envs.VLLM_ECHO_ENABLED and is_graph_capturing
+                    and self.speculative_config
+                    and num_tokens == envs.VLLM_ECHO_K_MAX):
+                # ECHO graph capture: build a coexist dummy (1 spec decode with
+                # K_MAX-2 drafts + 1 non-spec decode) so the coexist forward
+                # kernels (decode conv1d + decode recurrent) are captured.
+                # build_for_cudagraph_capture marks the last req as non-spec
+                # (num_decode_draft_tokens=-1) to drive build() into the
+                # coexist branch. At replay ECHO produces coexist with the
+                # same total=K_MAX but varying per-req distribution; the
+                # captured kernel sequence replays against fresh per-step
+                # metadata copied into static buffers.
+                num_reqs = 2
+                num_scheduled_tokens_list = [envs.VLLM_ECHO_K_MAX - 1, 1]
+            else:
+                num_reqs = min(max_num_reqs, cdiv(num_tokens, max_query_len))
+                num_scheduled_tokens_list = [max_query_len] * num_reqs
+                if num_tokens % max_query_len != 0:
+                    num_scheduled_tokens_list[-1] = num_tokens % max_query_len
         elif profile_cpp:
             num_reqs = 1
             num_scheduled_tokens_list = [num_tokens] * num_reqs

@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import torch
 import vllm.v1.attention.backends.gdn_attn as gdn_attn
 
+from vllm_ascend import envs
 from vllm_ascend.ops.triton.gdn_chunk_meta import (
     _build_seq_lens,
     _validate_cu_seqlens,
@@ -32,6 +33,7 @@ _GDN_CUMSUM_WORKING_SET = 2**18
 
 _IS_PATCHED = False
 _ORIGINAL_BUILD = gdn_attn.GDNAttentionMetadataBuilder.build
+_ORIGINAL_BUILD_FOR_CAPTURE = gdn_attn.GDNAttentionMetadataBuilder.build_for_cudagraph_capture
 _ORIGINAL_INIT_THRESHOLD = gdn_attn.GDNAttentionMetadataBuilder._init_reorder_batch_threshold
 
 
@@ -623,10 +625,40 @@ def _init_reorder_batch_threshold(
             self.reorder_batch_threshold = 1 + speculative_config.num_speculative_tokens
 
 
+def _patched_build_for_cudagraph_capture(self, common_attn_metadata):
+    """ECHO-aware graph capture.
+
+    The default build_for_cudagraph_capture derives num_decode_draft_tokens
+    from query lens (>=0 for every req), so build() always takes the all-spec
+    path and the coexist forward kernels (decode conv1d + decode recurrent)
+    are never captured. When ECHO is on, mark the last req as a non-spec
+    decode (num_decode_draft_tokens=-1) so build() takes the coexist branch
+    and captures the decode kernels too. Paired with the model runner's ECHO
+    capture dummy that emits query lens [K_MAX-1, 1].
+    """
+    m = common_attn_metadata
+    assert (
+        m.num_reqs <= self.decode_cudagraph_max_bs
+        and m.num_actual_tokens <= self.decode_cudagraph_max_bs
+    ), (
+        f"GDN only supports decode-only full CUDAGraph capture. "
+        f"Make sure batch size ({m.num_reqs}) <= "
+        f"cudagraph capture sizes ({self.decode_cudagraph_max_bs}), "
+        f"and number of tokens ({m.num_actual_tokens}) <= "
+        f"cudagraph capture sizes ({self.decode_cudagraph_max_bs})."
+    )
+    num_accepted_tokens = torch.diff(m.query_start_loc)
+    num_decode_draft_tokens_cpu = (num_accepted_tokens - 1).cpu()
+    if envs.VLLM_ECHO_ENABLED and m.num_reqs >= 2:
+        num_decode_draft_tokens_cpu[-1] = -1
+    return self.build(0, m, num_accepted_tokens, num_decode_draft_tokens_cpu)
+
+
 if not _IS_PATCHED and not is_310p():
     gdn_attn.GDNChunkedPrefillMetadata = GDNChunkedPrefillMetadata
     gdn_attn.GDNCausalConv1dHostMetadata = GDNCausalConv1dHostMetadata
     gdn_attn.GDNPrefillFallbackMeta = GDNPrefillFallbackMeta
     gdn_attn.GDNAttentionMetadataBuilder.build = _patched_build
+    gdn_attn.GDNAttentionMetadataBuilder.build_for_cudagraph_capture = _patched_build_for_cudagraph_capture
     gdn_attn.GDNAttentionMetadataBuilder._init_reorder_batch_threshold = _init_reorder_batch_threshold
     _IS_PATCHED = True
