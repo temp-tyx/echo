@@ -220,7 +220,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_decode_state_indices_tensor = None
             non_spec_decode_num_accepted_tokens = None
             spec_conv_max_query_len = 0
-            non_spec_decode_max_query_len = 0
+            if num_decodes > 0 and non_spec_query_start_loc_cpu is not None \
+                    and non_spec_query_start_loc_cpu.numel() > 1:
+                non_spec_decode_max_query_len = int(
+                    (non_spec_query_start_loc_cpu[1:]
+                     - non_spec_query_start_loc_cpu[:-1]).max())
+            else:
+                non_spec_decode_max_query_len = 0
         else:
             query_lens = query_start_loc[1:] - query_start_loc[:-1]
             assert spec_sequence_masks_cpu is not None
@@ -388,7 +394,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 non_spec_decode_token_indx = None
                 non_spec_decode_state_indices_tensor = None
                 non_spec_decode_num_accepted_tokens = None
-                non_spec_decode_max_query_len = 0
+                if num_decodes > 0 and non_spec_query_start_loc_cpu is not None \
+                        and non_spec_query_start_loc_cpu.numel() > 1:
+                    non_spec_decode_max_query_len = int(
+                        (non_spec_query_start_loc_cpu[1:]
+                         - non_spec_query_start_loc_cpu[:-1]).max())
+                else:
+                    non_spec_decode_max_query_len = 0
 
         if num_prefills > 0:
             has_initial_state = context_lens_tensor > 0

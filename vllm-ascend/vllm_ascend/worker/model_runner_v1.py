@@ -472,7 +472,6 @@ class NPUModelRunner(GPUModelRunner):
             self.kvcomp_meta_data = initialize_kvcomp_metadata(max_num_reqs=self.max_num_reqs,
                 block_size=self.block_size, device=self.device, vllm_config=self.vllm_config,
                 parallel_config=self.parallel_config, dtype=self.dtype)
-        self.echo_cu_draft_tokens = []
 
     @property
     def use_cp(self) -> bool:
@@ -1934,8 +1933,6 @@ class NPUModelRunner(GPUModelRunner):
                 sample_hidden_states,
                 batch_desc,
             )
-            mask = (self._draft_token_ids != -1)
-            self.echo_cu_draft_tokens = mask.int().sum(dim=1).cpu().tolist()
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         (

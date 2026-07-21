@@ -263,7 +263,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     conv_state_indices=non_spec_state_indices_tensor[:, 0][: attn_metadata.num_decodes],
                     num_accepted_tokens=attn_metadata.non_spec_num_accepted_tokens,
                     query_start_loc=non_spec_query_start_loc[: attn_metadata.num_decodes + 1],
-                    max_query_len=attn_metadata.spec_conv_max_query_len if attn_metadata.spec_conv_max_query_len > 0 else int((non_spec_query_start_loc[1:] - non_spec_query_start_loc[:-1]).max().item()),
+                    max_query_len=attn_metadata.non_spec_decode_max_query_len,
                     validate_data=True,
                 )
 
