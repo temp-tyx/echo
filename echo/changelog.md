@@ -44,6 +44,7 @@
 - **预计算 max_query_len**：在 build() 中 CPU 侧计算 `spec_conv_max_query_len` 和 `non_spec_decode_max_query_len`，避免 graph capture 时 `.item()` 导致 stream sync
 - **分离 decode metadata**：当 `num_decodes > 0 and num_spec_decodes > 0` 时，从 non-spec 请求中按 `query_len == 1` 分离出 decode 请求，构建独立的 query_start_loc、token_indx、state_indices、num_accepted
 - **graph buffer padding**：当 `spec_state_indices_tensor` 列数 < 预分配 buffer 列数时，pad `PAD_SLOT_ID` 到 `num_spec + 1` 列再 copy
+- **graph path slice 修复**：graph path 中 `spec_state_indices_tensor` 从 `[:batch_size]`（padded token 数）改为 `[:num_spec_decodes]`（req 数），避免 flatten 后长度 = `batch_size * (num_spec+1)` 导致 `colCount` 计算错误（如 40 而非 8）
 - **预分配 buffer 改 2D**：`non_spec_state_indices_tensor` buffer 从 `(max_bs,)` 改为 `(max_bs, num_spec + 1)`
 - 新增 `non_spec_num_accepted_tokens` 预分配 buffer
 
