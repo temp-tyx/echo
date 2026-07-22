@@ -17,13 +17,18 @@ from dataclasses import dataclass
 
 import torch
 import vllm.v1.attention.backends.gdn_attn as gdn_attn
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.logger import init_logger
 
+from vllm_ascend import envs
 from vllm_ascend.ops.triton.gdn_chunk_meta import (
     _build_seq_lens,
     _validate_cu_seqlens,
     build_chunk_meta_device,
 )
 from vllm_ascend.utils import is_310p
+
+logger = init_logger(__name__)
 
 _GDN_CHUNK_SIZE = 64
 # Keep this aligned with solve_tril.LARGE_BLOCK_T in ops/triton/fla/solve_tril.py.
@@ -568,6 +573,40 @@ def _patched_build(
         fast_build=fast_build,
     )
     attn_metadata.non_spec_prefill_fallback_meta = None
+
+    # ECHO: the FULL graph is captured with a wildcard descriptor whose
+    # num_tokens is pinned to K_MAX, so the captured spec_state_indices
+    # buffer has K_MAX rows. At runtime ECHO prunes drafts so num_spec_decodes
+    # (= bs) can be smaller than K_MAX. The original graph_path1 slices the
+    # buffer to [:num_spec_decodes], which would shrink the tensor shape on
+    # replay and break the captured graph. Pad the tail rows with PAD_SLOT_ID
+    # and expose a fixed [:K_MAX] view instead; device-side query_start_loc /
+    # num_accepted_tokens already carry the real per-request boundaries, so
+    # kernels skip the padded rows naturally.
+    if (
+        envs.VLLM_ECHO_ENABLED
+        and self.use_full_cuda_graph
+        and attn_metadata.num_prefills == 0
+        and attn_metadata.num_decodes == 0
+        and attn_metadata.num_spec_decodes > 0
+        and attn_metadata.spec_state_indices_tensor is not None
+    ):
+        k_max = envs.VLLM_ECHO_K_MAX
+        nsd = attn_metadata.num_spec_decodes
+        if nsd < k_max:
+            self.spec_state_indices_tensor[nsd:k_max].fill_(PAD_SLOT_ID)
+            attn_metadata.spec_state_indices_tensor = (
+                self.spec_state_indices_tensor[:k_max]
+            )
+            logger.warning(
+                "[ECHO_CG] gdn pad spec_state_indices nsd=%s -> k_max=%s",
+                nsd,
+                k_max,
+            )
+        # num_accepted_tokens tail also needs a valid fixed value; the
+        # original graph_path1 already pads [:batch_size] with 1, and
+        # batch_size == num_actual_tokens == K_MAX for ECHO, so it is covered.
+
     if attn_metadata.num_prefills <= 0:
         return attn_metadata
 
