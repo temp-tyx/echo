@@ -309,12 +309,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         attn_mask = self.attn_mask_builder.get_attention_mask(self.model_config)
 
         # TODO: Yet another unnecessary H2D while we already have a query_start_loc on device
-        if envs.VLLM_ECHO_ENABLED and common_attn_metadata.query_start_loc is not None:
-            # ECHO: use the stable device buffer (self.runner.query_start_loc.gpu)
-            # so the FIA op captures a stable pointer; content updates at replay.
-            query_start_loc = common_attn_metadata.query_start_loc
-        else:
-            query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
+        query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
 
         # ECHO: full_attention's seq_lens_list / actual_seq_lengths_q are host
         # lists whose length == num_reqs. The captured graph pins num_reqs to
@@ -580,6 +575,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     else:
                         seq_lens = attn_metadata[key].seq_lens_list
                         actual_seq_lengths_q = attn_metadata[key].actual_seq_lengths_q
+                        if envs.VLLM_ECHO_ENABLED:
+                            # DIAG ECHO: feed constant q (= capture's) to test if
+                            # the hang is caused by q being updated vs tiling baked.
+                            _k = envs.VLLM_ECHO_K_MAX
+                            actual_seq_lengths_q = [_k] * _k
                         block_tables = attn_metadata[key].block_tables
                         if envs.VLLM_ECHO_ENABLED:
                             logger.warning(
@@ -611,12 +611,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         atten_mask=attn_mask,
                         input_layout=input_layout,
                         block_size=block_size,
-                        actual_seq_lengths=(
-                            attn_metadata[key].query_start_loc[1:]
-                            if envs.VLLM_ECHO_ENABLED
-                            and attn_metadata[key].query_start_loc is not None
-                            else actual_seq_lengths_q
-                        ),
+                        actual_seq_lengths=actual_seq_lengths_q,
                         actual_seq_lengths_kv=seq_lens,
                         num_key_value_heads=num_kv_heads,
                         num_heads=num_heads,
@@ -750,14 +745,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 num_tokens, input_layout, _EXTRA_CTX.is_draft_model,
             )
         torch.npu.graph_task_group_begin(stream)
-        # ECHO: pass actual_seq_lengths as a device tensor (stable buffer) so
-        # the captured op reads updated per-req boundaries at replay instead of
-        # a baked host list.
-        _echo_asq = (
-            attn_metadata.query_start_loc[1:]
-            if envs.VLLM_ECHO_ENABLED and attn_metadata.query_start_loc is not None
-            else actual_seq_lengths_q
-        )
         torch_npu.npu_fused_infer_attention_score.out(
             query=query,
             key=key,
@@ -766,7 +753,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             block_table=block_table,
             input_layout=input_layout,
             block_size=block_size,
-            actual_seq_lengths=_echo_asq,
+            actual_seq_lengths=actual_seq_lengths_q,
             actual_seq_lengths_kv=actual_seq_lengths_kv,
             num_key_value_heads=self.num_kv_heads,
             num_heads=self.num_heads,
