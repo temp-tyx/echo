@@ -448,6 +448,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         # Prepare tensors for cudagraph
         # Note: m.num_actual_tokens is already padded by the model runner for CUDAGraph
         batch_size = m.num_actual_tokens
+        # Fixed req-count upper bound so the recurrent kernel's tiling (B,
+        # colCount, grid) is identical at capture and replay. ECHO prunes
+        # per-req drafts non-uniformly, but num_reqs (bs) is always <= this.
+        # Pad spec tensors to max_B so the kernel iterates max_B reqs and
+        # skips padding reqs (seqLen==0) at replay (kernel Process() has
+        # `if (seqLen <= 0) continue`).
+        max_B = self.vllm_config.scheduler_config.max_num_seqs
 
         if (
             self.use_full_cuda_graph
@@ -473,7 +480,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             self.spec_state_indices_tensor[:num_spec_decodes].copy_(
                 spec_state_indices_tensor, non_blocking=True
             )
-            spec_state_indices_tensor = self.spec_state_indices_tensor[:num_spec_decodes]
+            self.spec_state_indices_tensor[num_spec_decodes:max_B].fill_(PAD_SLOT_ID)
+            spec_state_indices_tensor = self.spec_state_indices_tensor[:max_B]
 
             self.spec_sequence_masks[:num_spec_decodes].copy_(
                 spec_sequence_masks[:num_spec_decodes], non_blocking=True
@@ -498,14 +506,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 spec_query_start_loc, non_blocking=True
             )
             spec_num_query_tokens = spec_query_start_loc[-1]  # type: ignore[index]
-            spec_query_start_loc = self.spec_query_start_loc[: batch_size + 1]
-            spec_query_start_loc[num_spec_decodes + 1 :].fill_(spec_num_query_tokens)
+            self.spec_query_start_loc[num_spec_decodes + 1 : max_B + 1].fill_(spec_num_query_tokens)
+            spec_query_start_loc = self.spec_query_start_loc[: max_B + 1]
 
             self.num_accepted_tokens[:num_spec_decodes].copy_(
                 num_accepted_tokens, non_blocking=True
             )
-            num_accepted_tokens = self.num_accepted_tokens[:batch_size]
-            num_accepted_tokens[num_spec_decodes:].fill_(1)
+            self.num_accepted_tokens[num_spec_decodes:max_B].fill_(1)
+            num_accepted_tokens = self.num_accepted_tokens[:max_B]
 
             # Coexist (spec + non-spec decode), e.g. ECHO pruned some reqs'
             # drafts to all -1: copy the non-spec-decode metadata into static
