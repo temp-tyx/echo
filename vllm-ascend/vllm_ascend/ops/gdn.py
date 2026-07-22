@@ -188,18 +188,19 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
-            mixed_qkv_spec = causal_conv1d_update_npu(
-                mixed_qkv_spec,
-                conv_state,
-                conv_weights,
-                self.conv1d.bias,
-                self.activation,
-                conv_state_indices=spec_state_indices_tensor[:, 0][: attn_metadata.num_spec_decodes],
-                num_accepted_tokens=num_accepted_tokens,
-                query_start_loc=spec_query_start_loc,
-                max_query_len=attn_metadata.spec_conv_max_query_len,
-                validate_data=False,
-            )
+            # DEBUG ECHO: no-op conv1d to bisect the replay hang (passthrough).
+            # mixed_qkv_spec = causal_conv1d_update_npu(
+            #     mixed_qkv_spec,
+            #     conv_state,
+            #     conv_weights,
+            #     self.conv1d.bias,
+            #     self.activation,
+            #     conv_state_indices=spec_state_indices_tensor[:, 0][: attn_metadata.num_spec_decodes],
+            #     num_accepted_tokens=num_accepted_tokens,
+            #     query_start_loc=spec_query_start_loc,
+            #     max_query_len=attn_metadata.spec_conv_max_query_len,
+            #     validate_data=False,
+            # )
 
         # 1.2: Process the remaining part
         # When ECHO prunes some reqs' drafts to -1, those reqs become
@@ -301,7 +302,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             # loaded at runtime via ASCEND_CUSTOM_OPP_PATH.
             # DEBUG ECHO: no-op the recurrent to bisect the replay hang.
             # If replay completes with this, GDN recurrent is the culprit.
-            core_attn_out_spec = torch.zeros_like(query_spec)
+            core_attn_out_spec = torch.zeros_like(value_spec)
         else:
             core_attn_out_spec, last_recurrent_state = None, None
 
