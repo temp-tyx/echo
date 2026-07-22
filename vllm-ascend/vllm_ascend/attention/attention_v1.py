@@ -555,6 +555,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         seq_lens = attn_metadata[key].seq_lens_list
                         actual_seq_lengths_q = attn_metadata[key].actual_seq_lengths_q
                         block_tables = attn_metadata[key].block_tables
+                        if envs.VLLM_ECHO_ENABLED:
+                            logger.warning(
+                                "[ECHO_CG] fia_update key=%s asq=%s sl=%s",
+                                key,
+                                actual_seq_lengths_q,
+                                seq_lens,
+                            )
 
                     torch.npu.graph_task_update_begin(update_stream, handle)
                     input_layout = "TND"

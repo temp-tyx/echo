@@ -579,6 +579,23 @@ class NPUModelRunner(GPUModelRunner):
         """
         # TODO: need refactor later, related to vllm PR #34043 this pr delete func
         # relax_for_mixed_batch_cudagraphs, num_reqs no longer equals the actual number of requests.
+        if envs.VLLM_ECHO_ENABLED and cudagraph_runtime_mode == CUDAGraphMode.FULL:
+            # ECHO: num_tokens is pinned to K_MAX (global budget), which is
+            # smaller than num_reqs * dql, so the original uniform/mixed branch
+            # would shrink/swap the query_start_loc shape across replays
+            # (capture num_reqs=1 -> shape[2]; runtime num_reqs=2 -> shape[4]
+            # via the mixed-case +1). Pin num_reqs_padded to K_MAX and pad
+            # query_start_loc non-decreasingly so the device tensor shape is
+            # fixed at [K_MAX+1]; dummy reqs carry 0 tokens (FIA/GDN skip).
+            k_max = envs.VLLM_ECHO_K_MAX
+            num_reqs_padded = k_max
+            last_loc = int(self.query_start_loc.np[num_reqs])
+            self.query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1] = last_loc
+            self.query_start_loc.copy_to_gpu()
+            if self._has_gdn:
+                self.gdn_query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1] = last_loc
+                self.gdn_query_start_loc.copy_to_gpu()
+            return num_reqs_padded
         if cudagraph_runtime_mode == CUDAGraphMode.FULL and \
             self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL:
             num_reqs_padded = num_reqs
