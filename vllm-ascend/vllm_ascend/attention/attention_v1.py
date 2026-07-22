@@ -436,6 +436,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
         num_dcp_pcp_tokens=None,
         draft_attn_metadatas=None,
     ):
+        if envs.VLLM_ECHO_ENABLED and envs.VLLM_ECHO_SKIP_FIA_UPDATE:
+            logger.warning(
+                "[ECHO_UPD_SKIP] skip fia_update num_tokens=%s is_draft=%s",
+                num_tokens, _EXTRA_CTX.is_draft_model,
+            )
+            return
         if using_paged_attention(num_tokens, vllm_config):
             # Paged Attention update logic
             if _EXTRA_CTX.is_draft_model:

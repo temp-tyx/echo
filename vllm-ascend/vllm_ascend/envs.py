@@ -122,6 +122,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Multiplier for extending speculation steps in ECHO.
     # The actual number of draft steps will be k * steps_multiplier.
     "VLLM_ECHO_STEPS_MULTIPLIER": lambda: int(os.getenv("VLLM_ECHO_STEPS_MULTIPLIER", "1")),
+    # DEBUG: skip the FIA graph_task_update path to localize the replay hang.
+    # 0 (default) = run fia_update; 1 = skip (FIA uses capture-baked args).
+    "VLLM_ECHO_SKIP_FIA_UPDATE": lambda: bool(int(os.getenv("VLLM_ECHO_SKIP_FIA_UPDATE", "0"))),
 }
 
 # end-env-vars-definition
