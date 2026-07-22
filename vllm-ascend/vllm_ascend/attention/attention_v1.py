@@ -515,6 +515,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
             if _EXTRA_CTX.is_draft_model:
                 attn_keys = attn_keys * (len(graph_params.attn_params[num_tokens]) // num_layers)
             attn_count = 0
+            logger.warning(
+                "[ECHO_DRAFT_UPD] is_draft=%s num_tokens=%s num_layers=%s "
+                "len_attn_params=%s len_multi_steps=%s",
+                _EXTRA_CTX.is_draft_model, num_tokens, num_layers,
+                len(graph_params.attn_params[num_tokens]),
+                len(attn_metadata) if isinstance(attn_metadata, list) else -1,
+            )
             with torch.npu.stream(update_stream):
                 for key, param, handle, event in zip(
                     attn_keys,

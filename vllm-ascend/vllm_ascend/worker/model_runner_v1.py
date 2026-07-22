@@ -1350,6 +1350,11 @@ class NPUModelRunner(GPUModelRunner):
                 draft_step = min(max(int(envs.VLLM_ECHO_STEPS_MULTIPLIER * echo_k_max // batch_size), 1), draft_max)
                 draft_num_spec_restore = self.drafter.num_speculative_tokens
                 self.drafter.num_speculative_tokens = draft_step
+                logger.warning(
+                    "[ECHO_DRAFT_MUT] bs=%s k_max=%s -> draft_step(num_spec)=%s "
+                    "(was=%s)",
+                    batch_size, echo_k_max, draft_step, draft_num_spec_restore,
+                )
             common_attn_metadata = spec_decode_common_attn_metadata
             sampled_token_ids = valid_sampled_token_ids
 

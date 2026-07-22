@@ -126,6 +126,11 @@ class ACLGraphWrapper:
             self.concrete_aclgraph_entries[batch_descriptor] = ACLGraphEntry(batch_descriptor=batch_descriptor)
 
         entry = self.concrete_aclgraph_entries[batch_descriptor]
+        logger.warning(
+            "[ECHO_WRAP] call bd=%s is_draft=%s capturing_now=%s has_graph=%s",
+            batch_descriptor, _EXTRA_CTX.is_draft_model, _EXTRA_CTX.capturing,
+            entry.aclgraph is not None,
+        )
 
         if entry.aclgraph is None:
             if self.aclgraph_options.debug_log_enable:
