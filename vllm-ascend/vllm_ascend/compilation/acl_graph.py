@@ -219,6 +219,7 @@ class ACLGraphWrapper:
             batch_descriptor, _EXTRA_CTX.is_draft_model,
         )
         entry.aclgraph.replay()
+        torch.npu.current_stream().synchronize()  # DEBUG ECHO: force sync to localize hang
         logger.warning(
             "[ECHO_REPLAY] post replay() bd=%s is_draft=%s",
             batch_descriptor, _EXTRA_CTX.is_draft_model,
