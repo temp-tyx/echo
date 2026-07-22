@@ -319,6 +319,14 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         actual_seq_lengths_q_val = query_start_loc_cpu[1:].tolist()
         if envs.VLLM_ECHO_ENABLED:
             k_max = envs.VLLM_ECHO_K_MAX
+            logger.warning(
+                "[ECHO_FIA_BUILD] num_reqs=%s num_actual_tokens=%s k_max=%s "
+                "asq_last=%s sl_last=%s qsl_cpu_len=%s",
+                num_reqs, num_actual_tokens, k_max,
+                actual_seq_lengths_q_val[-1] if actual_seq_lengths_q_val else None,
+                seq_lens_list_val[-1] if seq_lens_list_val else None,
+                len(query_start_loc_cpu),
+            )
             if num_reqs < k_max:
                 pad_n = k_max - num_reqs
                 seq_lens_list_val = seq_lens_list_val + [0] * pad_n
@@ -718,6 +726,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
             attn_params = attn_params + (None, None, None, None)  # type: ignore
         graph_params.attn_params[num_tokens].append(attn_params)
 
+        if envs.VLLM_ECHO_ENABLED:
+            logger.warning(
+                "[ECHO_FIA_OP] queryT=%s asq_last=%s num_tokens=%s layout=%s "
+                "is_draft=%s",
+                query.shape[0], actual_seq_lengths_q[-1] if actual_seq_lengths_q else None,
+                num_tokens, input_layout, _EXTRA_CTX.is_draft_model,
+            )
         torch.npu.graph_task_group_begin(stream)
         torch_npu.npu_fused_infer_attention_score.out(
             query=query,

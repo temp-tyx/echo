@@ -579,7 +579,24 @@ class NPUModelRunner(GPUModelRunner):
         """
         # TODO: need refactor later, related to vllm PR #34043 this pr delete func
         # relax_for_mixed_batch_cudagraphs, num_reqs no longer equals the actual number of requests.
-        if envs.VLLM_ECHO_ENABLED and cudagraph_runtime_mode == CUDAGraphMode.FULL:
+        if envs.VLLM_ECHO_ENABLED:
+            logger.warning(
+                "[ECHO_PAD_IN] num_tokens_padded=%s num_reqs_padded=%s num_reqs=%s "
+                "rt_mode=%s batch_desc_num_reqs=%s",
+                num_tokens_padded, num_reqs_padded, num_reqs,
+                cudagraph_runtime_mode, batch_desc_num_reqs,
+            )
+        if (
+            envs.VLLM_ECHO_ENABLED
+            and cudagraph_runtime_mode == CUDAGraphMode.FULL
+            and batch_desc_num_reqs is None
+        ):
+            # ECHO: only the wildcard FULL batch (num_reqs=None, num_tokens=K_MAX)
+            # is pinned. Standard uniform/mixed captures carry a concrete
+            # num_reqs and must fall through to the normal padding below,
+            # otherwise num_reqs_padded would be shrunk to K_MAX while the
+            # query tensor stays at the real num_tokens -> TND check
+            # (queryT == actual_seq_lengths_q[-1]) fails.
             # ECHO: num_tokens is pinned to K_MAX (global budget), which is
             # smaller than num_reqs * dql, so the original uniform/mixed branch
             # would shrink/swap the query_start_loc shape across replays
@@ -595,6 +612,11 @@ class NPUModelRunner(GPUModelRunner):
             if self._has_gdn:
                 self.gdn_query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1] = last_loc
                 self.gdn_query_start_loc.copy_to_gpu()
+            logger.warning(
+                "[ECHO_PAD] ECHO wildcard pad num_reqs=%s -> num_reqs_padded=k_max=%s "
+                "num_tokens_padded=%s",
+                num_reqs, k_max, num_tokens_padded,
+            )
             return num_reqs_padded
         if cudagraph_runtime_mode == CUDAGraphMode.FULL and \
             self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL:
