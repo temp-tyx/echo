@@ -21,6 +21,7 @@ from enum import Enum
 import torch
 import torch_npu
 import vllm.envs as envs_vllm
+from vllm_ascend import envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from vllm.utils.math_utils import cdiv
@@ -310,6 +311,26 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         # TODO: Yet another unnecessary H2D while we already have a query_start_loc on device
         query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
 
+        # ECHO: full_attention's seq_lens_list / actual_seq_lengths_q are host
+        # lists whose length == num_reqs. The captured graph pins num_reqs to
+        # K_MAX, so pad the tail with no-op entries (seq_len=0, cumsum frozen)
+        # to keep the list shape fixed across replays. FIA skips 0-len rows.
+        seq_lens_list_val = seq_lens.tolist()
+        actual_seq_lengths_q_val = query_start_loc_cpu[1:].tolist()
+        if envs.VLLM_ECHO_ENABLED:
+            k_max = envs.VLLM_ECHO_K_MAX
+            if num_reqs < k_max:
+                pad_n = k_max - num_reqs
+                seq_lens_list_val = seq_lens_list_val + [0] * pad_n
+                actual_seq_lengths_q_val = (
+                    actual_seq_lengths_q_val + [actual_seq_lengths_q_val[-1]] * pad_n
+                )
+                logger.warning(
+                    "[ECHO_CG] full_attn pad meta num_reqs=%s -> k_max=%s",
+                    num_reqs,
+                    k_max,
+                )
+
         attn_metadata = AscendMetadata(
             num_actual_tokens=num_actual_tokens,
             num_decode_tokens=num_decode_tokens,
@@ -317,9 +338,9 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             query_start_loc=query_start_loc,
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens,
-            seq_lens_list=seq_lens.tolist(),
+            seq_lens_list=seq_lens_list_val,
             max_query_len=common_attn_metadata.max_query_len,
-            actual_seq_lengths_q=query_start_loc_cpu[1:].tolist(),
+            actual_seq_lengths_q=actual_seq_lengths_q_val,
             slot_mapping=slot_mapping,
             attn_mask=attn_mask,
             attn_state=attn_state,
@@ -470,11 +491,17 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 else:
                     graph_params = get_draft_graph_params()
                 attn_metadata = draft_attn_metadatas
-                attn_keys = list(attn_metadata[0].keys())
+                attn_keys = [
+                    k for k in attn_metadata[0].keys()
+                    if hasattr(attn_metadata[0][k], "seq_lens_list")
+                ]
             else:
                 graph_params = get_graph_params()
                 attn_metadata = forward_context.attn_metadata
-                attn_keys = list(attn_metadata.keys())
+                attn_keys = [
+                    k for k in attn_metadata.keys()
+                    if hasattr(attn_metadata[k], "seq_lens_list")
+                ]
             # For Qwen3-next, since the kv_cache_config has already categorized
             # linear_attn and self_attn, the attn_metadata is first arranged with
             # self_attn followed by linear_attn. Therefore, using zip directly

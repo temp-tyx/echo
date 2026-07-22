@@ -593,6 +593,11 @@ def _patched_build(
     ):
         k_max = envs.VLLM_ECHO_K_MAX
         nsd = attn_metadata.num_spec_decodes
+        # Pin num_spec_decodes to K_MAX so GDN forward's host slices
+        # (conv_state_indices[:nsd], cu_seqlens[:nsd+1], ...) use a fixed
+        # [:K_MAX] shape inside the captured graph. Padded rows are
+        # PAD_SLOT_ID / 0-len and skipped by conv1d / recurrent kernels.
+        attn_metadata.num_spec_decodes = k_max
         if nsd < k_max:
             self.spec_state_indices_tensor[nsd:k_max].fill_(PAD_SLOT_ID)
             attn_metadata.spec_state_indices_tensor = (
