@@ -580,31 +580,26 @@ class NPUModelRunner(GPUModelRunner):
         # TODO: need refactor later, related to vllm PR #34043 this pr delete func
         # relax_for_mixed_batch_cudagraphs, num_reqs no longer equals the actual number of requests.
         if envs.VLLM_ECHO_ENABLED:
+            k_max = envs.VLLM_ECHO_K_MAX
             logger.warning(
                 "[ECHO_PAD_IN] num_tokens_padded=%s num_reqs_padded=%s num_reqs=%s "
-                "rt_mode=%s batch_desc_num_reqs=%s",
+                "rt_mode=%s batch_desc_num_reqs=%s k_max=%s",
                 num_tokens_padded, num_reqs_padded, num_reqs,
-                cudagraph_runtime_mode, batch_desc_num_reqs,
+                cudagraph_runtime_mode, batch_desc_num_reqs, k_max,
             )
         if (
             envs.VLLM_ECHO_ENABLED
             and cudagraph_runtime_mode == CUDAGraphMode.FULL
-            and batch_desc_num_reqs is None
+            and num_tokens_padded == k_max
         ):
-            # ECHO: only the wildcard FULL batch (num_reqs=None, num_tokens=K_MAX)
-            # is pinned. Standard uniform/mixed captures carry a concrete
-            # num_reqs and must fall through to the normal padding below,
-            # otherwise num_reqs_padded would be shrunk to K_MAX while the
-            # query tensor stays at the real num_tokens -> TND check
-            # (queryT == actual_seq_lengths_q[-1]) fails.
-            # ECHO: num_tokens is pinned to K_MAX (global budget), which is
-            # smaller than num_reqs * dql, so the original uniform/mixed branch
-            # would shrink/swap the query_start_loc shape across replays
-            # (capture num_reqs=1 -> shape[2]; runtime num_reqs=2 -> shape[4]
-            # via the mixed-case +1). Pin num_reqs_padded to K_MAX and pad
-            # query_start_loc non-decreasingly so the device tensor shape is
-            # fixed at [K_MAX+1]; dummy reqs carry 0 tokens (FIA/GDN skip).
-            k_max = envs.VLLM_ECHO_K_MAX
+            # ECHO wildcard branch: only the ECHO wildcard batch has
+            # num_tokens == K_MAX. Standard uniform/mixed captures have
+            # num_tokens >> K_MAX and must fall through to normal padding,
+            # otherwise num_reqs_padded is shrunk to K_MAX while the query
+            # tensor stays at the real num_tokens -> TND check
+            # (queryT == actual_seq_lengths_q[-1]) fails. Gating on
+            # num_tokens_padded == K_MAX avoids relying on batch_desc.num_reqs
+            # (which can be None for non-ECHO uniform batches too).
             num_reqs_padded = k_max
             last_loc = int(self.query_start_loc.np[num_reqs])
             self.query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1] = last_loc
