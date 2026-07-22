@@ -145,6 +145,7 @@ from vllm_ascend.ascend_forward_context import (  # isort: skip
     select_moe_comm_method,
     set_ascend_forward_context,
     set_mc2_mask,
+    _EXTRA_CTX,
     set_mc2_tokens_capacity,
 )
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
@@ -2285,6 +2286,13 @@ class NPUModelRunner(GPUModelRunner):
         assert self.model is not None
         forward_context = get_forward_context()
         assert forward_context is not None
+        if envs.VLLM_ECHO_ENABLED:
+            logger.warning(
+                "[ECHO_FWD_START] num_tokens_padded=%s rt_mode=%s is_draft=%s",
+                num_tokens_padded,
+                forward_context.cudagraph_runtime_mode,
+                _EXTRA_CTX.is_draft_model,
+            )
 
         model_inputs: dict[str, Any] = {
             "input_ids": input_ids,

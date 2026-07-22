@@ -214,7 +214,15 @@ class ACLGraphWrapper:
         is_draft_eagle = _EXTRA_CTX.is_draft_model and self.use_eagle
         if not self.enable_enpu and not is_draft_eagle:
             torch.npu.current_stream().synchronize()
+        logger.warning(
+            "[ECHO_REPLAY] pre replay() bd=%s is_draft=%s",
+            batch_descriptor, _EXTRA_CTX.is_draft_model,
+        )
         entry.aclgraph.replay()
+        logger.warning(
+            "[ECHO_REPLAY] post replay() bd=%s is_draft=%s",
+            batch_descriptor, _EXTRA_CTX.is_draft_model,
+        )
         return entry.output
 
 
