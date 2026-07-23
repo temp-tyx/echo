@@ -458,9 +458,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # update the tensor's address for each step.
             logger.warning(
                 "[ECHO_DRAFT_CAP] dummy_run num_tokens=%s num_reqs=%s num_spec=%s "
-                "batch_desc=%s aclmode=%s capturing=%s",
+                "batch_desc=%s aclmode=%s",
                 num_tokens, num_reqs, self.num_speculative_tokens,
-                batch_descriptor, aclgraph_runtime_mode, _EXTRA_CTX.capturing,
+                batch_descriptor, aclgraph_runtime_mode,
             )
             for draft_step in range(self.num_speculative_tokens):
                 common_attn_metadata = self.shallow_copy_metadata(common_attn_metadata)

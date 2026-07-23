@@ -127,9 +127,8 @@ class ACLGraphWrapper:
 
         entry = self.concrete_aclgraph_entries[batch_descriptor]
         logger.warning(
-            "[ECHO_WRAP] call bd=%s is_draft=%s capturing_now=%s has_graph=%s",
-            batch_descriptor, _EXTRA_CTX.is_draft_model, _EXTRA_CTX.capturing,
-            entry.aclgraph is not None,
+            "[ECHO_WRAP] call bd=%s has_graph=%s",
+            batch_descriptor, entry.aclgraph is not None,
         )
 
         if entry.aclgraph is None:
@@ -215,13 +214,13 @@ class ACLGraphWrapper:
         if not self.enable_enpu and not is_draft_eagle:
             torch.npu.current_stream().synchronize()
         logger.warning(
-            "[ECHO_REPLAY] pre replay() bd=%s is_draft=%s",
-            batch_descriptor, _EXTRA_CTX.is_draft_model,
+            "[ECHO_REPLAY] pre replay() bd=%s",
+            batch_descriptor,
         )
         entry.aclgraph.replay()
         logger.warning(
-            "[ECHO_REPLAY] post replay() bd=%s is_draft=%s",
-            batch_descriptor, _EXTRA_CTX.is_draft_model,
+            "[ECHO_REPLAY] post replay() bd=%s",
+            batch_descriptor,
         )
         return entry.output
 

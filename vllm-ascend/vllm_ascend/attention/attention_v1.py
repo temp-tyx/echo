@@ -538,9 +538,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 attn_keys = attn_keys * (len(graph_params.attn_params[num_tokens]) // num_layers)
             attn_count = 0
             logger.warning(
-                "[ECHO_DRAFT_UPD] is_draft=%s num_tokens=%s num_layers=%s "
+                "[ECHO_DRAFT_UPD] num_tokens=%s num_layers=%s "
                 "len_attn_params=%s len_multi_steps=%s",
-                _EXTRA_CTX.is_draft_model, num_tokens, num_layers,
+                num_tokens, num_layers,
                 len(graph_params.attn_params[num_tokens]),
                 len(attn_metadata) if isinstance(attn_metadata, list) else -1,
             )
@@ -592,45 +592,39 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                 seq_lens,
                             )
 
-                    _echo_skip_op = (
-                        envs.VLLM_ECHO_ENABLED
-                        and envs.VLLM_ECHO_SKIP_FIA_UPDATE
-                        and not _EXTRA_CTX.is_draft_model
+                    torch.npu.graph_task_update_begin(update_stream, handle)
+                    input_layout = "TND"
+                    extra_args = {}
+                    if c8_k_aq_scale is not None:
+                        extra_args = {
+                            "key_antiquant_scale": c8_k_aq_scale,
+                            "key_antiquant_offset": c8_k_aq_offset,
+                            "value_antiquant_scale": c8_v_aq_scale,
+                            "value_antiquant_offset": c8_v_aq_offset,
+                            "key_antiquant_mode": 0,
+                            "value_antiquant_mode": 0,
+                        }
+                        input_layout = "BNSD"
+                        sparse_mode = 0
+                    torch_npu.npu_fused_infer_attention_score.out(
+                        query=query,
+                        key=key_cache,
+                        value=value,
+                        block_table=block_tables,
+                        atten_mask=attn_mask,
+                        input_layout=input_layout,
+                        block_size=block_size,
+                        actual_seq_lengths=actual_seq_lengths_q,
+                        actual_seq_lengths_kv=seq_lens,
+                        num_key_value_heads=num_kv_heads,
+                        num_heads=num_heads,
+                        scale=scale,
+                        sparse_mode=sparse_mode,
+                        **extra_args,
+                        workspace=graph_params.workspaces.get(num_tokens),
+                        out=[attn_output, softmax_lse],
                     )
-                    if not _echo_skip_op:
-                        torch.npu.graph_task_update_begin(update_stream, handle)
-                        input_layout = "TND"
-                        extra_args = {}
-                        if c8_k_aq_scale is not None:
-                            extra_args = {
-                                "key_antiquant_scale": c8_k_aq_scale,
-                                "key_antiquant_offset": c8_k_aq_offset,
-                                "value_antiquant_scale": c8_v_aq_scale,
-                                "value_antiquant_offset": c8_v_aq_offset,
-                                "key_antiquant_mode": 0,
-                                "value_antiquant_mode": 0,
-                            }
-                            input_layout = "BNSD"
-                            sparse_mode = 0
-                        torch_npu.npu_fused_infer_attention_score.out(
-                            query=query,
-                            key=key_cache,
-                            value=value,
-                            block_table=block_tables,
-                            atten_mask=attn_mask,
-                            input_layout=input_layout,
-                            block_size=block_size,
-                            actual_seq_lengths=actual_seq_lengths_q,
-                            actual_seq_lengths_kv=seq_lens,
-                            num_key_value_heads=num_kv_heads,
-                            num_heads=num_heads,
-                            scale=scale,
-                            sparse_mode=sparse_mode,
-                            **extra_args,
-                            workspace=graph_params.workspaces.get(num_tokens),
-                            out=[attn_output, softmax_lse],
-                        )
-                        torch.npu.graph_task_update_end(update_stream)
+                    torch.npu.graph_task_update_end(update_stream)
 
                     event.record(update_stream)
                 # ECHO: the zip loop above only runs len(attn_keys) iterations,
@@ -763,18 +757,17 @@ class AscendAttentionBackendImpl(AttentionImpl):
         if envs.VLLM_ECHO_ENABLED:
             logger.warning(
                 "[ECHO_FIA_CAP] append attn_params num_tokens=%s idx=%s "
-                "queryT=%s is_draft=%s layer=%s",
+                "queryT=%s layer=%s",
                 num_tokens, len(graph_params.attn_params[num_tokens]) - 1,
-                query.shape[0], _EXTRA_CTX.is_draft_model,
+                query.shape[0],
                 getattr(layer, "layer_name", None) if layer is not None else None,
             )
 
         if envs.VLLM_ECHO_ENABLED:
             logger.warning(
-                "[ECHO_FIA_OP] queryT=%s asq_last=%s num_tokens=%s layout=%s "
-                "is_draft=%s",
+                "[ECHO_FIA_OP] queryT=%s asq_last=%s num_tokens=%s layout=%s",
                 query.shape[0], actual_seq_lengths_q[-1] if actual_seq_lengths_q else None,
-                num_tokens, input_layout, _EXTRA_CTX.is_draft_model,
+                num_tokens, input_layout,
             )
         torch.npu.graph_task_group_begin(stream)
         torch_npu.npu_fused_infer_attention_score.out(
