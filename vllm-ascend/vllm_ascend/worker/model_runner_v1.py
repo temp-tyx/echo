@@ -583,9 +583,9 @@ class NPUModelRunner(GPUModelRunner):
         if envs.VLLM_ECHO_ENABLED:
             k_max = envs.VLLM_ECHO_K_MAX
         if (
-                envs.VLLM_ECHO_ENABLED
-                and cudagraph_runtime_mode == CUDAGraphMode.FULL
-                and num_tokens_padded == k_max
+            envs.VLLM_ECHO_ENABLED
+            and cudagraph_runtime_mode == CUDAGraphMode.FULL
+            and num_tokens_padded == k_max
         ):
             # ECHO wildcard branch: only the ECHO wildcard batch has
             # num_tokens == K_MAX. Standard uniform/mixed captures have
@@ -597,7 +597,7 @@ class NPUModelRunner(GPUModelRunner):
             # (which can be None for non-ECHO uniform batches too).
             num_reqs_padded = k_max
             last_loc = int(self.query_start_loc.np[num_reqs])
-            self.query_start_loc.np[num_reqs + 1: num_reqs_padded + 1] = last_loc
+            self.query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1] = last_loc
             # The query tensor is padded to num_tokens_padded (= k_max), but the
             # real reqs may carry fewer tokens (e.g. a decode step with bs=1 has
             # 2 real tokens, 6 padding). The frozen dummies above leave the last
@@ -607,7 +607,7 @@ class NPUModelRunner(GPUModelRunner):
             self.query_start_loc.np[num_reqs_padded] = num_tokens_padded
             self.query_start_loc.copy_to_gpu()
             if self._has_gdn:
-                self.gdn_query_start_loc.np[num_reqs + 1: num_reqs_padded + 1] = last_loc
+                self.gdn_query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1] = last_loc
                 self.gdn_query_start_loc.np[num_reqs_padded] = num_tokens_padded
                 self.gdn_query_start_loc.copy_to_gpu()
             return num_reqs_padded
@@ -1052,9 +1052,15 @@ class NPUModelRunner(GPUModelRunner):
                 req_idx = self.input_batch.req_id_to_index[req_id]
                 draft_len = len(draft_token_ids)
                 num_draft_tokens[req_idx] = draft_len
-                if (self.is_kv_consumer and req_id in new_schedule_reqs) or \
-                   (self.input_batch.num_computed_tokens_cpu[req_idx] >= \
-                    self.input_batch.num_prompt_tokens[req_idx]):
+                if draft_len == 0 or \
+                    (self.is_kv_consumer and req_id in new_schedule_reqs) or \
+                    (self.input_batch.num_computed_tokens_cpu[req_idx] >= \
+                     self.input_batch.num_prompt_tokens[req_idx]):
+                    # draft_len == 0: ECHO stripped this req's drafts to [].
+                    # The scheduler never puts a 0-draft entry in
+                    # scheduled_spec_decode_tokens, so this only happens via
+                    # ECHO pruning. Treat as spec-decode with 0 drafts (not
+                    # prefill) so the GDN graph path matches capture.
                     num_decode_draft_tokens[req_idx] = draft_len
                 else:
                     num_decode_draft_tokens[req_idx] = -1
@@ -1493,9 +1499,9 @@ class NPUModelRunner(GPUModelRunner):
         return draft_token_ids
 
     def _echo_prune_drafts(
-            self,
-            num_reqs: int,
-            scheduler_output: "SchedulerOutput",
+        self,
+        num_reqs: int,
+        scheduler_output: "SchedulerOutput",
     ) -> None:
         """48692-style pruning at execute_model start, BEFORE num_scheduled_tokens_np
         is built. Modifies scheduler_output.scheduled_spec_decode_tokens AND
@@ -1547,15 +1553,22 @@ class NPUModelRunner(GPUModelRunner):
         # set by AsyncScheduler._update_after_schedule. The drafter didn't
         # produce drafts for them (they were in a different batch at drafter
         # time). Strip their spec tokens so only the bonus token remains.
+        # Always set spec_tokens[req_id] = [] even if not previously in the
+        # dict, so _prepare_inputs classifies it as spec-decode with 0 drafts
+        # (matching graph capture's spec-only path).
         drafter_req_set = set(req_ids_drafter[:bs_drafter])
         num_non_drafter = 0
         for req_id in sched_tokens_dict:
             if req_id in drafter_req_set:
                 continue
-            if req_id in spec_tokens:
-                spec_tokens[req_id] = []
+            was_in_spec = req_id in spec_tokens
+            spec_tokens[req_id] = []
             sched_tokens_dict[req_id] = 1
             num_non_drafter += 1
+            logger.info(
+                "[ECHO] non_drafter: req_id=%s was_in_spec=%s -> stripped",
+                req_id, was_in_spec,
+            )
 
         # Select only the scheduled reqs' rows from drafter output
         idx_tensor = torch.tensor(sched_indices, device=draft_token_ids.device)
@@ -1743,7 +1756,7 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_np,
                 )
 
-                num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+                num_tokens_unpadded = total_num_scheduled_tokens
                 if self.pcp_size > 1:
                     num_tokens_unpadded = self.pcp_manager.total_num_sampled_tokens_pcp
                 cascade_attn_prefix_lens = None
@@ -3785,8 +3798,8 @@ class NPUModelRunner(GPUModelRunner):
             max_num_blocks_per_req = cdiv(max_model_len, block_sizes[i] * get_total_cp_world_size())
             if isinstance(kv_cache_group.kv_cache_spec, MambaSpec):
                 mamba_blocks_per_req = (
-                                           max_num_blocks_per_req if self.cache_config.enable_prefix_caching else 1
-                                       ) + kv_cache_group.kv_cache_spec.num_speculative_blocks
+                    max_num_blocks_per_req if self.cache_config.enable_prefix_caching else 1
+                ) + kv_cache_group.kv_cache_spec.num_speculative_blocks
 
                 max_num_blocks_per_req = max(max_num_blocks_per_req, mamba_blocks_per_req)
             max_num_blocks.append(max_num_blocks_per_req)
