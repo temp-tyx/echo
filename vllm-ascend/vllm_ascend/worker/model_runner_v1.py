@@ -1570,7 +1570,14 @@ class NPUModelRunner(GPUModelRunner):
         for i, req_id in enumerate(sched_req_ids):
             if req_id not in spec_tokens:
                 continue
-            full_drafts = spec_tokens[req_id]
+            # Use actual draft token IDs from the drafter output, NOT the
+            # placeholders in spec_tokens. In async scheduling,
+            # AsyncScheduler._update_after_schedule fills spec_token_ids
+            # with [-1]*num_spec (placeholders) because the drafter hasn't
+            # run yet at scheduling time. update_draft_token_ids is never
+            # called in async scheduling, so the placeholders are never
+            # replaced. We must source the real tokens from _draft_token_ids.
+            full_drafts = draft_token_ids[i].tolist()
             n_in_layout = min(len(full_drafts), total_steps)
             req_mask = mask[i, :n_in_layout].tolist()
             pruned = [t for t, keep in zip(full_drafts, req_mask) if keep]
