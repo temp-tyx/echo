@@ -359,8 +359,6 @@ class NPUModelRunner(GPUModelRunner):
             if vllm_config.speculative_config
             else None
         )
-        if envs.VLLM_ECHO_ENABLED:
-            logger.info("[ECHO] use_eagle=%s", self.use_eagle)
         # When True, run update_full_graph_params before self.model (ENPU / graph capture order).
         # Internal / non-public toggle: read C getenv ``ENPU_ENABLE`` from enpu code (not in envs.py).
         _enpu = get_c_env("ENPU_ENABLE")
@@ -585,9 +583,9 @@ class NPUModelRunner(GPUModelRunner):
         if envs.VLLM_ECHO_ENABLED:
             k_max = envs.VLLM_ECHO_K_MAX
         if (
-            envs.VLLM_ECHO_ENABLED
-            and cudagraph_runtime_mode == CUDAGraphMode.FULL
-            and num_tokens_padded == k_max
+                envs.VLLM_ECHO_ENABLED
+                and cudagraph_runtime_mode == CUDAGraphMode.FULL
+                and num_tokens_padded == k_max
         ):
             # ECHO wildcard branch: only the ECHO wildcard batch has
             # num_tokens == K_MAX. Standard uniform/mixed captures have
@@ -599,7 +597,7 @@ class NPUModelRunner(GPUModelRunner):
             # (which can be None for non-ECHO uniform batches too).
             num_reqs_padded = k_max
             last_loc = int(self.query_start_loc.np[num_reqs])
-            self.query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1] = last_loc
+            self.query_start_loc.np[num_reqs + 1: num_reqs_padded + 1] = last_loc
             # The query tensor is padded to num_tokens_padded (= k_max), but the
             # real reqs may carry fewer tokens (e.g. a decode step with bs=1 has
             # 2 real tokens, 6 padding). The frozen dummies above leave the last
@@ -609,7 +607,7 @@ class NPUModelRunner(GPUModelRunner):
             self.query_start_loc.np[num_reqs_padded] = num_tokens_padded
             self.query_start_loc.copy_to_gpu()
             if self._has_gdn:
-                self.gdn_query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1] = last_loc
+                self.gdn_query_start_loc.np[num_reqs + 1: num_reqs_padded + 1] = last_loc
                 self.gdn_query_start_loc.np[num_reqs_padded] = num_tokens_padded
                 self.gdn_query_start_loc.copy_to_gpu()
             return num_reqs_padded
@@ -1495,9 +1493,9 @@ class NPUModelRunner(GPUModelRunner):
         return draft_token_ids
 
     def _echo_prune_drafts(
-        self,
-        num_reqs: int,
-        scheduler_output: "SchedulerOutput",
+            self,
+            num_reqs: int,
+            scheduler_output: "SchedulerOutput",
     ) -> None:
         """48692-style pruning at execute_model start, BEFORE num_scheduled_tokens_np
         is built. Modifies scheduler_output.scheduled_spec_decode_tokens AND
@@ -1517,6 +1515,11 @@ class NPUModelRunner(GPUModelRunner):
 
         spec_tokens = scheduler_output.scheduled_spec_decode_tokens
         sched_tokens_dict = scheduler_output.num_scheduled_tokens
+        # Use _draft_token_req_ids (saved at drafter time) instead of
+        # input_batch.req_ids (updated by _update_states which removes
+        # finished reqs). Otherwise the row-to-req mapping shifts and we
+        # select the WRONG drafter row for pruning.
+        req_ids_drafter = self._draft_token_req_ids[:bs_drafter]
         # Save originals so update_from_output sees the UNPRUNED data
         # (scheduler's _update_after_schedule already advanced
         # num_computed_tokens by the original num_scheduled_tokens; if
@@ -1527,7 +1530,6 @@ class NPUModelRunner(GPUModelRunner):
             dict(spec_tokens),
             scheduler_output.total_num_scheduled_tokens,
         )
-        req_ids_drafter = self.input_batch.req_ids[:bs_drafter]
 
         # Async scheduling: the drafter ran on the PREVIOUS step's
         # input_batch, so some reqs may have finished and are no longer in
@@ -1659,14 +1661,10 @@ class NPUModelRunner(GPUModelRunner):
         )):
             scheduler_output = deepcopy(scheduler_output)
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-        logger.info("[ECHO_STEP] start, total_num_scheduled=%s", num_scheduled_tokens)
         with record_function_or_nullcontext("prepare input"):
             with self.synchronize_input_prep():
-                logger.info("[ECHO_STEP] after sync_input_prep")
                 # Update persistent batch states.
                 deferred_state_corrections_fn = self._update_states(scheduler_output)
-                logger.info("[ECHO_STEP] after update_states, num_reqs=%s req_ids=%s",
-                            self.input_batch.num_reqs, list(self.input_batch.req_ids[:self.input_batch.num_reqs]))
 
                 if has_ec_transfer() and get_ec_transfer().is_producer:
                     with self.maybe_get_ec_connector_output(
@@ -1677,7 +1675,6 @@ class NPUModelRunner(GPUModelRunner):
                         return make_empty_encoder_model_runner_output(scheduler_output)
 
                 if not num_scheduled_tokens:
-                    logger.info("[ECHO_STEP] no scheduled tokens, returning early")
                     if (
                         self.parallel_config.distributed_executor_backend == "external_launcher"
                         and self.parallel_config.data_parallel_size > 1
@@ -1708,13 +1705,9 @@ class NPUModelRunner(GPUModelRunner):
                 # dict (num_scheduled_tokens + scheduled_spec_decode_tokens).
                 # This ensures _prepare_inputs sees consistent data.
                 if envs.VLLM_ECHO_ENABLED:
-                    logger.info("[ECHO_STEP] before prune, draft_ids=%s",
-                                self._draft_token_ids.shape if self._draft_token_ids is not None else None)
                     self._echo_prune_drafts(num_reqs, scheduler_output)
-                    logger.info("[ECHO_STEP] after prune")
 
                 tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
-                logger.info("[ECHO_STEP] tokens=%s", tokens)
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
 
@@ -1727,7 +1720,7 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_np,
                 )
 
-                num_tokens_unpadded = total_num_scheduled_tokens
+                num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
                 if self.pcp_size > 1:
                     num_tokens_unpadded = self.pcp_manager.total_num_sampled_tokens_pcp
                 cascade_attn_prefix_lens = None
@@ -1756,13 +1749,10 @@ class NPUModelRunner(GPUModelRunner):
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 )
 
-                logger.debug(
-                    "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
-                    "should_ubatch: %s, num_tokens_across_dp: %s",
-                    cudagraph_mode,
-                    batch_desc,
-                    should_ubatch,
-                    num_tokens_across_dp,
+                logger.info(
+                    "[ECHO] dispatch: mode=%s tokens_padded=%s num_reqs=%s/%s",
+                    cudagraph_mode, batch_desc.num_tokens,
+                    num_reqs, batch_desc.num_reqs,
                 )
 
                 num_tokens_padded = batch_desc.num_tokens
@@ -2103,11 +2093,7 @@ class NPUModelRunner(GPUModelRunner):
                 if use_padded_batch:
                     # EAGLE speculative decoding can use the GPU sampled tokens
                     # as inputs, and does not need to wait for bookkeeping to finish.
-                    logger.info("[ECHO] drafter start, sampled_shape=%s",
-                                sampler_output.sampled_token_ids.shape)
                     propose_draft_token_ids(sampler_output.sampled_token_ids)
-                    logger.info("[ECHO] drafter done, draft_shape=%s",
-                                self._draft_token_ids.shape if self._draft_token_ids is not None else None)
                 if self.speculative_config and not use_padded_batch:
                     # ngram and other speculative decoding methods use the sampled
                     # tokens on the CPU, so they are run after bookkeeping.
@@ -2133,8 +2119,6 @@ class NPUModelRunner(GPUModelRunner):
             scheduler_output.total_num_scheduled_tokens = orig_total
             del self._echo_restore
 
-        logger.info("[ECHO] execute_model returning, use_async=%s",
-                    self.use_async_scheduling)
         if self.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
@@ -2408,12 +2392,6 @@ class NPUModelRunner(GPUModelRunner):
         assert self.model is not None
         forward_context = get_forward_context()
         assert forward_context is not None
-        if envs.VLLM_ECHO_ENABLED:
-            logger.info(
-                "[ECHO] target forward num_tokens=%s rt_mode=%s (full decode only graph)",
-                num_tokens_padded,
-                forward_context.cudagraph_runtime_mode,
-            )
 
         model_inputs: dict[str, Any] = {
             "input_ids": input_ids,
@@ -3742,8 +3720,8 @@ class NPUModelRunner(GPUModelRunner):
             max_num_blocks_per_req = cdiv(max_model_len, block_sizes[i] * get_total_cp_world_size())
             if isinstance(kv_cache_group.kv_cache_spec, MambaSpec):
                 mamba_blocks_per_req = (
-                    max_num_blocks_per_req if self.cache_config.enable_prefix_caching else 1
-                ) + kv_cache_group.kv_cache_spec.num_speculative_blocks
+                                           max_num_blocks_per_req if self.cache_config.enable_prefix_caching else 1
+                                       ) + kv_cache_group.kv_cache_spec.num_speculative_blocks
 
                 max_num_blocks_per_req = max(max_num_blocks_per_req, mamba_blocks_per_req)
             max_num_blocks.append(max_num_blocks_per_req)
