@@ -318,14 +318,18 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         seq_lens_list_val = seq_lens.tolist()
         actual_seq_lengths_q_val = query_start_loc_cpu[1:].tolist()
         # ECHO pad only applies to the target wildcard batch
-        # (is_draft=False and num_actual_tokens == k_max). The drafter (eager,
-        # is_draft=True) and standard batches must not be padded, otherwise
-        # 0-length dummy reqs are created and break eager ops (e.g. GDN
-        # recurrent). Note: drafter num_actual_tokens can also == k_max, so the
-        # is_draft gate is required.
+        # (is_draft=False and num_actual_tokens == k_max). The drafter
+        # (is_draft=True; with fixed num_spec its num_actual_tokens is
+        # bs* draft_max which can also == k_max) and standard batches must not
+        # be padded. _EXTRA_CTX.is_draft_model is a dynamic proxy that crashes
+        # outside a forward context (e.g. profile/warmup), so guard it.
+        try:
+            _echo_is_draft = _EXTRA_CTX.is_draft_model
+        except Exception:
+            _echo_is_draft = False
         if (
             envs.VLLM_ECHO_ENABLED
-            and not _EXTRA_CTX.is_draft_model
+            and not _echo_is_draft
             and num_actual_tokens == envs.VLLM_ECHO_K_MAX
         ):
             k_max = envs.VLLM_ECHO_K_MAX
