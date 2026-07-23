@@ -1563,9 +1563,7 @@ class NPUModelRunner(GPUModelRunner):
             req_mask = mask[i, :n_in_layout].tolist()
             pruned = [t for t, keep in zip(full_drafts, req_mask) if keep]
             spec_tokens[req_id] = pruned
-            new_count = len(pruned) + 1
-            num_scheduled_tokens_np[i] = new_count
-            sched_tokens_dict[req_id] = new_count
+            sched_tokens_dict[req_id] = len(pruned) + 1
 
         logger.info(
             "[ECHO] pruned: bs=%s num_spec=%s k_max=%s n_select=%s per_req=%s",
