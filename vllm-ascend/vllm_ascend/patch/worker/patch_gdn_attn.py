@@ -21,6 +21,7 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.logger import init_logger
 
 from vllm_ascend import envs
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.triton.gdn_chunk_meta import (
     _build_seq_lens,
     _validate_cu_seqlens,
@@ -583,10 +584,10 @@ def _patched_build(
     # and expose a fixed [:K_MAX] view instead; device-side query_start_loc /
     # num_accepted_tokens already carry the real per-request boundaries, so
     # kernels skip the padded rows naturally.
-    # Gate on num_actual_tokens == k_max so this only applies to the ECHO target
-    # wildcard batch; the drafter (eager, num_actual_tokens per step = bs) and
-    # standard batches are not padded (avoids 0-length dummy reqs breaking eager
-    # GDN recurrent).
+    # Gate on num_actual_tokens == k_max AND not is_draft so this only applies
+    # to the ECHO target wildcard batch; the drafter (eager, is_draft=True, and
+    # its num_actual_tokens can also == k_max) and standard batches are not
+    # padded (avoids 0-length dummy reqs breaking eager GDN recurrent).
     if (
         envs.VLLM_ECHO_ENABLED
         and self.use_full_cuda_graph
@@ -594,6 +595,7 @@ def _patched_build(
         and attn_metadata.num_decodes == 0
         and attn_metadata.num_spec_decodes > 0
         and attn_metadata.spec_state_indices_tensor is not None
+        and not _EXTRA_CTX.is_draft_model
         and attn_metadata.num_actual_tokens == envs.VLLM_ECHO_K_MAX
     ):
         k_max = envs.VLLM_ECHO_K_MAX

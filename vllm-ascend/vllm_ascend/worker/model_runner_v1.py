@@ -605,14 +605,22 @@ class NPUModelRunner(GPUModelRunner):
             num_reqs_padded = k_max
             last_loc = int(self.query_start_loc.np[num_reqs])
             self.query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1] = last_loc
+            # The query tensor is padded to num_tokens_padded (= k_max), but the
+            # real reqs may carry fewer tokens (e.g. a decode step with bs=1 has
+            # 2 real tokens, 6 padding). The frozen dummies above leave the last
+            # entry at last_loc (< num_tokens_padded), which breaks the TND
+            # invariant (queryT == actual_seq_lengths_q[-1]). Put the padding
+            # tokens into the last dummy so asq_last == num_tokens_padded.
+            self.query_start_loc.np[num_reqs_padded] = num_tokens_padded
             self.query_start_loc.copy_to_gpu()
             if self._has_gdn:
                 self.gdn_query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1] = last_loc
+                self.gdn_query_start_loc.np[num_reqs_padded] = num_tokens_padded
                 self.gdn_query_start_loc.copy_to_gpu()
             logger.warning(
                 "[ECHO_PAD] ECHO wildcard pad num_reqs=%s -> num_reqs_padded=k_max=%s "
-                "num_tokens_padded=%s",
-                num_reqs, k_max, num_tokens_padded,
+                "num_tokens_padded=%s last_loc=%s",
+                num_reqs, k_max, num_tokens_padded, last_loc,
             )
             return num_reqs_padded
         if cudagraph_runtime_mode == CUDAGraphMode.FULL and \
@@ -1366,7 +1374,9 @@ class NPUModelRunner(GPUModelRunner):
                 draft_max = getattr(
                     self.drafter, "_echo_draft_max_tokens", self.drafter.num_speculative_tokens
                 )
-                draft_step = min(max(int(envs.VLLM_ECHO_STEPS_MULTIPLIER * echo_k_max // batch_size), 1), draft_max)
+                # TODO: modify draft length
+                # draft_step = min(max(int(envs.VLLM_ECHO_STEPS_MULTIPLIER * echo_k_max // batch_size), 1), draft_max)
+                draft_step = draft_max
                 draft_num_spec_restore = self.drafter.num_speculative_tokens
                 self.drafter.num_speculative_tokens = draft_step
                 logger.warning(
