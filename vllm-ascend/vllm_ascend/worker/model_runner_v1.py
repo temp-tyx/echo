@@ -1543,6 +1543,20 @@ class NPUModelRunner(GPUModelRunner):
         if actual_bs == 0:
             return
 
+        # Non-drafter reqs: these have placeholder spec tokens ([-1]*num_spec)
+        # set by AsyncScheduler._update_after_schedule. The drafter didn't
+        # produce drafts for them (they were in a different batch at drafter
+        # time). Strip their spec tokens so only the bonus token remains.
+        drafter_req_set = set(req_ids_drafter[:bs_drafter])
+        num_non_drafter = 0
+        for req_id in sched_tokens_dict:
+            if req_id in drafter_req_set:
+                continue
+            if req_id in spec_tokens:
+                spec_tokens[req_id] = []
+            sched_tokens_dict[req_id] = 1
+            num_non_drafter += 1
+
         # Select only the scheduled reqs' rows from drafter output
         idx_tensor = torch.tensor(sched_indices, device=draft_token_ids.device)
         draft_token_ids = draft_token_ids.index_select(0, idx_tensor)  # [actual_bs, total_steps]
@@ -1555,7 +1569,9 @@ class NPUModelRunner(GPUModelRunner):
         cond_log_probs = step_log_probs.transpose(0, 1)  # [actual_bs, T]
         cum_log_probs = torch.cumsum(cond_log_probs, dim=1)  # [actual_bs, T]
 
-        n_select = min(max(k_max - actual_bs, 0), cum_log_probs.numel())
+        # Budget: k_max minus ALL scheduled reqs' bonus tokens (drafter + non-drafter)
+        total_sched_reqs = actual_bs + num_non_drafter
+        n_select = min(max(k_max - total_sched_reqs, 0), cum_log_probs.numel())
         flat_log_probs = cum_log_probs.flatten()
         mask = torch.zeros_like(flat_log_probs, dtype=torch.bool)
         if n_select > 0:
