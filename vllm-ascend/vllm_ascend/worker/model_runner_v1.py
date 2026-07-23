@@ -1506,18 +1506,16 @@ class NPUModelRunner(GPUModelRunner):
     def _echo_prune_drafts(
         self,
         num_reqs: int,
-        num_scheduled_tokens_np: np.ndarray,
         scheduler_output: "SchedulerOutput",
     ) -> None:
-        """48692-style pruning at execute_model start, BEFORE _prepare_inputs.
-
-        Modifies scheduler_output.scheduled_spec_decode_tokens AND
-        num_scheduled_tokens_np in-place so that _prepare_inputs naturally
-        builds the pruned layout (consistent positions/slot_mapping/input_ids/
-        spec_decode_metadata, no gather/clone needed).
-        """
+        """48692-style pruning at execute_model start, BEFORE num_scheduled_tokens_np
+        is built. Modifies scheduler_output.scheduled_spec_decode_tokens AND
+        scheduler_output.num_scheduled_tokens in-place, so num_scheduled_tokens_np
+        (built after) and _prepare_inputs see consistent pruned data."""
         if not envs.VLLM_ECHO_ENABLED:
             return
+        self._echo_query_start_loc = None
+        self._echo_selected_indices = None
         if self._draft_token_ids is None or not torch.is_tensor(self._draft_token_ids):
             return
         drafter = self.drafter
@@ -1555,6 +1553,7 @@ class NPUModelRunner(GPUModelRunner):
         self._echo_num_accepted = num_accepted_drafts
 
         spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        sched_tokens_dict = scheduler_output.num_scheduled_tokens
         req_ids_list = self.input_batch.req_ids[:actual_bs]
         for i, req_id in enumerate(req_ids_list):
             if req_id not in spec_tokens:
@@ -1564,7 +1563,9 @@ class NPUModelRunner(GPUModelRunner):
             req_mask = mask[i, :n_in_layout].tolist()
             pruned = [t for t, keep in zip(full_drafts, req_mask) if keep]
             spec_tokens[req_id] = pruned
-            num_scheduled_tokens_np[i] = len(pruned) + 1
+            new_count = len(pruned) + 1
+            num_scheduled_tokens_np[i] = new_count
+            sched_tokens_dict[req_id] = new_count
 
         logger.info(
             "[ECHO] pruned: bs=%s num_spec=%s k_max=%s n_select=%s per_req=%s",
@@ -1677,18 +1678,17 @@ class NPUModelRunner(GPUModelRunner):
 
                 num_reqs = self.input_batch.num_reqs
                 req_ids = self.input_batch.req_ids
+
+                # ECHO: prune BEFORE building num_scheduled_tokens_np, so the
+                # numpy array is built from the already-modified scheduler_output
+                # dict (num_scheduled_tokens + scheduled_spec_decode_tokens).
+                # This ensures _prepare_inputs sees consistent data.
+                if envs.VLLM_ECHO_ENABLED:
+                    self._echo_prune_drafts(num_reqs, scheduler_output)
+
                 tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
-
-                # ECHO: 48692-style pruning. Prune previous step's full drafts
-                # to k_max BEFORE _prepare_inputs, by modifying
-                # scheduler_output.scheduled_spec_decode_tokens to only contain
-                # the selected drafts. _prepare_inputs then naturally builds the
-                # pruned layout (correct slot_mapping/input_ids/positions, no
-                # gather/clone needed).
-                if envs.VLLM_ECHO_ENABLED:
-                    self._echo_prune_drafts(num_reqs, num_scheduled_tokens_np, scheduler_output)
 
                 (
                     logits_indices,
@@ -1698,18 +1698,6 @@ class NPUModelRunner(GPUModelRunner):
                     scheduler_output,
                     num_scheduled_tokens_np,
                 )
-
-                # ECHO: rebuild num_scheduled_tokens_np and logits_indices from
-                # the pruned layout (total should be ~k_max now).
-                if (
-                    envs.VLLM_ECHO_ENABLED
-                    and self._echo_query_start_loc is not None
-                ):
-                    k_max = envs.VLLM_ECHO_K_MAX
-                    total_num_scheduled_tokens = min(
-                        total_num_scheduled_tokens, k_max
-                    )
-                    logits_indices = self._echo_query_start_loc[:num_reqs].to(torch.int64)
 
                 num_tokens_unpadded = total_num_scheduled_tokens
                 if self.pcp_size > 1:
