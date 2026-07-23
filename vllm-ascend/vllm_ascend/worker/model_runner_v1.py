@@ -32,6 +32,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
@@ -259,6 +260,13 @@ class NPUModelRunner(GPUModelRunner):
                 dtype=torch.int32,
             )
 
+        # ECHO: device tensors produced by _echo_prune_drafts (48692-style
+        # pruning at execute_model start). Consumed by target verify.
+        self._echo_selected_indices: torch.Tensor | None = None
+        self._echo_query_start_loc: torch.Tensor | None = None
+        self._echo_num_accepted: torch.Tensor | None = None
+        self._echo_logits_indices: torch.Tensor | None = None
+
         vllm_config.scheduler_config.max_num_batched_tokens -= max_pcp_pad_tokens
         self.max_num_tokens = self.scheduler_config.max_num_batched_tokens
         self.max_num_reqs = self.scheduler_config.max_num_seqs
@@ -358,7 +366,8 @@ class NPUModelRunner(GPUModelRunner):
             if vllm_config.speculative_config
             else None
         )
-        logger.warning("[ECHO_CFG] use_eagle=%s ECHO=%s", self.use_eagle, envs.VLLM_ECHO_ENABLED)
+        if envs.VLLM_ECHO_ENABLED:
+            logger.info("[ECHO] use_eagle=%s", self.use_eagle)
         # When True, run update_full_graph_params before self.model (ENPU / graph capture order).
         # Internal / non-public toggle: read C getenv ``ENPU_ENABLE`` from enpu code (not in envs.py).
         _enpu = get_c_env("ENPU_ENABLE")
@@ -582,12 +591,6 @@ class NPUModelRunner(GPUModelRunner):
         # relax_for_mixed_batch_cudagraphs, num_reqs no longer equals the actual number of requests.
         if envs.VLLM_ECHO_ENABLED:
             k_max = envs.VLLM_ECHO_K_MAX
-            logger.warning(
-                "[ECHO_PAD_IN] num_tokens_padded=%s num_reqs_padded=%s num_reqs=%s "
-                "rt_mode=%s batch_desc_num_reqs=%s k_max=%s",
-                num_tokens_padded, num_reqs_padded, num_reqs,
-                cudagraph_runtime_mode, batch_desc_num_reqs, k_max,
-            )
         if (
             envs.VLLM_ECHO_ENABLED
             and cudagraph_runtime_mode == CUDAGraphMode.FULL
@@ -616,11 +619,6 @@ class NPUModelRunner(GPUModelRunner):
                 self.gdn_query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1] = last_loc
                 self.gdn_query_start_loc.np[num_reqs_padded] = num_tokens_padded
                 self.gdn_query_start_loc.copy_to_gpu()
-            logger.warning(
-                "[ECHO_PAD] ECHO wildcard pad num_reqs=%s -> num_reqs_padded=k_max=%s "
-                "num_tokens_padded=%s last_loc=%s",
-                num_reqs, k_max, num_tokens_padded, last_loc,
-            )
             return num_reqs_padded
         if cudagraph_runtime_mode == CUDAGraphMode.FULL and \
             self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL:
@@ -1378,11 +1376,6 @@ class NPUModelRunner(GPUModelRunner):
                 draft_step = draft_max
                 draft_num_spec_restore = self.drafter.num_speculative_tokens
                 self.drafter.num_speculative_tokens = draft_step
-                logger.warning(
-                    "[ECHO_DRAFT_MUT] bs=%s k_max=%s -> draft_step(num_spec)=%s "
-                    "(was=%s)",
-                    batch_size, echo_k_max, draft_step, draft_num_spec_restore,
-                )
             common_attn_metadata = spec_decode_common_attn_metadata
             sampled_token_ids = valid_sampled_token_ids
 
@@ -1510,6 +1503,75 @@ class NPUModelRunner(GPUModelRunner):
 
         return draft_token_ids
 
+    def _echo_prune_drafts(
+        self,
+        num_reqs: int,
+        num_scheduled_tokens_np: np.ndarray,
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        """48692-style pruning at execute_model start, BEFORE _prepare_inputs.
+
+        Modifies scheduler_output.scheduled_spec_decode_tokens AND
+        num_scheduled_tokens_np in-place so that _prepare_inputs naturally
+        builds the pruned layout (consistent positions/slot_mapping/input_ids/
+        spec_decode_metadata, no gather/clone needed).
+        """
+        if not envs.VLLM_ECHO_ENABLED:
+            return
+        if self._draft_token_ids is None or not torch.is_tensor(self._draft_token_ids):
+            return
+        drafter = self.drafter
+        if drafter is None or not hasattr(drafter, "_echo_logits_list") or not drafter._echo_logits_list:
+            return
+
+        draft_token_ids = self._draft_token_ids  # [bs_drafter, num_spec]
+        actual_bs, total_steps = draft_token_ids.shape
+        k_max = envs.VLLM_ECHO_K_MAX
+
+        logits_stack = torch.stack(drafter._echo_logits_list, dim=0)
+        log_probs = F.log_softmax(logits_stack, dim=-1)
+        step_tokens = draft_token_ids.transpose(0, 1)
+        step_log_probs = log_probs.gather(2, step_tokens.unsqueeze(-1)).squeeze(-1)
+        cond_log_probs = step_log_probs.transpose(0, 1)
+        cum_log_probs = torch.cumsum(cond_log_probs, dim=1)
+
+        n_select = min(k_max - actual_bs, cum_log_probs.numel())
+        if n_select <= 0:
+            return
+        flat_log_probs = cum_log_probs.flatten()
+        _, top_flat_indices = torch.topk(flat_log_probs, k=n_select, sorted=False)
+
+        mask = torch.zeros_like(flat_log_probs, dtype=torch.bool)
+        mask[top_flat_indices] = True
+        mask = mask.view(actual_bs, total_steps)
+
+        num_accepted_drafts = mask.sum(dim=1).to(torch.int32)
+        per_req_counts = num_accepted_drafts + 1
+
+        qsl = torch.zeros(k_max + 1, dtype=torch.int32, device=draft_token_ids.device)
+        qsl[1 : actual_bs + 1] = torch.cumsum(per_req_counts, dim=0)
+        qsl[actual_bs + 1 : k_max + 1] = qsl[actual_bs].unsqueeze(0)
+        self._echo_query_start_loc = qsl
+        self._echo_num_accepted = num_accepted_drafts
+
+        spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        req_ids_list = self.input_batch.req_ids[:actual_bs]
+        for i, req_id in enumerate(req_ids_list):
+            if req_id not in spec_tokens:
+                continue
+            full_drafts = spec_tokens[req_id]
+            n_in_layout = min(len(full_drafts), total_steps)
+            req_mask = mask[i, :n_in_layout].tolist()
+            pruned = [t for t, keep in zip(full_drafts, req_mask) if keep]
+            spec_tokens[req_id] = pruned
+            num_scheduled_tokens_np[i] = len(pruned) + 1
+
+        logger.info(
+            "[ECHO] pruned: bs=%s num_spec=%s k_max=%s n_select=%s per_req=%s",
+            actual_bs, total_steps, k_max, n_select,
+            per_req_counts.tolist(),
+        )
+
     def _copy_draft_token_ids_to_cpu(
             self, scheduler_output: "SchedulerOutput", zeros_only: bool = False
     ) -> None:
@@ -1539,13 +1601,6 @@ class NPUModelRunner(GPUModelRunner):
                 self.draft_token_ids_event.record()
             return
         super()._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=zeros_only)
-
-    def take_draft_token_ids(self) -> DraftTokenIds | None:
-        draft = super().take_draft_token_ids()
-        if draft is None or not envs.VLLM_ECHO_ENABLED:
-            return draft
-        filtered = [[t for t in row if t != -1] for row in draft.draft_token_ids]
-        return DraftTokenIds(draft.req_ids, filtered)
 
     @torch.inference_mode()
     def execute_model(
@@ -1626,6 +1681,15 @@ class NPUModelRunner(GPUModelRunner):
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
 
+                # ECHO: 48692-style pruning. Prune previous step's full drafts
+                # to k_max BEFORE _prepare_inputs, by modifying
+                # scheduler_output.scheduled_spec_decode_tokens to only contain
+                # the selected drafts. _prepare_inputs then naturally builds the
+                # pruned layout (correct slot_mapping/input_ids/positions, no
+                # gather/clone needed).
+                if envs.VLLM_ECHO_ENABLED:
+                    self._echo_prune_drafts(num_reqs, num_scheduled_tokens_np, scheduler_output)
+
                 (
                     logits_indices,
                     spec_decode_metadata,
@@ -1635,7 +1699,19 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_np,
                 )
 
-                num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+                # ECHO: rebuild num_scheduled_tokens_np and logits_indices from
+                # the pruned layout (total should be ~k_max now).
+                if (
+                    envs.VLLM_ECHO_ENABLED
+                    and self._echo_query_start_loc is not None
+                ):
+                    k_max = envs.VLLM_ECHO_K_MAX
+                    total_num_scheduled_tokens = min(
+                        total_num_scheduled_tokens, k_max
+                    )
+                    logits_indices = self._echo_query_start_loc[:num_reqs].to(torch.int64)
+
+                num_tokens_unpadded = total_num_scheduled_tokens
                 if self.pcp_size > 1:
                     num_tokens_unpadded = self.pcp_manager.total_num_sampled_tokens_pcp
                 cascade_attn_prefix_lens = None
@@ -2297,8 +2373,8 @@ class NPUModelRunner(GPUModelRunner):
         forward_context = get_forward_context()
         assert forward_context is not None
         if envs.VLLM_ECHO_ENABLED:
-            logger.warning(
-                "[ECHO_FWD_START] num_tokens_padded=%s rt_mode=%s",
+            logger.info(
+                "[ECHO] target forward num_tokens=%s rt_mode=%s (full decode only graph)",
                 num_tokens_padded,
                 forward_context.cudagraph_runtime_mode,
             )
@@ -2801,14 +2877,6 @@ class NPUModelRunner(GPUModelRunner):
             num_scheduled_tokens_list[-1] += num_tokens % num_reqs
         assert sum(num_scheduled_tokens_list) == num_tokens
         assert len(num_scheduled_tokens_list) == num_reqs
-        if envs.VLLM_ECHO_ENABLED and not uniform_decode and is_graph_capturing:
-            logger.warning(
-                "[ECHO_CG] dummy_run capture dummy: num_tokens=%s num_reqs=%s "
-                "scheduled=%s",
-                num_tokens,
-                num_reqs,
-                num_scheduled_tokens_list,
-            )
 
         if not is_profile and self.dynamic_eplb:
             self.eplb_updator.forward_before()

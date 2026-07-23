@@ -615,11 +615,6 @@ def _patched_build(
             attn_metadata.spec_state_indices_tensor = (
                 self.spec_state_indices_tensor[:k_max]
             )
-            logger.warning(
-                "[ECHO_CG] gdn pad spec_state_indices nsd=%s -> k_max=%s",
-                nsd,
-                k_max,
-            )
         # num_accepted_tokens tail also needs a valid fixed value; the
         # original graph_path1 already pads [:batch_size] with 1, and
         # batch_size == num_actual_tokens == K_MAX for ECHO, so it is covered.

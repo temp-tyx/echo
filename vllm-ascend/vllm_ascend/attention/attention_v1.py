@@ -333,24 +333,11 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             and num_actual_tokens == envs.VLLM_ECHO_K_MAX
         ):
             k_max = envs.VLLM_ECHO_K_MAX
-            logger.warning(
-                "[ECHO_FIA_BUILD] num_reqs=%s num_actual_tokens=%s k_max=%s "
-                "asq_last=%s sl_last=%s qsl_cpu_len=%s",
-                num_reqs, num_actual_tokens, k_max,
-                actual_seq_lengths_q_val[-1] if actual_seq_lengths_q_val else None,
-                seq_lens_list_val[-1] if seq_lens_list_val else None,
-                len(query_start_loc_cpu),
-            )
             if num_reqs < k_max:
                 pad_n = k_max - num_reqs
                 seq_lens_list_val = seq_lens_list_val + [0] * pad_n
                 actual_seq_lengths_q_val = (
                     actual_seq_lengths_q_val + [actual_seq_lengths_q_val[-1]] * pad_n
-                )
-                logger.warning(
-                    "[ECHO_CG] full_attn pad meta num_reqs=%s -> k_max=%s",
-                    num_reqs,
-                    k_max,
                 )
 
         attn_metadata = AscendMetadata(
@@ -535,15 +522,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
             if num_layers == 0:
                 return
             if _EXTRA_CTX.is_draft_model:
-                attn_keys = attn_keys * (len(graph_params.attn_params[num_tokens]) // num_layers)
+                _n_steps = len(attn_metadata) if isinstance(attn_metadata, list) else 1
+                attn_keys = attn_keys * _n_steps
             attn_count = 0
-            logger.warning(
-                "[ECHO_DRAFT_UPD] num_tokens=%s num_layers=%s "
-                "len_attn_params=%s len_multi_steps=%s",
-                num_tokens, num_layers,
-                len(graph_params.attn_params[num_tokens]),
-                len(attn_metadata) if isinstance(attn_metadata, list) else -1,
-            )
             with torch.npu.stream(update_stream):
                 for key, param, handle, event in zip(
                     attn_keys,
@@ -584,13 +565,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         seq_lens = attn_metadata[key].seq_lens_list
                         actual_seq_lengths_q = attn_metadata[key].actual_seq_lengths_q
                         block_tables = attn_metadata[key].block_tables
-                        if envs.VLLM_ECHO_ENABLED:
-                            logger.warning(
-                                "[ECHO_CG] fia_update key=%s asq=%s sl=%s",
-                                key,
-                                actual_seq_lengths_q,
-                                seq_lens,
-                            )
 
                     torch.npu.graph_task_update_begin(update_stream, handle)
                     input_layout = "TND"
@@ -636,12 +610,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     _extra = graph_params.events[num_tokens][len(attn_keys):]
                     for _ev in _extra:
                         _ev.record(update_stream)
-                    logger.warning(
-                        "[ECHO_EVREC] recorded extra events n=%s (attn_keys=%s "
-                        "total_events=%s)",
-                        len(_extra), len(attn_keys),
-                        len(graph_params.events[num_tokens]),
-                    )
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         super().process_weights_after_loading(act_dtype)
@@ -754,21 +722,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
         else:
             attn_params = attn_params + (None, None, None, None)  # type: ignore
         graph_params.attn_params[num_tokens].append(attn_params)
-        if envs.VLLM_ECHO_ENABLED:
-            logger.warning(
-                "[ECHO_FIA_CAP] append attn_params num_tokens=%s idx=%s "
-                "queryT=%s layer=%s",
-                num_tokens, len(graph_params.attn_params[num_tokens]) - 1,
-                query.shape[0],
-                getattr(layer, "layer_name", None) if layer is not None else None,
-            )
-
-        if envs.VLLM_ECHO_ENABLED:
-            logger.warning(
-                "[ECHO_FIA_OP] queryT=%s asq_last=%s num_tokens=%s layout=%s",
-                query.shape[0], actual_seq_lengths_q[-1] if actual_seq_lengths_q else None,
-                num_tokens, input_layout,
-            )
         torch.npu.graph_task_group_begin(stream)
         torch_npu.npu_fused_infer_attention_score.out(
             query=query,

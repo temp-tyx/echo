@@ -456,12 +456,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             assert len(self.draft_attn_groups) > 0
             builder = self.draft_attn_groups[0].get_metadata_builder()
             # update the tensor's address for each step.
-            logger.warning(
-                "[ECHO_DRAFT_CAP] dummy_run num_tokens=%s num_reqs=%s num_spec=%s "
-                "batch_desc=%s aclmode=%s",
-                num_tokens, num_reqs, self.num_speculative_tokens,
-                batch_descriptor, aclgraph_runtime_mode,
-            )
             for draft_step in range(self.num_speculative_tokens):
                 common_attn_metadata = self.shallow_copy_metadata(common_attn_metadata)
                 # Set the real slot_mapping.
@@ -611,12 +605,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 num_tokens=num_input_tokens, uniform_decode=uniform_decode, has_lora=has_lora
             )
             num_input_tokens = batch_descriptor.num_tokens
-            logger.warning(
-                "[ECHO_DRAFT_RT] _propose dispatch num_tokens_in=%s num_spec=%s uniform=%s "
-                "-> bd=%s aclmode=%s",
-                num_input_tokens, self.num_speculative_tokens, uniform_decode,
-                batch_descriptor, aclgraph_runtime_mode,
-            )
         else:
             aclgraph_runtime_mode = CUDAGraphMode.NONE
             batch_descriptor = None
@@ -864,8 +852,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 draft_token_ids = run_draft()
                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
 
-            if envs.VLLM_ECHO_ENABLED:
-                draft_token_ids = self._apply_echo_pruning(draft_token_ids)
+            # ECHO: pruning moved to model_runner._echo_prune_drafts (execute_model
+            # start), 48692-style. Drafter produces full uniform drafts here.
         return draft_token_ids
 
     def _run_merged_draft(
