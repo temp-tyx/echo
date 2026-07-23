@@ -1533,14 +1533,12 @@ class NPUModelRunner(GPUModelRunner):
         cond_log_probs = step_log_probs.transpose(0, 1)
         cum_log_probs = torch.cumsum(cond_log_probs, dim=1)
 
-        n_select = min(k_max - actual_bs, cum_log_probs.numel())
-        if n_select <= 0:
-            return
+        n_select = min(max(k_max - actual_bs, 0), cum_log_probs.numel())
         flat_log_probs = cum_log_probs.flatten()
-        _, top_flat_indices = torch.topk(flat_log_probs, k=n_select, sorted=False)
-
         mask = torch.zeros_like(flat_log_probs, dtype=torch.bool)
-        mask[top_flat_indices] = True
+        if n_select > 0:
+            _, top_flat_indices = torch.topk(flat_log_probs, k=n_select, sorted=False)
+            mask[top_flat_indices] = True
         mask = mask.view(actual_bs, total_steps)
 
         num_accepted_drafts = mask.sum(dim=1).to(torch.int32)
@@ -1562,12 +1560,22 @@ class NPUModelRunner(GPUModelRunner):
             n_in_layout = min(len(full_drafts), total_steps)
             req_mask = mask[i, :n_in_layout].tolist()
             pruned = [t for t, keep in zip(full_drafts, req_mask) if keep]
-            spec_tokens[req_id] = pruned
-            sched_tokens_dict[req_id] = len(pruned) + 1
+            if pruned:
+                spec_tokens[req_id] = pruned
+                sched_tokens_dict[req_id] = len(pruned) + 1
+            else:
+                # 0 drafts selected → keep empty list in spec_tokens so
+                # downstream classifies it as spec-decode with 0 drafts
+                # (NOT regular decode). num_scheduled_tokens = 1 (bonus only).
+                spec_tokens[req_id] = []
+                sched_tokens_dict[req_id] = 1
+        scheduler_output.total_num_scheduled_tokens = sum(sched_tokens_dict.values())
 
         logger.info(
-            "[ECHO] pruned: bs=%s num_spec=%s k_max=%s n_select=%s per_req=%s",
+            "[ECHO] pruned: bs=%s num_spec=%s k_max=%s n_select=%s "
+            "total=%s per_req=%s",
             actual_bs, total_steps, k_max, n_select,
+            scheduler_output.total_num_scheduled_tokens,
             per_req_counts.tolist(),
         )
 
