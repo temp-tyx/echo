@@ -436,12 +436,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
         num_dcp_pcp_tokens=None,
         draft_attn_metadatas=None,
     ):
-        if envs.VLLM_ECHO_ENABLED and envs.VLLM_ECHO_SKIP_FIA_UPDATE:
-            logger.warning(
-                "[ECHO_UPD_SKIP] skip fia_update num_tokens=%s is_draft=%s",
-                num_tokens, _EXTRA_CTX.is_draft_model,
-            )
-            return
         if using_paged_attention(num_tokens, vllm_config):
             # Paged Attention update logic
             if _EXTRA_CTX.is_draft_model:
@@ -575,11 +569,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     else:
                         seq_lens = attn_metadata[key].seq_lens_list
                         actual_seq_lengths_q = attn_metadata[key].actual_seq_lengths_q
-                        if envs.VLLM_ECHO_ENABLED:
-                            # DIAG ECHO: feed constant q (= capture's) to test if
-                            # the hang is caused by q being updated vs tiling baked.
-                            _k = envs.VLLM_ECHO_K_MAX
-                            actual_seq_lengths_q = [_k] * _k
                         block_tables = attn_metadata[key].block_tables
                         if envs.VLLM_ECHO_ENABLED:
                             logger.warning(
@@ -589,41 +578,55 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                 seq_lens,
                             )
 
-                    torch.npu.graph_task_update_begin(update_stream, handle)
-                    input_layout = "TND"
-                    extra_args = {}
-                    if c8_k_aq_scale is not None:
-                        extra_args = {
-                            "key_antiquant_scale": c8_k_aq_scale,
-                            "key_antiquant_offset": c8_k_aq_offset,
-                            "value_antiquant_scale": c8_v_aq_scale,
-                            "value_antiquant_offset": c8_v_aq_offset,
-                            "key_antiquant_mode": 0,
-                            "value_antiquant_mode": 0,
-                        }
-                        input_layout = "BNSD"
-                        sparse_mode = 0
-                    torch_npu.npu_fused_infer_attention_score.out(
-                        query=query,
-                        key=key_cache,
-                        value=value,
-                        block_table=block_tables,
-                        atten_mask=attn_mask,
-                        input_layout=input_layout,
-                        block_size=block_size,
-                        actual_seq_lengths=actual_seq_lengths_q,
-                        actual_seq_lengths_kv=seq_lens,
-                        num_key_value_heads=num_kv_heads,
-                        num_heads=num_heads,
-                        scale=scale,
-                        sparse_mode=sparse_mode,
-                        **extra_args,
-                        workspace=graph_params.workspaces.get(num_tokens),
-                        out=[attn_output, softmax_lse],
+                    _echo_skip_op = (
+                        envs.VLLM_ECHO_ENABLED
+                        and envs.VLLM_ECHO_SKIP_FIA_UPDATE
+                        and not _EXTRA_CTX.is_draft_model
                     )
-                    torch.npu.graph_task_update_end(update_stream)
+                    if not _echo_skip_op:
+                        torch.npu.graph_task_update_begin(update_stream, handle)
+                        input_layout = "TND"
+                        extra_args = {}
+                        if c8_k_aq_scale is not None:
+                            extra_args = {
+                                "key_antiquant_scale": c8_k_aq_scale,
+                                "key_antiquant_offset": c8_k_aq_offset,
+                                "value_antiquant_scale": c8_v_aq_scale,
+                                "value_antiquant_offset": c8_v_aq_offset,
+                                "key_antiquant_mode": 0,
+                                "value_antiquant_mode": 0,
+                            }
+                            input_layout = "BNSD"
+                            sparse_mode = 0
+                        torch_npu.npu_fused_infer_attention_score.out(
+                            query=query,
+                            key=key_cache,
+                            value=value,
+                            block_table=block_tables,
+                            atten_mask=attn_mask,
+                            input_layout=input_layout,
+                            block_size=block_size,
+                            actual_seq_lengths=actual_seq_lengths_q,
+                            actual_seq_lengths_kv=seq_lens,
+                            num_key_value_heads=num_kv_heads,
+                            num_heads=num_heads,
+                            scale=scale,
+                            sparse_mode=sparse_mode,
+                            **extra_args,
+                            workspace=graph_params.workspaces.get(num_tokens),
+                            out=[attn_output, softmax_lse],
+                        )
+                        torch.npu.graph_task_update_end(update_stream)
 
                     event.record(update_stream)
+                # ECHO: the zip loop above only runs len(attn_keys) iterations,
+                # but the graph may have more attn_params (e.g. merged drafter
+                # FIA ops captured into the target _graph_params). Their baked
+                # event.wait (full_graph_fia capture) would time out at replay
+                # because their events are never recorded here. Record them.
+                if envs.VLLM_ECHO_ENABLED:
+                    for _ev in graph_params.events[num_tokens][len(attn_keys):]:
+                        _ev.record(update_stream)
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         super().process_weights_after_loading(act_dtype)
@@ -736,6 +739,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
         else:
             attn_params = attn_params + (None, None, None, None)  # type: ignore
         graph_params.attn_params[num_tokens].append(attn_params)
+        if envs.VLLM_ECHO_ENABLED:
+            logger.warning(
+                "[ECHO_FIA_CAP] append attn_params num_tokens=%s idx=%s "
+                "queryT=%s is_draft=%s layer=%s",
+                num_tokens, len(graph_params.attn_params[num_tokens]) - 1,
+                query.shape[0], _EXTRA_CTX.is_draft_model,
+                getattr(layer, "layer_name", None) if layer is not None else None,
+            )
 
         if envs.VLLM_ECHO_ENABLED:
             logger.warning(

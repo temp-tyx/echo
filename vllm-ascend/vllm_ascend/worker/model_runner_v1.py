@@ -359,6 +359,7 @@ class NPUModelRunner(GPUModelRunner):
             if vllm_config.speculative_config
             else None
         )
+        logger.warning("[ECHO_CFG] use_eagle=%s ECHO=%s", self.use_eagle, envs.VLLM_ECHO_ENABLED)
         # When True, run update_full_graph_params before self.model (ENPU / graph capture order).
         # Internal / non-public toggle: read C getenv ``ENPU_ENABLE`` from enpu code (not in envs.py).
         _enpu = get_c_env("ENPU_ENABLE")
