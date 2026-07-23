@@ -1517,6 +1517,16 @@ class NPUModelRunner(GPUModelRunner):
 
         spec_tokens = scheduler_output.scheduled_spec_decode_tokens
         sched_tokens_dict = scheduler_output.num_scheduled_tokens
+        # Save originals so update_from_output sees the UNPRUNED data
+        # (scheduler's _update_after_schedule already advanced
+        # num_computed_tokens by the original num_scheduled_tokens; if
+        # we leave the pruned values, num_rejected is computed as 0 and
+        # num_computed_tokens is over-advanced).
+        self._echo_restore = (
+            dict(sched_tokens_dict),
+            dict(spec_tokens),
+            scheduler_output.total_num_scheduled_tokens,
+        )
         req_ids_drafter = self.input_batch.req_ids[:bs_drafter]
 
         # Async scheduling: the drafter ran on the PREVIOUS step's
@@ -1649,10 +1659,14 @@ class NPUModelRunner(GPUModelRunner):
         )):
             scheduler_output = deepcopy(scheduler_output)
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        logger.info("[ECHO_STEP] start, total_num_scheduled=%s", num_scheduled_tokens)
         with record_function_or_nullcontext("prepare input"):
             with self.synchronize_input_prep():
+                logger.info("[ECHO_STEP] after sync_input_prep")
                 # Update persistent batch states.
                 deferred_state_corrections_fn = self._update_states(scheduler_output)
+                logger.info("[ECHO_STEP] after update_states, num_reqs=%s req_ids=%s",
+                            self.input_batch.num_reqs, list(self.input_batch.req_ids[:self.input_batch.num_reqs]))
 
                 if has_ec_transfer() and get_ec_transfer().is_producer:
                     with self.maybe_get_ec_connector_output(
@@ -1663,6 +1677,7 @@ class NPUModelRunner(GPUModelRunner):
                         return make_empty_encoder_model_runner_output(scheduler_output)
 
                 if not num_scheduled_tokens:
+                    logger.info("[ECHO_STEP] no scheduled tokens, returning early")
                     if (
                         self.parallel_config.distributed_executor_backend == "external_launcher"
                         and self.parallel_config.data_parallel_size > 1
@@ -1693,9 +1708,13 @@ class NPUModelRunner(GPUModelRunner):
                 # dict (num_scheduled_tokens + scheduled_spec_decode_tokens).
                 # This ensures _prepare_inputs sees consistent data.
                 if envs.VLLM_ECHO_ENABLED:
+                    logger.info("[ECHO_STEP] before prune, draft_ids=%s",
+                                self._draft_token_ids.shape if self._draft_token_ids is not None else None)
                     self._echo_prune_drafts(num_reqs, scheduler_output)
+                    logger.info("[ECHO_STEP] after prune")
 
                 tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
+                logger.info("[ECHO_STEP] tokens=%s", tokens)
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
 
@@ -2099,6 +2118,20 @@ class NPUModelRunner(GPUModelRunner):
             # draft model runs so KV pool save/put can complete.
             if self.speculative_config is not None:
                 self.finalize_kv_connector()
+
+        # Restore original scheduler_output so update_from_output sees
+        # the UNPRUNED num_scheduled_tokens and spec_decode_tokens.
+        # _update_after_schedule already advanced num_computed_tokens
+        # by the original values; update_from_output computes
+        # num_rejected = original_drafts - accepted and adjusts
+        # num_computed_tokens accordingly. If we leave pruned values,
+        # num_rejected = 0 and num_computed_tokens is over-advanced.
+        if hasattr(self, '_echo_restore'):
+            orig_tokens, orig_spec, orig_total = self._echo_restore
+            scheduler_output.num_scheduled_tokens = orig_tokens
+            scheduler_output.scheduled_spec_decode_tokens = orig_spec
+            scheduler_output.total_num_scheduled_tokens = orig_total
+            del self._echo_restore
 
         logger.info("[ECHO] execute_model returning, use_async=%s",
                     self.use_async_scheduling)
