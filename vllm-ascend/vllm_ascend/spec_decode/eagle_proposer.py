@@ -150,6 +150,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             self.tp_group_context = nullcontext()
 
         self.use_cuda_graph = self.runner._use_aclgraph() and not self.speculative_config.enforce_eager
+        # ECHO: the drafter's num_spec = k_max // batch_size varies with bs
+        # (structural change in the number of attention sub-steps), so a single
+        # wildcard graph cannot serve all bs, and runtime capture of uncaptured
+        # bs is blocked by the vLLM monitor. Run the drafter eager for now to
+        # unblock the target graph. Per-bs drafter capture is the follow-up.
+        if envs.VLLM_ECHO_ENABLED:
+            self.use_cuda_graph = False
 
         # TODO: Remove it when the bug of fx-graph is solved
         self.maybe_eager_context: AbstractContextManager[Any] = nullcontext()
