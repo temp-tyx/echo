@@ -583,6 +583,10 @@ def _patched_build(
     # and expose a fixed [:K_MAX] view instead; device-side query_start_loc /
     # num_accepted_tokens already carry the real per-request boundaries, so
     # kernels skip the padded rows naturally.
+    # Gate on num_actual_tokens == k_max so this only applies to the ECHO target
+    # wildcard batch; the drafter (eager, num_actual_tokens per step = bs) and
+    # standard batches are not padded (avoids 0-length dummy reqs breaking eager
+    # GDN recurrent).
     if (
         envs.VLLM_ECHO_ENABLED
         and self.use_full_cuda_graph
@@ -590,6 +594,7 @@ def _patched_build(
         and attn_metadata.num_decodes == 0
         and attn_metadata.num_spec_decodes > 0
         and attn_metadata.spec_state_indices_tensor is not None
+        and attn_metadata.num_actual_tokens == envs.VLLM_ECHO_K_MAX
     ):
         k_max = envs.VLLM_ECHO_K_MAX
         nsd = attn_metadata.num_spec_decodes

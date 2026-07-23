@@ -26,7 +26,6 @@ from vllm.logger import init_logger
 from vllm.v1 import cudagraph_dispatcher as cd
 
 from vllm_ascend import envs
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 
 logger = init_logger(__name__)
 
@@ -77,19 +76,9 @@ def _echo_dispatch(
     invalid_modes=None,
 ):
     if envs.VLLM_ECHO_ENABLED and not uniform_decode:
-        # ECHO drafter: num_spec = k_max // batch_size varies with bs (structural
-        # change in the number of attention sub-steps), so a single wildcard
-        # graph cannot serve all bs. Per-bs capture is the long-term plan; for
-        # now run the drafter eager to unblock the target graph (whose event
-        # recording fix is in place). Without this, the drafter hits an
-        # uncaptured batch_descriptor at runtime and tries to capture, which the
-        # vLLM monitor blocks ("CUDA graph capturing detected at an
-        # inappropriate time").
-        if _EXTRA_CTX.is_draft_model:
-            logger.info_once(
-                "[ECHO_CG] drafter falls back to eager (per-bs capture TODO)"
-            )
-            return CUDAGraphMode.NONE, None
+        # NOTE: the ECHO drafter is kept eager via use_cuda_graph=False in
+        # eagle_proposer (num_spec=k_max//bs is structural, per-bs capture TODO),
+        # so it never reaches this dispatch. Here we only handle the target.
         k_max = _echo_k_max()
         if num_tokens <= k_max:
             allowed = valid_modes or CUDAGraphMode.valid_runtime_modes()

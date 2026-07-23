@@ -317,7 +317,11 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         # to keep the list shape fixed across replays. FIA skips 0-len rows.
         seq_lens_list_val = seq_lens.tolist()
         actual_seq_lengths_q_val = query_start_loc_cpu[1:].tolist()
-        if envs.VLLM_ECHO_ENABLED:
+        # ECHO pad only applies to the target wildcard batch
+        # (num_actual_tokens == k_max). The drafter (eager, num_actual_tokens per
+        # step = bs) and standard batches must not be padded, otherwise 0-length
+        # dummy reqs are created and break eager ops (e.g. GDN recurrent).
+        if envs.VLLM_ECHO_ENABLED and num_actual_tokens == envs.VLLM_ECHO_K_MAX:
             k_max = envs.VLLM_ECHO_K_MAX
             logger.warning(
                 "[ECHO_FIA_BUILD] num_reqs=%s num_actual_tokens=%s k_max=%s "
