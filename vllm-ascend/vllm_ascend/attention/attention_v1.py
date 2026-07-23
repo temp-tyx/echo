@@ -625,8 +625,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 # event.wait (full_graph_fia capture) would time out at replay
                 # because their events are never recorded here. Record them.
                 if envs.VLLM_ECHO_ENABLED:
-                    for _ev in graph_params.events[num_tokens][len(attn_keys):]:
+                    _extra = graph_params.events[num_tokens][len(attn_keys):]
+                    for _ev in _extra:
                         _ev.record(update_stream)
+                    logger.warning(
+                        "[ECHO_EVREC] recorded extra events n=%s (attn_keys=%s "
+                        "total_events=%s)",
+                        len(_extra), len(attn_keys),
+                        len(graph_params.events[num_tokens]),
+                    )
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         super().process_weights_after_loading(act_dtype)

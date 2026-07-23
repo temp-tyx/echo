@@ -2274,10 +2274,6 @@ class NPUModelRunner(GPUModelRunner):
                 self.speculative_config,
                 positions.shape[0],
             )
-            if envs.VLLM_ECHO_ENABLED:
-                logger.warning("[ECHO_UPD_SYNC] pre synchronize after fia_update")
-                torch.npu.synchronize()  # DEBUG ECHO: sync all streams to localize hang
-                logger.warning("[ECHO_UPD_SYNC] post synchronize after fia_update")
 
     def _model_forward(
         self,
