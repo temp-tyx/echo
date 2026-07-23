@@ -2084,7 +2084,11 @@ class NPUModelRunner(GPUModelRunner):
                 if use_padded_batch:
                     # EAGLE speculative decoding can use the GPU sampled tokens
                     # as inputs, and does not need to wait for bookkeeping to finish.
+                    logger.info("[ECHO] drafter start, sampled_shape=%s",
+                                sampler_output.sampled_token_ids.shape)
                     propose_draft_token_ids(sampler_output.sampled_token_ids)
+                    logger.info("[ECHO] drafter done, draft_shape=%s",
+                                self._draft_token_ids.shape if self._draft_token_ids is not None else None)
                 if self.speculative_config and not use_padded_batch:
                     # ngram and other speculative decoding methods use the sampled
                     # tokens on the CPU, so they are run after bookkeeping.
@@ -2096,6 +2100,8 @@ class NPUModelRunner(GPUModelRunner):
             if self.speculative_config is not None:
                 self.finalize_kv_connector()
 
+        logger.info("[ECHO] execute_model returning, use_async=%s",
+                    self.use_async_scheduling)
         if self.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
