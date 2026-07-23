@@ -173,18 +173,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         b = b[:num_actual_tokens]
         a = a[:num_actual_tokens]
 
-        # Guard: when all decodes are spec decodes (e.g. ECHO pruned to 0
-        # drafts), attn_metadata.num_decodes > 0 (from split_decodes_and_prefills)
-        # but GDN build set non-spec metadata to None (pure spec path).
-        # Skip non-spec decode blocks to avoid None access.
-        _has_non_spec_decode = (
-            attn_metadata.num_decodes > 0
-            and (
-                attn_metadata.non_spec_num_accepted_tokens is not None
-                or attn_metadata.non_spec_decode_num_accepted_tokens is not None
-            )
-        )
-
         # 1. Convolution sequence transformation
         conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
         if spec_sequence_masks is not None:
@@ -244,7 +232,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     mixed_qkv.index_copy_(0, non_spec_token_indx, mixed_qkv_non_spec)
                 else:
                     mixed_qkv[:mixed_qkv_non_spec.shape[0]] = mixed_qkv_non_spec
-        if _has_non_spec_decode:
+        if attn_metadata.num_decodes > 0:
             if attn_metadata.non_spec_decode_token_indx is not None:
                 # Non-spec decodes coexist with spec decodes: use separate metadata
                 mixed_qkv_decode = mixed_qkv.index_select(0, attn_metadata.non_spec_decode_token_indx)
@@ -348,7 +336,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             ssm_state[non_spec_state_indices_tensor[:, 0]] = (
                 last_recurrent_state.transpose(-1, -2).contiguous().to(ssm_state.dtype)
             )
-        if _has_non_spec_decode:
+        if attn_metadata.num_decodes > 0:
             if attn_metadata.non_spec_decode_token_indx is not None:
                 # Non-spec decodes coexist with spec decodes
                 decode_q = mixed_qkv.index_select(0, attn_metadata.non_spec_decode_token_indx)

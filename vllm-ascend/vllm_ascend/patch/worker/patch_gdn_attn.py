@@ -619,6 +619,22 @@ def _patched_build(
         # original graph_path1 already pads [:batch_size] with 1, and
         # batch_size == num_actual_tokens == K_MAX for ECHO, so it is covered.
 
+    # When spec_sequence_masks is None (no spec decodes at all — e.g. ECHO
+    # pruned every req to 0 drafts AND reqs are in prefill state so
+    # num_decode_draft_tokens = -1), the upstream build sets
+    # non_spec_num_accepted_tokens = None. But if num_decodes > 0, the
+    # non-spec decode conv1d + recurrent blocks need it. Set it to a
+    # tensor of 1s (each decode req accepts exactly 1 token).
+    if (
+        attn_metadata.spec_sequence_masks is None
+        and attn_metadata.non_spec_num_accepted_tokens is None
+        and attn_metadata.num_decodes > 0
+    ):
+        device = common_attn_metadata.query_start_loc.device
+        attn_metadata.non_spec_num_accepted_tokens = torch.ones(
+            attn_metadata.num_decodes, dtype=torch.int32, device=device,
+        )
+
     if attn_metadata.num_prefills <= 0:
         return attn_metadata
 
