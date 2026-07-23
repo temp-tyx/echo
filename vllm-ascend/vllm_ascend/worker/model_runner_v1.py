@@ -1561,14 +1561,9 @@ class NPUModelRunner(GPUModelRunner):
         for req_id in sched_tokens_dict:
             if req_id in drafter_req_set:
                 continue
-            was_in_spec = req_id in spec_tokens
             spec_tokens[req_id] = []
             sched_tokens_dict[req_id] = 1
             num_non_drafter += 1
-            logger.info(
-                "[ECHO] non_drafter: req_id=%s was_in_spec=%s -> stripped",
-                req_id, was_in_spec,
-            )
 
         # Select only the scheduled reqs' rows from drafter output
         idx_tensor = torch.tensor(sched_indices, device=draft_token_ids.device)
@@ -1622,12 +1617,9 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output.total_num_scheduled_tokens = sum(sched_tokens_dict.values())
 
         logger.info(
-            "[ECHO] pruned: bs=%s/%s num_spec=%s k_max=%s n_select=%s "
-            "total=%s per_req=%s sched_tokens=%s",
-            actual_bs, bs_drafter, total_steps, k_max, n_select,
+            "[ECHO] pruned: bs=%s/%s n_select=%s total=%s",
+            actual_bs, bs_drafter, n_select,
             scheduler_output.total_num_scheduled_tokens,
-            per_req_counts.tolist(),
-            dict(sched_tokens_dict),
         )
 
     def _copy_draft_token_ids_to_cpu(
@@ -1785,10 +1777,13 @@ class NPUModelRunner(GPUModelRunner):
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 )
 
-                logger.info(
-                    "[ECHO] dispatch: mode=%s tokens_padded=%s num_reqs=%s/%s",
-                    cudagraph_mode, batch_desc.num_tokens,
-                    num_reqs, batch_desc.num_reqs,
+                logger.debug(
+                    "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
+                    "should_ubatch: %s, num_tokens_across_dp: %s",
+                    cudagraph_mode,
+                    batch_desc,
+                    should_ubatch,
+                    num_tokens_across_dp,
                 )
 
                 num_tokens_padded = batch_desc.num_tokens
@@ -1941,47 +1936,6 @@ class NPUModelRunner(GPUModelRunner):
         has_encoder_input = self.model_config.is_encoder_decoder and num_encoder_reqs > 0
 
         # Run forward pass
-        if envs.VLLM_ECHO_ENABLED and cudagraph_mode == CUDAGraphMode.FULL and num_tokens_padded == envs.VLLM_ECHO_K_MAX:
-            # Dump GDN metadata from the first GDN layer
-            gdn_meta = None
-            for layer_name, meta in attn_metadata.items():
-                if hasattr(meta, 'spec_state_indices_tensor'):
-                    gdn_meta = meta
-                    break
-            gdn_info = ""
-            if gdn_meta is not None:
-                spec_si = gdn_meta.spec_state_indices_tensor
-                gdn_info = (
-                    "nspec=%d ndec=%d nprefill=%d "
-                    "spec_si=%s non_spec_si=%s "
-                    "num_accepted=%s "
-                    "num_decode_draft=%s "
-                    "spec_qsl=%s non_spec_qsl=%s "
-                    "spec_masks=%s"
-                ) % (
-                    gdn_meta.num_spec_decodes,
-                    gdn_meta.num_decodes,
-                    gdn_meta.num_prefills,
-                    spec_si[:8].tolist() if spec_si is not None else None,
-                    gdn_meta.non_spec_state_indices_tensor[:4].tolist() if gdn_meta.non_spec_state_indices_tensor is not None else None,
-                    self.num_accepted_tokens.gpu[:num_reqs].tolist(),
-                    self.num_decode_draft_tokens.cpu[:num_reqs].tolist(),
-                    gdn_meta.spec_query_start_loc[:4].tolist() if gdn_meta.spec_query_start_loc is not None else None,
-                    gdn_meta.non_spec_query_start_loc[:4].tolist() if gdn_meta.non_spec_query_start_loc is not None else None,
-                    gdn_meta.spec_sequence_masks[:num_reqs].tolist() if gdn_meta.spec_sequence_masks is not None else None,
-                )
-            logger.info(
-                "[ECHO_FWD] qsl=%s positions=%s seq_lens=%s num_reqs=%s "
-                "num_computed=%s sched_tokens_np=%s blk=%s %s",
-                self.query_start_loc.np[:num_reqs_padded + 1].tolist(),
-                positions[:num_tokens_padded].tolist() if positions is not None and positions.dim() <= 2 else "skip",
-                self.optimistic_seq_lens_cpu[:num_reqs].tolist(),
-                num_reqs,
-                self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist(),
-                num_scheduled_tokens_np[:num_reqs].tolist(),
-                self.input_batch.block_table[0].get_device_tensor()[:2, :4].tolist() if num_reqs > 0 else None,
-                gdn_info,
-            )
         clear_kv_metadata = self.speculative_config is None
         with (
             record_function_or_nullcontext("forward"),
@@ -2596,7 +2550,7 @@ class NPUModelRunner(GPUModelRunner):
                 num_active_loras=num_active_loras,
             )
 
-        cudagraph_mode, batch_descriptor = dispatch_cudagraph(num_tokens_padded, use_cascade_attn or has_encoder_output)
+        cudagraph_mode, batch_descriptor = dispatch_cudagraph(num_tokens_padded, use_cascade_attn or has_encoder_output or envs.VLLM_ECHO_ENABLED)
         num_tokens_padded = batch_descriptor.num_tokens
         if enable_sp(self.vllm_config):
             assert batch_descriptor.num_tokens % self.vllm_config.parallel_config.tensor_parallel_size == 0, (
