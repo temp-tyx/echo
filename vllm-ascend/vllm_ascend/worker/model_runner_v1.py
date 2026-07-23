@@ -1815,13 +1815,16 @@ class NPUModelRunner(GPUModelRunner):
                     # to compute mamba state copy targets. If it sees the pruned
                     # values (e.g. non-drafter req stripped from 8→1), it copies
                     # mamba state to the wrong block, corrupting GDN attention.
-                    # The restored values also reach update_from_output for
-                    # correct num_rejected accounting.
+                    # After preprocess_mamba, set total_num_scheduled_tokens
+                    # back to the pruned value so _preprocess sees the correct
+                    # count. The dict stays restored for update_from_output.
                     if hasattr(self, '_echo_restore'):
                         orig_tokens, orig_spec, orig_total = self._echo_restore
+                        pruned_total = scheduler_output.total_num_scheduled_tokens
                         scheduler_output.num_scheduled_tokens = orig_tokens
                         scheduler_output.scheduled_spec_decode_tokens = orig_spec
                         scheduler_output.total_num_scheduled_tokens = orig_total
+                        self._echo_pruned_total = pruned_total
                         del self._echo_restore
                     # preprocess_mamba reads req_state.num_computed_tokens (CPU)
                     # to decide copy operations, so we must apply deferred
@@ -1897,6 +1900,14 @@ class NPUModelRunner(GPUModelRunner):
 
             # update global cos, sin
             update_cos_sin(positions)
+
+            # _preprocess read scheduler_output.total_num_scheduled_tokens
+            # (which was restored to the original value for preprocess_mamba).
+            # Set it back to the pruned value so subsequent code sees the
+            # correct count.
+            if hasattr(self, '_echo_pruned_total'):
+                scheduler_output.total_num_scheduled_tokens = self._echo_pruned_total
+                del self._echo_pruned_total
 
         if self.dynamic_eplb:
             with record_function_or_nullcontext("EPLB weight D2D"):
