@@ -1523,15 +1523,36 @@ class NPUModelRunner(GPUModelRunner):
             return
 
         draft_token_ids = self._draft_token_ids  # [bs_drafter, num_spec]
-        actual_bs, total_steps = draft_token_ids.shape
+        bs_drafter, total_steps = draft_token_ids.shape
         k_max = envs.VLLM_ECHO_K_MAX
 
-        logits_stack = torch.stack(drafter._echo_logits_list, dim=0)
+        spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        sched_tokens_dict = scheduler_output.num_scheduled_tokens
+        req_ids_drafter = self.input_batch.req_ids[:bs_drafter]
+
+        # Async scheduling: the drafter ran on the PREVIOUS step's
+        # input_batch, so some reqs may have finished and are no longer in
+        # the current scheduler_output. Filter to only reqs that are still
+        # scheduled, and map them to their row in the drafter output.
+        sched_indices = [
+            i for i, req_id in enumerate(req_ids_drafter)
+            if req_id in sched_tokens_dict
+        ]
+        actual_bs = len(sched_indices)
+        if actual_bs == 0:
+            return
+
+        # Select only the scheduled reqs' rows from drafter output
+        idx_tensor = torch.tensor(sched_indices, device=draft_token_ids.device)
+        draft_token_ids = draft_token_ids.index_select(0, idx_tensor)  # [actual_bs, total_steps]
+        logits_stack = torch.stack(drafter._echo_logits_list, dim=0)  # [T, bs_drafter, V]
+        logits_stack = logits_stack.index_select(1, idx_tensor)  # [T, actual_bs, V]
+
         log_probs = F.log_softmax(logits_stack, dim=-1)
-        step_tokens = draft_token_ids.transpose(0, 1)
+        step_tokens = draft_token_ids.transpose(0, 1)  # [T, actual_bs]
         step_log_probs = log_probs.gather(2, step_tokens.unsqueeze(-1)).squeeze(-1)
-        cond_log_probs = step_log_probs.transpose(0, 1)
-        cum_log_probs = torch.cumsum(cond_log_probs, dim=1)
+        cond_log_probs = step_log_probs.transpose(0, 1)  # [actual_bs, T]
+        cum_log_probs = torch.cumsum(cond_log_probs, dim=1)  # [actual_bs, T]
 
         n_select = min(max(k_max - actual_bs, 0), cum_log_probs.numel())
         flat_log_probs = cum_log_probs.flatten()
@@ -1550,10 +1571,8 @@ class NPUModelRunner(GPUModelRunner):
         self._echo_query_start_loc = qsl
         self._echo_num_accepted = num_accepted_drafts
 
-        spec_tokens = scheduler_output.scheduled_spec_decode_tokens
-        sched_tokens_dict = scheduler_output.num_scheduled_tokens
-        req_ids_list = self.input_batch.req_ids[:actual_bs]
-        for i, req_id in enumerate(req_ids_list):
+        sched_req_ids = [req_ids_drafter[i] for i in sched_indices]
+        for i, req_id in enumerate(sched_req_ids):
             if req_id not in spec_tokens:
                 continue
             full_drafts = spec_tokens[req_id]
@@ -1572,11 +1591,12 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output.total_num_scheduled_tokens = sum(sched_tokens_dict.values())
 
         logger.info(
-            "[ECHO] pruned: bs=%s num_spec=%s k_max=%s n_select=%s "
-            "total=%s per_req=%s",
-            actual_bs, total_steps, k_max, n_select,
+            "[ECHO] pruned: bs=%s/%s num_spec=%s k_max=%s n_select=%s "
+            "total=%s per_req=%s sched_tokens=%s",
+            actual_bs, bs_drafter, total_steps, k_max, n_select,
             scheduler_output.total_num_scheduled_tokens,
             per_req_counts.tolist(),
+            dict(sched_tokens_dict),
         )
 
     def _copy_draft_token_ids_to_cpu(

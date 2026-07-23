@@ -860,11 +860,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self,
         num_input_tokens,
         batch_size,
-        token_indices_to_sample,
-        target_positions,
-        inputs_embeds,
-        multi_steps_attn_metadata,
-        num_tokens,
         is_prefill=None,
     ) -> torch.Tensor:
         # The lifecycle of `input_ids`, `positions`, `hidden_states` runs through all
@@ -1816,37 +1811,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 if hidden_states is not None:
                     hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states.contiguous(), True)
         return last_hidden_states, positions, hidden_states
-
-    def _apply_echo_pruning(self, draft_token_ids: torch.Tensor) -> torch.Tensor:
-        if not hasattr(self, "_echo_logits_list") or not self._echo_logits_list:
-            return draft_token_ids
-
-        actual_batch_size, total_steps = draft_token_ids.shape
-        logits_stack = torch.stack(self._echo_logits_list, dim=0)  # [T, B, V]
-
-        log_probs = F.log_softmax(logits_stack, dim=-1)  # [T, B, V]
-        step_tokens = draft_token_ids.transpose(0, 1)  # [T, B]
-
-        step_log_probs = log_probs.gather(dim=2, index=step_tokens.unsqueeze(-1)).squeeze(-1)  # [T, B]
-        cond_log_probs = step_log_probs.transpose(0, 1)  # [B, T]
-        cum_log_probs = torch.cumsum(cond_log_probs, dim=1)  # [B, T]
-
-        k_max = min(envs.VLLM_ECHO_K_MAX - actual_batch_size, cum_log_probs.numel())
-        flat_log_probs = cum_log_probs.flatten()
-        top_flat_indices = torch.topk(flat_log_probs, k=k_max, sorted=False).indices
-
-        mask = torch.zeros_like(flat_log_probs, dtype=torch.bool)
-        mask[top_flat_indices] = True
-        mask = mask.view(actual_batch_size, total_steps)
-
-        pruned = torch.where(mask, draft_token_ids, -1)
-        return self._compact_echo_draft_rows(pruned)
-
-    @staticmethod
-    def _compact_echo_draft_rows(draft_token_ids: torch.Tensor) -> torch.Tensor:
-        mask = (draft_token_ids != -1).to(torch.int32)
-        sorted_indices = torch.argsort(mask, dim=1, descending=True, stable=True)
-        return torch.gather(draft_token_ids, 1, sorted_indices)
 
 
 class AscendEagleProposer(EagleProposer, AscendSpecDecodeBaseProposer):
