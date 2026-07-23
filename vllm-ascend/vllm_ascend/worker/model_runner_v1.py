@@ -260,13 +260,6 @@ class NPUModelRunner(GPUModelRunner):
                 dtype=torch.int32,
             )
 
-        # ECHO: device tensors produced by _echo_prune_drafts (48692-style
-        # pruning at execute_model start). Consumed by target verify.
-        self._echo_selected_indices: torch.Tensor | None = None
-        self._echo_query_start_loc: torch.Tensor | None = None
-        self._echo_num_accepted: torch.Tensor | None = None
-        self._echo_logits_indices: torch.Tensor | None = None
-
         vllm_config.scheduler_config.max_num_batched_tokens -= max_pcp_pad_tokens
         self.max_num_tokens = self.scheduler_config.max_num_batched_tokens
         self.max_num_reqs = self.scheduler_config.max_num_seqs
@@ -1368,9 +1361,7 @@ class NPUModelRunner(GPUModelRunner):
             if envs.VLLM_ECHO_ENABLED:
                 echo_k_max = envs.VLLM_ECHO_K_MAX
                 batch_size = spec_decode_common_attn_metadata.batch_size()
-                draft_max = getattr(
-                    self.drafter, "_echo_draft_max_tokens", self.drafter.num_speculative_tokens
-                )
+                draft_max = self.drafter.num_speculative_tokens
                 # TODO: modify draft length
                 # draft_step = min(max(int(envs.VLLM_ECHO_STEPS_MULTIPLIER * echo_k_max // batch_size), 1), draft_max)
                 draft_step = draft_max
@@ -1514,8 +1505,6 @@ class NPUModelRunner(GPUModelRunner):
         (built after) and _prepare_inputs see consistent pruned data."""
         if not envs.VLLM_ECHO_ENABLED:
             return
-        self._echo_query_start_loc = None
-        self._echo_selected_indices = None
         if self._draft_token_ids is None or not torch.is_tensor(self._draft_token_ids):
             return
         drafter = self.drafter
@@ -1564,12 +1553,6 @@ class NPUModelRunner(GPUModelRunner):
 
         num_accepted_drafts = mask.sum(dim=1).to(torch.int32)
         per_req_counts = num_accepted_drafts + 1
-
-        qsl = torch.zeros(k_max + 1, dtype=torch.int32, device=draft_token_ids.device)
-        qsl[1 : actual_bs + 1] = torch.cumsum(per_req_counts, dim=0)
-        qsl[actual_bs + 1 : k_max + 1] = qsl[actual_bs].unsqueeze(0)
-        self._echo_query_start_loc = qsl
-        self._echo_num_accepted = num_accepted_drafts
 
         sched_req_ids = [req_ids_drafter[i] for i in sched_indices]
         for i, req_id in enumerate(sched_req_ids):

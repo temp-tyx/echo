@@ -97,14 +97,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device, pass_hidden_states_to_model: bool, runner=None):
         super().__init__(vllm_config, device, pass_hidden_states_to_model, runner=runner)
-        # ECHO's max draft propose width is bounded by the static
-        # num_speculative_tokens. Deployments must set num_speculative_tokens to
-        # the maximum ECHO verify width so that every component (scheduler
-        # lookahead, KV/graph/buffer sizing, decode_threshold) is consistently
-        # sized; ECHO then prunes via global top-k below this bound.
-        self._target_num_speculative_tokens = self.speculative_config.num_speculative_tokens
-        self._echo_draft_max_tokens = self.num_speculative_tokens
-
         # Assign runner before it's used in the methods below
         self.runner = runner
 
@@ -860,6 +852,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self,
         num_input_tokens,
         batch_size,
+        token_indices_to_sample,
+        target_positions,
+        inputs_embeds,
+        multi_steps_attn_metadata,
+        num_tokens,
         is_prefill=None,
     ) -> torch.Tensor:
         # The lifecycle of `input_ids`, `positions`, `hidden_states` runs through all
