@@ -181,6 +181,10 @@ class AscendMetadata:
     seq_lens_cpu: torch.Tensor = None
     seq_lens_list: list[int] = None  # type: ignore
     actual_seq_lengths_q: list[int] = None  # type: ignore
+    # Device-tensor versions of the above, with stable data_ptr for
+    # graph_task_update during ECHO wildcard replay.
+    seq_lens_list_gpu: torch.Tensor = None
+    actual_seq_lengths_q_gpu: torch.Tensor = None
 
     query_start_loc: torch.Tensor = None
     # Maximum query length in the batch (None for decoding).
@@ -256,6 +260,17 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         scheduler_config = vllm_config.scheduler_config
         self.chunked_prefill_enabled = scheduler_config.enable_chunked_prefill
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
+
+        # Pre-allocated device tensors for actual_seq_lengths_q and
+        # actual_seq_lengths_kv (= seq_lens_list).  These MUST be stable
+        # device tensors (fixed data_ptr) so that graph_task_update can
+        # overwrite their contents at replay time.  Passing Python lists
+        # to npu_fused_infer_attention_score causes the NPU runtime to
+        # create a fresh device tensor on every call, which breaks
+        # graph replay because the baked-in address does not match.
+        max_seqs = vllm_config.scheduler_config.max_num_seqs
+        self._asl_q_gpu = torch.zeros(max_seqs, dtype=torch.int32, device=device)
+        self._asl_kv_gpu = torch.zeros(max_seqs, dtype=torch.int32, device=device)
 
     @classmethod
     def get_cudagraph_support(
@@ -340,6 +355,15 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
                     actual_seq_lengths_q_val + [actual_seq_lengths_q_val[-1]] * pad_n
                 )
 
+        # Copy host lists into pre-allocated device tensors so that
+        # graph_task_update can overwrite data at a stable address.
+        n_q = len(actual_seq_lengths_q_val)
+        n_kv = len(seq_lens_list_val)
+        self._asl_q_gpu[:n_q].copy_(
+            torch.tensor(actual_seq_lengths_q_val, dtype=torch.int32, device=self.device))
+        self._asl_kv_gpu[:n_kv].copy_(
+            torch.tensor(seq_lens_list_val, dtype=torch.int32, device=self.device))
+
         attn_metadata = AscendMetadata(
             num_actual_tokens=num_actual_tokens,
             num_decode_tokens=num_decode_tokens,
@@ -358,6 +382,8 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             causal=common_attn_metadata.causal,
             model_runner_type=self.model_config.runner_type,
             kvcomp_metadata=common_attn_metadata.kvcomp_metadata,
+            seq_lens_list_gpu=self._asl_kv_gpu[:n_kv],
+            actual_seq_lengths_q_gpu=self._asl_q_gpu[:n_q],
         )
         return attn_metadata
 
@@ -555,16 +581,25 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     sparse_mode = 3
                     if _EXTRA_CTX.is_draft_model:
                         draft_step = attn_count // num_layers
-                        seq_lens = attn_metadata[draft_step][key].seq_lens_list
-                        actual_seq_lengths_q = attn_metadata[draft_step][key].actual_seq_lengths_q
-                        block_tables = attn_metadata[draft_step][key].block_tables
+                        _meta = attn_metadata[draft_step][key]
+                        seq_lens = _meta.seq_lens_list_gpu if _meta.seq_lens_list_gpu is not None else _meta.seq_lens_list
+                        actual_seq_lengths_q = _meta.actual_seq_lengths_q_gpu if _meta.actual_seq_lengths_q_gpu is not None else _meta.actual_seq_lengths_q
+                        block_tables = _meta.block_tables
                         attn_count = attn_count + 1
-                        if not attn_metadata[draft_step][key].causal:
+                        if not _meta.causal:
                             sparse_mode = 0
                     else:
-                        seq_lens = attn_metadata[key].seq_lens_list
-                        actual_seq_lengths_q = attn_metadata[key].actual_seq_lengths_q
-                        block_tables = attn_metadata[key].block_tables
+                        _meta = attn_metadata[key]
+                        seq_lens = _meta.seq_lens_list_gpu if _meta.seq_lens_list_gpu is not None else _meta.seq_lens_list
+                        actual_seq_lengths_q = _meta.actual_seq_lengths_q_gpu if _meta.actual_seq_lengths_q_gpu is not None else _meta.actual_seq_lengths_q
+                        block_tables = _meta.block_tables
+
+                    if envs.VLLM_ECHO_ENABLED:
+                        _q = actual_seq_lengths_q.tolist() if isinstance(actual_seq_lengths_q, torch.Tensor) else actual_seq_lengths_q
+                        _kv = seq_lens.tolist() if isinstance(seq_lens, torch.Tensor) else seq_lens
+                        logger.info("[ECHO_FIA_REPLAY] asl_q=%s asl_kv=%s id_q=%s id_kv=%s",
+                                    _q, _kv,
+                                    id(actual_seq_lengths_q), id(seq_lens))
 
                     torch.npu.graph_task_update_begin(update_stream, handle)
                     input_layout = "TND"
@@ -642,7 +677,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 graph_params = get_draft_graph_params()
         else:
             graph_params = get_graph_params()
-        actual_seq_lengths_q = attn_metadata.actual_seq_lengths_q
+        actual_seq_lengths_q = attn_metadata.actual_seq_lengths_q_gpu if attn_metadata.actual_seq_lengths_q_gpu is not None else attn_metadata.actual_seq_lengths_q
         # Prepare tensors for attention output
         # TODO: Refactor this to step-level instead of layer-level
 
@@ -692,6 +727,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         # Handle graph capturing mode
         stream = torch_npu.npu.current_stream()
+        if envs.VLLM_ECHO_ENABLED:
+            logger.info("[ECHO_FIA_CAP] asl_q=%s asl_kv=%s id_q=%s id_kv=%s",
+                        actual_seq_lengths_q, actual_seq_lengths_kv,
+                        id(actual_seq_lengths_q), id(actual_seq_lengths_kv))
 
         event = torch.npu.ExternalEvent()
         event.wait(stream)
@@ -847,7 +886,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             value = self.value_cache.view(  # type: ignore
                 num_block, block_size, -1
             )
-            actual_seq_lengths_kv = attn_metadata.seq_lens_list
+            actual_seq_lengths_kv = attn_metadata.seq_lens_list_gpu if attn_metadata.seq_lens_list_gpu is not None else attn_metadata.seq_lens_list
         elif attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
             num_block, block_size, _, _ = self.key_cache.shape  # type: ignore
             key = self.key_cache.view(  # type: ignore
@@ -857,7 +896,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 num_block, block_size, -1
             )
             block_table = attn_metadata.block_tables
-            actual_seq_lengths_kv = attn_metadata.seq_lens_list
+            actual_seq_lengths_kv = attn_metadata.seq_lens_list_gpu if attn_metadata.seq_lens_list_gpu is not None else attn_metadata.seq_lens_list
         # chunked prefill.
         else:
             num_block, block_size, _, _ = self.key_cache.shape  # type: ignore
@@ -868,7 +907,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 num_block, block_size, -1
             )
             block_table = attn_metadata.block_tables
-            actual_seq_lengths_kv = attn_metadata.seq_lens_list
+            actual_seq_lengths_kv = attn_metadata.seq_lens_list_gpu if attn_metadata.seq_lens_list_gpu is not None else attn_metadata.seq_lens_list
         return key, value, block_size, block_table, actual_seq_lengths_kv
 
     def _forward_fia_slidingwindow(self, query: torch.Tensor, attn_metadata: AscendMetadata, output: torch.Tensor):
