@@ -677,7 +677,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 graph_params = get_draft_graph_params()
         else:
             graph_params = get_graph_params()
-        actual_seq_lengths_q = attn_metadata.actual_seq_lengths_q_gpu if attn_metadata.actual_seq_lengths_q_gpu is not None else attn_metadata.actual_seq_lengths_q
+        actual_seq_lengths_q = attn_metadata.actual_seq_lengths_q
+        actual_seq_lengths_q_gpu = attn_metadata.actual_seq_lengths_q_gpu
         # Prepare tensors for attention output
         # TODO: Refactor this to step-level instead of layer-level
 
@@ -713,7 +714,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 input_layout=input_layout,
                 block_size=block_size,
                 actual_seq_lengths=actual_seq_lengths_q,
-                actual_seq_lengths_kv=actual_seq_lengths_kv,
+                actual_seq_lengths_kv=actual_seq_lengths_kv if not isinstance(actual_seq_lengths_kv, torch.Tensor) else actual_seq_lengths_kv.tolist(),
                 num_key_value_heads=self.num_kv_heads,
                 num_heads=self.num_heads,
                 sparse_mode=sparse_mode,
@@ -729,8 +730,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
         stream = torch_npu.npu.current_stream()
         if envs.VLLM_ECHO_ENABLED:
             logger.info("[ECHO_FIA_CAP] asl_q=%s asl_kv=%s id_q=%s id_kv=%s",
-                        actual_seq_lengths_q, actual_seq_lengths_kv,
-                        id(actual_seq_lengths_q), id(actual_seq_lengths_kv))
+                        asl_q_for_fia, asl_kv_for_fia,
+                        id(asl_q_for_fia), id(asl_kv_for_fia))
+
+        # Use device tensors for attn_params and FIA call so that
+        # graph_task_update can update data at a stable address.
+        asl_q_for_fia = actual_seq_lengths_q_gpu if actual_seq_lengths_q_gpu is not None else actual_seq_lengths_q
+        asl_kv_for_fia = actual_seq_lengths_kv
+        asl_kv_list = asl_kv_for_fia.tolist() if isinstance(asl_kv_for_fia, torch.Tensor) else asl_kv_for_fia
 
         event = torch.npu.ExternalEvent()
         event.wait(stream)
@@ -743,8 +750,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
             weak_ref_tensors(block_table),
             weak_ref_tensors(attn_mask) if attn_mask is not None else None,
             block_size,
-            actual_seq_lengths_kv,
-            actual_seq_lengths_q,
+            asl_kv_for_fia,
+            asl_q_for_fia,
             self.num_kv_heads,
             self.num_heads,
             self.scale,
@@ -770,8 +777,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
             block_table=block_table,
             input_layout=input_layout,
             block_size=block_size,
-            actual_seq_lengths=actual_seq_lengths_q,
-            actual_seq_lengths_kv=actual_seq_lengths_kv,
+            actual_seq_lengths=asl_q_for_fia,
+            actual_seq_lengths_kv=asl_kv_for_fia,
             num_key_value_heads=self.num_kv_heads,
             num_heads=self.num_heads,
             scale=self.scale,
