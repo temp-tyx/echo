@@ -643,7 +643,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
         else:
             graph_params = get_graph_params()
         actual_seq_lengths_q = attn_metadata.actual_seq_lengths_q
-        actual_seq_lengths_q_gpu = attn_metadata.actual_seq_lengths_q_gpu
         # Prepare tensors for attention output
         # TODO: Refactor this to step-level instead of layer-level
 
