@@ -2328,15 +2328,28 @@ class NPUModelRunner(GPUModelRunner):
     ) -> tuple[CUDAGraphMode, BatchDescriptor, bool, torch.Tensor | None, CUDAGraphStat | None]:
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
         is_all_decode = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
-        uniform_decode = (
-            (
-                (is_all_decode if self.speculative_config else True)
-                and (max_num_scheduled_tokens == self.uniform_decode_query_len)
-                and (num_tokens == max_num_scheduled_tokens * num_reqs)
+        if envs.VLLM_ECHO_ENABLED and self.speculative_config and force_uniform_decode is None:
+            # ECHO pure-decode verify has a fixed total token count
+            # (base + kept drafts = K_MAX) but non-uniform per-req draft
+            # counts. Flag uniform_decode=True so dispatch routes to the
+            # ECHO FULL wildcard (num_reqs=None + max_query_len) in
+            # _create_padded_batch_descriptor; that branch short-circuits
+            # before the legacy num_reqs = num_tokens // udql division that
+            # would mis-count reqs for a non-uniform batch.
+            # Prefill-bearing batches keep uniform_decode=False
+            # (is_all_decode=False) and skip ECHO FULL, matching upstream
+            # PR #48692's "prefills use fixed-K fallback" behaviour.
+            uniform_decode = is_all_decode and (num_tokens == envs.VLLM_ECHO_K_MAX)
+        else:
+            uniform_decode = (
+                (
+                    (is_all_decode if self.speculative_config else True)
+                    and (max_num_scheduled_tokens == self.uniform_decode_query_len)
+                    and (num_tokens == max_num_scheduled_tokens * num_reqs)
+                )
+                if force_uniform_decode is None
+                else force_uniform_decode
             )
-            if force_uniform_decode is None
-            else force_uniform_decode
-        )
         # Encoder-decoder models only support CG for decoder_step > 0 (no enc_output
         # is present). Also, chunked-prefill is disabled, so batch are uniform.
         has_encoder_output = self.model_config.is_encoder_decoder and num_encoder_reqs > 0
@@ -3565,8 +3578,8 @@ class NPUModelRunner(GPUModelRunner):
             max_num_blocks_per_req = cdiv(max_model_len, block_sizes[i] * get_total_cp_world_size())
             if isinstance(kv_cache_group.kv_cache_spec, MambaSpec):
                 mamba_blocks_per_req = (
-                    max_num_blocks_per_req if self.cache_config.enable_prefix_caching else 1
-                ) + kv_cache_group.kv_cache_spec.num_speculative_blocks
+                                           max_num_blocks_per_req if self.cache_config.enable_prefix_caching else 1
+                                       ) + kv_cache_group.kv_cache_spec.num_speculative_blocks
 
                 max_num_blocks_per_req = max(max_num_blocks_per_req, mamba_blocks_per_req)
             max_num_blocks.append(max_num_blocks_per_req)
@@ -3633,7 +3646,7 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         def create_attn_groups(
-            attn_backends_map: dict[AttentionBackend, list[str]], kv_cache_group_id: int
+                attn_backends_map: dict[AttentionBackend, list[str]], kv_cache_group_id: int
         ) -> list[AttentionGroup]:
             attn_groups: list[AttentionGroup] = []
             for (attn_backend, kv_cache_spec), layer_names in attn_backends_map.items():
@@ -3778,13 +3791,12 @@ class NPUModelRunner(GPUModelRunner):
         return kv_cache_spec
 
     def _check_and_update_cudagraph_mode(
-        self,
-        attention_backends: list[set[type[AttentionBackend]]],
-        kv_cache_groups: list[KVCacheGroupSpec],
+            self,
+            attention_backends: list[set[type[AttentionBackend]]],
+            kv_cache_groups: list[KVCacheGroupSpec],
     ) -> None:
         with update_pass_config(self):
             super()._check_and_update_cudagraph_mode(attention_backends, kv_cache_groups)
-
 
         capture_descs = self.cudagraph_dispatcher.get_capture_descs()
         capture_sizes = sorted({

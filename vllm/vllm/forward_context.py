@@ -56,6 +56,16 @@ class BatchDescriptor:
     (like fused_moe_lora) whose grid size depends on num_active_loras
     to be properly captured.
     """
+    max_query_len: int | None = None
+    """
+    Explicit per-request query-length upper bound for non-uniform FULL
+    cudagraphs. None means the captured graph requires a uniform per-req
+    query length (the legacy FULL decode contract) or is a PIECEWISE
+    wildcard. When set, the descriptor accepts a runtime batch whose
+    per-req query lengths vary as long as their max equals this value;
+    the actual per-req layout is read from device-side cu_seqlens at
+    replay. Mirrors upstream adaptive-verification (PR #48692).
+    """
 
 
 def _compute_sp_num_tokens(

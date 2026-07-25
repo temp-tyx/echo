@@ -291,7 +291,13 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
-            cu_seqlens = spec_query_start_loc[: attn_metadata.num_spec_decodes + 1]
+            # Use the full (padded in graph path) spec_query_start_loc so the
+            # recurrent kernel's tiling sees a fixed B = max_num_seqs at both
+            # capture and replay. Padding reqs have seqLen==0 and are skipped
+            # by kernel Process() (`if (seqLen <= 0) continue`). In eager mode
+            # spec_query_start_loc is the actual (unpadded) cumulative, which
+            # is also correct since eager re-tils every step.
+            cu_seqlens = spec_query_start_loc
             actual_seq_lengths = torch.cat([cu_seqlens[:1], cu_seqlens[1:] - cu_seqlens[:-1]])
             query_spec = l2norm_fwd(query_spec)
             key_spec = l2norm_fwd(key_spec)

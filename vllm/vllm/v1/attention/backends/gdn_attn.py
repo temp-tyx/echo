@@ -157,6 +157,31 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             dtype=torch.int32,
             device=device,
         )
+        # Coexist (spec + non-spec decode) graph buffers. Used when ECHO prunes
+        # some reqs' drafts to -1, producing non-spec decodes alongside spec
+        # decodes. The coexist forward path (gdn.py) drives the decode kernel
+        # from these separate decode-only tensors, so they need static buffers
+        # for graph replay to read fresh per-step data.
+        self.non_spec_decode_state_indices_tensor: torch.Tensor = torch.empty(
+            (self.decode_cudagraph_max_bs, self.num_spec + 1),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.non_spec_decode_num_accepted_tokens: torch.Tensor = torch.empty(
+            (self.decode_cudagraph_max_bs,),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.non_spec_decode_query_start_loc: torch.Tensor = torch.empty(
+            (self.decode_cudagraph_max_bs + 1,),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.non_spec_decode_token_indx: torch.Tensor = torch.empty(
+            (self.decode_cudagraph_max_bs,),
+            dtype=torch.int32,
+            device=device,
+        )
 
     def build(  # type: ignore[override]
         self,
@@ -423,13 +448,21 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         # Prepare tensors for cudagraph
         # Note: m.num_actual_tokens is already padded by the model runner for CUDAGraph
         batch_size = m.num_actual_tokens
+        # Fixed req-count upper bound so the recurrent kernel's tiling (B,
+        # colCount, grid) is identical at capture and replay. ECHO prunes
+        # per-req drafts non-uniformly, but num_reqs (bs) is always <= this.
+        # Pad spec tensors to max_B so the kernel iterates max_B reqs and
+        # skips padding reqs (seqLen==0) at replay (kernel Process() has
+        # `if (seqLen <= 0) continue`).
+        max_B = self.vllm_config.scheduler_config.max_num_seqs
 
         if (
             self.use_full_cuda_graph
             and num_prefills == 0
-            and num_decodes == 0
+            and num_spec_decodes > 0
             and num_spec_decodes <= self.decode_cudagraph_max_bs
             and num_spec_decode_tokens <= self.decode_cudagraph_max_bs
+            and num_decodes <= self.decode_cudagraph_max_bs
         ):
             assert spec_sequence_masks is not None
             # spec_state_indices_tensor may have fewer columns than the
@@ -447,7 +480,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             self.spec_state_indices_tensor[:num_spec_decodes].copy_(
                 spec_state_indices_tensor, non_blocking=True
             )
-            spec_state_indices_tensor = self.spec_state_indices_tensor[:num_spec_decodes]
+            self.spec_state_indices_tensor[num_spec_decodes:max_B].fill_(PAD_SLOT_ID)
+            spec_state_indices_tensor = self.spec_state_indices_tensor[:max_B]
 
             self.spec_sequence_masks[:num_spec_decodes].copy_(
                 spec_sequence_masks[:num_spec_decodes], non_blocking=True
@@ -472,14 +506,71 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 spec_query_start_loc, non_blocking=True
             )
             spec_num_query_tokens = spec_query_start_loc[-1]  # type: ignore[index]
-            spec_query_start_loc = self.spec_query_start_loc[: batch_size + 1]
-            spec_query_start_loc[num_spec_decodes + 1 :].fill_(spec_num_query_tokens)
+            self.spec_query_start_loc[num_spec_decodes + 1 : max_B + 1].fill_(spec_num_query_tokens)
+            spec_query_start_loc = self.spec_query_start_loc[: max_B + 1]
 
             self.num_accepted_tokens[:num_spec_decodes].copy_(
                 num_accepted_tokens, non_blocking=True
             )
-            num_accepted_tokens = self.num_accepted_tokens[:batch_size]
-            num_accepted_tokens[num_spec_decodes:].fill_(1)
+            self.num_accepted_tokens[num_spec_decodes:max_B].fill_(1)
+            num_accepted_tokens = self.num_accepted_tokens[:max_B]
+
+            # Coexist (spec + non-spec decode), e.g. ECHO pruned some reqs'
+            # drafts to all -1: copy the non-spec-decode metadata into static
+            # buffers so graph replay reads fresh per-step data. These tensors
+            # are only built when num_decodes > 0 and num_spec_decodes > 0.
+            if num_decodes > 0:
+                assert non_spec_decode_state_indices_tensor is not None
+                assert non_spec_decode_num_accepted_tokens is not None
+                assert non_spec_decode_query_start_loc is not None
+                assert non_spec_decode_token_indx is not None
+                # Pad columns to buffer width (runtime has fewer cols when
+                # ECHO prunes) so flatten length = num_decodes * (num_spec+1)
+                # and the recurrent kernel's colCount (= ssmTotal / B) is
+                # correct (mirrors the spec path's column padding above).
+                nsd_runtime_cols = non_spec_decode_state_indices_tensor.shape[1]
+                nsd_buf_cols = self.non_spec_decode_state_indices_tensor.shape[1]
+                if nsd_runtime_cols < nsd_buf_cols:
+                    nsd_padded = torch.full(
+                        (non_spec_decode_state_indices_tensor.shape[0], nsd_buf_cols),
+                        PAD_SLOT_ID,
+                        dtype=torch.int32,
+                        device=non_spec_decode_state_indices_tensor.device,
+                    )
+                    nsd_padded[:, :nsd_runtime_cols] = non_spec_decode_state_indices_tensor
+                    non_spec_decode_state_indices_tensor = nsd_padded
+                self.non_spec_decode_state_indices_tensor[:num_decodes].copy_(
+                    non_spec_decode_state_indices_tensor, non_blocking=True
+                )
+                non_spec_decode_state_indices_tensor = (
+                    self.non_spec_decode_state_indices_tensor[:num_decodes]
+                )
+
+                self.non_spec_decode_num_accepted_tokens[:num_decodes].copy_(
+                    non_spec_decode_num_accepted_tokens, non_blocking=True
+                )
+                non_spec_decode_num_accepted_tokens = (
+                    self.non_spec_decode_num_accepted_tokens[:batch_size]
+                )
+                non_spec_decode_num_accepted_tokens[num_decodes:].fill_(1)
+
+                self.non_spec_decode_query_start_loc[: num_decodes + 1].copy_(
+                    non_spec_decode_query_start_loc, non_blocking=True
+                )
+                nsd_num_query_tokens = non_spec_decode_query_start_loc[-1]
+                non_spec_decode_query_start_loc = (
+                    self.non_spec_decode_query_start_loc[: batch_size + 1]
+                )
+                non_spec_decode_query_start_loc[num_decodes + 1 :].fill_(
+                    nsd_num_query_tokens
+                )
+
+                self.non_spec_decode_token_indx[:num_decodes].copy_(
+                    non_spec_decode_token_indx, non_blocking=True
+                )
+                non_spec_decode_token_indx = (
+                    self.non_spec_decode_token_indx[:num_decodes]
+                )
 
         if (
             self.use_full_cuda_graph

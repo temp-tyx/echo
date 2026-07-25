@@ -18,6 +18,7 @@ from vllm.distributed.parallel_state import (
     init_model_parallel_group,
     patch_tensor_parallel_group,
 )
+from dataclasses import replace
 from vllm.forward_context import BatchDescriptor, ForwardContext, get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -590,6 +591,15 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             _, batch_descriptor = self.runner.cudagraph_dispatcher.dispatch(
                 num_tokens=num_tokens, uniform_decode=uniform_decode, has_lora=has_lora
             )
+            # ECHO: the target uses num_reqs=None (wildcard, one graph covers
+            # any bs) because its recurrent kernel pads to max_num_seqs. But the
+            # drafter's draft output shape [bs, num_spec] depends on bs, so it
+            # must capture a separate graph per bs. Override the wildcard with
+            # the actual num_reqs so the ACLGraphWrapper lazy-captures per bs.
+            if envs.VLLM_ECHO_ENABLED:
+                batch_descriptor = replace(
+                    batch_descriptor, num_reqs=common_attn_metadata.num_reqs
+                )
             num_input_tokens = batch_descriptor.num_tokens
         else:
             num_input_tokens = num_tokens
@@ -604,6 +614,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             aclgraph_runtime_mode, batch_descriptor = self.runner.cudagraph_dispatcher.dispatch(
                 num_tokens=num_input_tokens, uniform_decode=uniform_decode, has_lora=has_lora
             )
+            if envs.VLLM_ECHO_ENABLED:
+                batch_descriptor = replace(
+                    batch_descriptor, num_reqs=common_attn_metadata.num_reqs
+                )
             num_input_tokens = batch_descriptor.num_tokens
         else:
             aclgraph_runtime_mode = CUDAGraphMode.NONE
@@ -853,7 +867,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
 
             if envs.VLLM_ECHO_ENABLED:
-                draft_token_ids = self._apply_echo_pruning(draft_token_ids)
+                draft_token_ids, logits_stack = draft_token_ids
+                draft_token_ids = self._apply_echo_pruning(draft_token_ids, logits_stack)
         return draft_token_ids
 
     def _run_merged_draft(
@@ -945,7 +960,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
             # [batch_size, 1]
-            return draft_token_ids.view(-1, self.num_speculative_tokens)
+            draft = draft_token_ids.view(-1, self.num_speculative_tokens)
+            if envs.VLLM_ECHO_ENABLED:
+                return draft, torch.stack(self._echo_logits_list, dim=0)
+            return draft
 
         if self.pcp_size * self.dcp_size > 1 and is_prefill:
             draft_token_ids = logits.argmax(dim=-1)
@@ -1081,6 +1099,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = draft_token_ids_tensor.swapaxes(0, 1)
+        if envs.VLLM_ECHO_ENABLED:
+            # Return logits with the draft so graph replay carries fresh
+            # per-step logits to the eager pruning step (self._echo_logits_list
+            # is populated during capture but NOT during replay).
+            logits_stack = torch.stack(self._echo_logits_list, dim=0)  # [T, B, V]
+            return draft_token_ids, logits_stack
         return draft_token_ids
 
     def set_inputs_first_pass(
@@ -1817,13 +1841,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states.contiguous(), True)
         return last_hidden_states, positions, hidden_states
 
-    def _apply_echo_pruning(self, draft_token_ids: torch.Tensor) -> torch.Tensor:
-        if not hasattr(self, "_echo_logits_list") or not self._echo_logits_list:
-            return draft_token_ids
+    def _apply_echo_pruning(self, draft_token_ids: torch.Tensor,
+                           logits_stack: torch.Tensor | None = None) -> torch.Tensor:
+        if logits_stack is None:
+            if not hasattr(self, "_echo_logits_list") or not self._echo_logits_list:
+                return draft_token_ids
+            logits_stack = torch.stack(self._echo_logits_list, dim=0)  # [T, B, V]
 
         actual_batch_size, total_steps = draft_token_ids.shape
-        logits_stack = torch.stack(self._echo_logits_list, dim=0)  # [T, B, V]
-
         log_probs = F.log_softmax(logits_stack, dim=-1)  # [T, B, V]
         step_tokens = draft_token_ids.transpose(0, 1)  # [T, B]
 
