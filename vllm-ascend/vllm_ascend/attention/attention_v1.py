@@ -678,7 +678,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 input_layout=input_layout,
                 block_size=block_size,
                 actual_seq_lengths=actual_seq_lengths_q,
-                actual_seq_lengths_kv=attn_metadata.seq_lens_list,
+                actual_seq_lengths_kv=actual_seq_lengths_kv,
                 num_key_value_heads=self.num_kv_heads,
                 num_heads=self.num_heads,
                 sparse_mode=sparse_mode,
