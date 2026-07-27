@@ -21,7 +21,6 @@ from enum import Enum
 import torch
 import torch_npu
 import vllm.envs as envs_vllm
-from vllm_ascend import envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from vllm.utils.math_utils import cdiv
@@ -311,35 +310,6 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         # TODO: Yet another unnecessary H2D while we already have a query_start_loc on device
         query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
 
-        # ECHO: full_attention's seq_lens_list / actual_seq_lengths_q are host
-        # lists whose length == num_reqs. The captured graph pins num_reqs to
-        # K_MAX, so pad the tail with no-op entries (seq_len=0, cumsum frozen)
-        # to keep the list shape fixed across replays. FIA skips 0-len rows.
-        seq_lens_list_val = seq_lens.tolist()
-        actual_seq_lengths_q_val = query_start_loc_cpu[1:].tolist()
-        # ECHO pad only applies to the target wildcard batch
-        # (is_draft=False and num_actual_tokens == k_max). The drafter
-        # (is_draft=True; with fixed num_spec its num_actual_tokens is
-        # bs* draft_max which can also == k_max) and standard batches must not
-        # be padded. _EXTRA_CTX.is_draft_model is a dynamic proxy that crashes
-        # outside a forward context (e.g. profile/warmup), so guard it.
-        try:
-            _echo_is_draft = _EXTRA_CTX.is_draft_model
-        except Exception:
-            _echo_is_draft = False
-        if (
-            envs.VLLM_ECHO_ENABLED
-            and not _echo_is_draft
-            and num_actual_tokens == envs.VLLM_ECHO_K_MAX
-        ):
-            k_max = envs.VLLM_ECHO_K_MAX
-            if num_reqs < k_max:
-                pad_n = k_max - num_reqs
-                seq_lens_list_val = seq_lens_list_val + [0] * pad_n
-                actual_seq_lengths_q_val = (
-                    actual_seq_lengths_q_val + [actual_seq_lengths_q_val[-1]] * pad_n
-                )
-
         attn_metadata = AscendMetadata(
             num_actual_tokens=num_actual_tokens,
             num_decode_tokens=num_decode_tokens,
@@ -347,9 +317,9 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             query_start_loc=query_start_loc,
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens,
-            seq_lens_list=seq_lens_list_val,
+            seq_lens_list=seq_lens.tolist(),
             max_query_len=common_attn_metadata.max_query_len,
-            actual_seq_lengths_q=actual_seq_lengths_q_val,
+            actual_seq_lengths_q=query_start_loc_cpu[1:].tolist(),
             slot_mapping=slot_mapping,
             attn_mask=attn_mask,
             attn_state=attn_state,
@@ -500,17 +470,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 else:
                     graph_params = get_draft_graph_params()
                 attn_metadata = draft_attn_metadatas
-                attn_keys = [
-                    k for k in attn_metadata[0].keys()
-                    if hasattr(attn_metadata[0][k], "seq_lens_list")
-                ]
+                attn_keys = list(attn_metadata[0].keys())
             else:
                 graph_params = get_graph_params()
                 attn_metadata = forward_context.attn_metadata
-                attn_keys = [
-                    k for k in attn_metadata.keys()
-                    if hasattr(attn_metadata[k], "seq_lens_list")
-                ]
+                attn_keys = list(attn_metadata.keys())
             # For Qwen3-next, since the kv_cache_config has already categorized
             # linear_attn and self_attn, the attn_metadata is first arranged with
             # self_attn followed by linear_attn. Therefore, using zip directly
@@ -522,8 +486,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             if num_layers == 0:
                 return
             if _EXTRA_CTX.is_draft_model:
-                _n_steps = len(attn_metadata) if isinstance(attn_metadata, list) else 1
-                attn_keys = attn_keys * _n_steps
+                attn_keys = attn_keys * (len(graph_params.attn_params[num_tokens]) // num_layers)
             attn_count = 0
             with torch.npu.stream(update_stream):
                 for key, param, handle, event in zip(
@@ -601,15 +564,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     torch.npu.graph_task_update_end(update_stream)
 
                     event.record(update_stream)
-                # ECHO: the zip loop above only runs len(attn_keys) iterations,
-                # but the graph may have more attn_params (e.g. merged drafter
-                # FIA ops captured into the target _graph_params). Their baked
-                # event.wait (full_graph_fia capture) would time out at replay
-                # because their events are never recorded here. Record them.
-                if envs.VLLM_ECHO_ENABLED:
-                    _extra = graph_params.events[num_tokens][len(attn_keys):]
-                    for _ev in _extra:
-                        _ev.record(update_stream)
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         super().process_weights_after_loading(act_dtype)
@@ -722,6 +676,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         else:
             attn_params = attn_params + (None, None, None, None)  # type: ignore
         graph_params.attn_params[num_tokens].append(attn_params)
+
         torch.npu.graph_task_group_begin(stream)
         torch_npu.npu_fused_infer_attention_score.out(
             query=query,

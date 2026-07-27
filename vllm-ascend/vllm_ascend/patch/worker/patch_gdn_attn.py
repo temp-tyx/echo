@@ -402,7 +402,7 @@ def _build_spec_sequence_masks_cpu(builder, num_decode_draft_tokens_cpu: torch.T
     if (
         not getattr(builder, "use_spec_decode", False)
         or num_decode_draft_tokens_cpu is None
-        or not (num_decode_draft_tokens_cpu >= 0).any()
+        or num_decode_draft_tokens_cpu[num_decode_draft_tokens_cpu >= 0].sum().item() == 0
     ):
         return None
     return num_decode_draft_tokens_cpu >= 0

@@ -68,7 +68,6 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
-    DraftTokenIds,
     ECConnectorOutput,
     LogprobsLists,
     LogprobsTensors,
@@ -580,37 +579,6 @@ class NPUModelRunner(GPUModelRunner):
         """
         # TODO: need refactor later, related to vllm PR #34043 this pr delete func
         # relax_for_mixed_batch_cudagraphs, num_reqs no longer equals the actual number of requests.
-        if envs.VLLM_ECHO_ENABLED:
-            k_max = envs.VLLM_ECHO_K_MAX
-        if (
-                envs.VLLM_ECHO_ENABLED
-                and cudagraph_runtime_mode == CUDAGraphMode.FULL
-                and num_tokens_padded == k_max
-        ):
-            # ECHO wildcard branch: only the ECHO wildcard batch has
-            # num_tokens == K_MAX. Standard uniform/mixed captures have
-            # num_tokens >> K_MAX and must fall through to normal padding,
-            # otherwise num_reqs_padded is shrunk to K_MAX while the query
-            # tensor stays at the real num_tokens -> TND check
-            # (queryT == actual_seq_lengths_q[-1]) fails. Gating on
-            # num_tokens_padded == K_MAX avoids relying on batch_desc.num_reqs
-            # (which can be None for non-ECHO uniform batches too).
-            num_reqs_padded = k_max
-            last_loc = int(self.query_start_loc.np[num_reqs])
-            self.query_start_loc.np[num_reqs + 1: num_reqs_padded + 1] = last_loc
-            # The query tensor is padded to num_tokens_padded (= k_max), but the
-            # real reqs may carry fewer tokens (e.g. a decode step with bs=1 has
-            # 2 real tokens, 6 padding). The frozen dummies above leave the last
-            # entry at last_loc (< num_tokens_padded), which breaks the TND
-            # invariant (queryT == actual_seq_lengths_q[-1]). Put the padding
-            # tokens into the last dummy so asq_last == num_tokens_padded.
-            self.query_start_loc.np[num_reqs_padded] = num_tokens_padded
-            self.query_start_loc.copy_to_gpu()
-            if self._has_gdn:
-                self.gdn_query_start_loc.np[num_reqs + 1: num_reqs_padded + 1] = last_loc
-                self.gdn_query_start_loc.np[num_reqs_padded] = num_tokens_padded
-                self.gdn_query_start_loc.copy_to_gpu()
-            return num_reqs_padded
         if cudagraph_runtime_mode == CUDAGraphMode.FULL and \
             self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL:
             num_reqs_padded = num_reqs
@@ -1749,10 +1717,13 @@ class NPUModelRunner(GPUModelRunner):
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 )
 
-                logger.info(
-                    "[ECHO] dispatch: mode=%s tokens_padded=%s num_reqs=%s/%s",
-                    cudagraph_mode, batch_desc.num_tokens,
-                    num_reqs, batch_desc.num_reqs,
+                logger.debug(
+                    "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
+                    "should_ubatch: %s, num_tokens_across_dp: %s",
+                    cudagraph_mode,
+                    batch_desc,
+                    should_ubatch,
+                    num_tokens_across_dp,
                 )
 
                 num_tokens_padded = batch_desc.num_tokens
@@ -3720,8 +3691,8 @@ class NPUModelRunner(GPUModelRunner):
             max_num_blocks_per_req = cdiv(max_model_len, block_sizes[i] * get_total_cp_world_size())
             if isinstance(kv_cache_group.kv_cache_spec, MambaSpec):
                 mamba_blocks_per_req = (
-                                           max_num_blocks_per_req if self.cache_config.enable_prefix_caching else 1
-                                       ) + kv_cache_group.kv_cache_spec.num_speculative_blocks
+                    max_num_blocks_per_req if self.cache_config.enable_prefix_caching else 1
+                ) + kv_cache_group.kv_cache_spec.num_speculative_blocks
 
                 max_num_blocks_per_req = max(max_num_blocks_per_req, mamba_blocks_per_req)
             max_num_blocks.append(max_num_blocks_per_req)

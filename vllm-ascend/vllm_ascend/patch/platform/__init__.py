@@ -34,10 +34,8 @@ import vllm_ascend.patch.platform.patch_tool_choice_none_content  # noqa
 
 if envs.VLLM_ECHO_ENABLED:
     from vllm_ascend.patch.platform.patch_echo_async import apply_patch as _apply_echo_async_patch
-    from vllm_ascend.patch.platform.patch_echo_cudagraph import apply_patch as _apply_echo_cudagraph_patch
 
     _apply_echo_async_patch()
-    _apply_echo_cudagraph_patch()
 
 if os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1") or os.getenv("EXPERT_MAP_RECORD", "false") == "true":
     import vllm_ascend.patch.platform.patch_multiproc_executor  # noqa

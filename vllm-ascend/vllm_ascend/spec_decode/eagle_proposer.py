@@ -48,7 +48,6 @@ from vllm_ascend.compilation.acl_graph import ACLGraphWrapper, update_full_graph
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 from vllm_ascend.utils import enable_sp, lmhead_tp_enable, shared_expert_dp_enabled, vllm_version_is
-from vllm_ascend import envs
 
 if not vllm_version_is("0.19.1"):
     from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
@@ -97,6 +96,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device, pass_hidden_states_to_model: bool, runner=None):
         super().__init__(vllm_config, device, pass_hidden_states_to_model, runner=runner)
+
         # Assign runner before it's used in the methods below
         self.runner = runner
 
