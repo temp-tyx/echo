@@ -17,19 +17,13 @@ from dataclasses import dataclass
 
 import torch
 import vllm.v1.attention.backends.gdn_attn as gdn_attn
-from vllm.v1.attention.backends.utils import PAD_SLOT_ID
-from vllm.logger import init_logger
 
-from vllm_ascend import envs
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.triton.gdn_chunk_meta import (
     _build_seq_lens,
     _validate_cu_seqlens,
     build_chunk_meta_device,
 )
 from vllm_ascend.utils import is_310p
-
-logger = init_logger(__name__)
 
 _GDN_CHUNK_SIZE = 64
 # Keep this aligned with solve_tril.LARGE_BLOCK_T in ops/triton/fla/solve_tril.py.
@@ -574,50 +568,6 @@ def _patched_build(
         fast_build=fast_build,
     )
     attn_metadata.non_spec_prefill_fallback_meta = None
-
-    # ECHO: the FULL graph is captured with a wildcard descriptor whose
-    # num_tokens is pinned to K_MAX, so the captured spec_state_indices
-    # buffer has K_MAX rows. At runtime ECHO prunes drafts so num_spec_decodes
-    # (= bs) can be smaller than K_MAX. The original graph_path1 slices the
-    # buffer to [:num_spec_decodes], which would shrink the tensor shape on
-    # replay and break the captured graph. Pad the tail rows with PAD_SLOT_ID
-    # and expose a fixed [:K_MAX] view instead; device-side query_start_loc /
-    # num_accepted_tokens already carry the real per-request boundaries, so
-    # kernels skip the padded rows naturally.
-    # Gate on num_actual_tokens == k_max AND not is_draft so this only applies
-    # to the ECHO target wildcard batch; the drafter (is_draft=True, and its
-    # num_actual_tokens can also == k_max) and standard batches are not padded
-    # (avoids 0-length dummy reqs breaking GDN recurrent). Guard the dynamic
-    # _EXTRA_CTX proxy for contexts without a forward_context.
-    try:
-        _echo_is_draft = _EXTRA_CTX.is_draft_model
-    except Exception:
-        _echo_is_draft = False
-    if (
-        envs.VLLM_ECHO_ENABLED
-        and self.use_full_cuda_graph
-        and attn_metadata.num_prefills == 0
-        and attn_metadata.num_decodes == 0
-        and attn_metadata.num_spec_decodes > 0
-        and attn_metadata.spec_state_indices_tensor is not None
-        and not _echo_is_draft
-        and attn_metadata.num_actual_tokens == envs.VLLM_ECHO_K_MAX
-    ):
-        k_max = envs.VLLM_ECHO_K_MAX
-        nsd = attn_metadata.num_spec_decodes
-        # Pin num_spec_decodes to K_MAX so GDN forward's host slices
-        # (conv_state_indices[:nsd], cu_seqlens[:nsd+1], ...) use a fixed
-        # [:K_MAX] shape inside the captured graph. Padded rows are
-        # PAD_SLOT_ID / 0-len and skipped by conv1d / recurrent kernels.
-        attn_metadata.num_spec_decodes = k_max
-        if nsd < k_max:
-            self.spec_state_indices_tensor[nsd:k_max].fill_(PAD_SLOT_ID)
-            attn_metadata.spec_state_indices_tensor = (
-                self.spec_state_indices_tensor[:k_max]
-            )
-        # num_accepted_tokens tail also needs a valid fixed value; the
-        # original graph_path1 already pads [:batch_size] with 1, and
-        # batch_size == num_actual_tokens == K_MAX for ECHO, so it is covered.
 
     # When spec_sequence_masks is None (no spec decodes at all — e.g. ECHO
     # pruned every req to 0 drafts AND reqs are in prefill state so
