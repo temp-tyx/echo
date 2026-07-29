@@ -507,9 +507,7 @@ def _build_non_spec_causal_conv1d_host_meta(
         slot = _acquire_causal_conv1d_host_slot(builder)
 
     cache_indices_cpu = _copy_to_pinned_cpu(
-        attn_metadata.non_spec_state_indices_tensor[:, 0]
-        if attn_metadata.non_spec_state_indices_tensor.dim() > 1
-        else attn_metadata.non_spec_state_indices_tensor,
+        attn_metadata.non_spec_state_indices_tensor,
         None if slot is None else slot.cache_indices_cpu,
     )
     has_initial_state_cpu = _copy_to_pinned_cpu(
@@ -568,23 +566,6 @@ def _patched_build(
         fast_build=fast_build,
     )
     attn_metadata.non_spec_prefill_fallback_meta = None
-
-    # When spec_sequence_masks is None (no spec decodes at all — e.g. ECHO
-    # pruned every req to 0 drafts AND reqs are in prefill state so
-    # num_decode_draft_tokens = -1), the upstream build sets
-    # non_spec_num_accepted_tokens = None. But if num_decodes > 0, the
-    # non-spec decode conv1d + recurrent blocks need it. Set it to a
-    # tensor of 1s (each decode req accepts exactly 1 token).
-    if (
-        attn_metadata.spec_sequence_masks is None
-        and attn_metadata.non_spec_num_accepted_tokens is None
-        and attn_metadata.num_decodes > 0
-    ):
-        device = common_attn_metadata.query_start_loc.device
-        attn_metadata.non_spec_num_accepted_tokens = torch.ones(
-            attn_metadata.num_decodes, dtype=torch.int32, device=device,
-        )
-
     if attn_metadata.num_prefills <= 0:
         return attn_metadata
 
