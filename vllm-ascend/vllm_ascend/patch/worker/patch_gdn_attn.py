@@ -507,9 +507,7 @@ def _build_non_spec_causal_conv1d_host_meta(
         slot = _acquire_causal_conv1d_host_slot(builder)
 
     cache_indices_cpu = _copy_to_pinned_cpu(
-        attn_metadata.non_spec_state_indices_tensor[:, 0]
-        if attn_metadata.non_spec_state_indices_tensor.dim() > 1
-        else attn_metadata.non_spec_state_indices_tensor,
+        attn_metadata.non_spec_state_indices_tensor,
         None if slot is None else slot.cache_indices_cpu,
     )
     has_initial_state_cpu = _copy_to_pinned_cpu(

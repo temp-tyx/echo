@@ -1,0 +1,2354 @@
+diff --git a/docs/features/speculative_decoding/dynamic_speculative_decoding.md b/docs/features/speculative_decoding/dynamic_speculative_decoding.md
+index 682eaafd29d8..70d2871b5022 100644
+--- a/docs/features/speculative_decoding/dynamic_speculative_decoding.md
++++ b/docs/features/speculative_decoding/dynamic_speculative_decoding.md
+@@ -11,7 +11,9 @@ SD methods need to verify K tokens for each sequence during decoding. As BS incr
+ 
+ ## `--speculative-config` schema
+ 
+-To use Dynamic SD, add `num_speculative_tokens_per_batch_size` to the config of an SD method which is a list of list. Here, an entry is `[start_bs, end_bs, optimal_K]` which means when the concurrency is within range `[start_bs, end_bs]` then `optimal_K` number of draft tokens are used. For e.g.,
++To use Dynamic SD, add `num_speculative_tokens_per_batch_size` to the config of an SD method which is a list of list. Here, an entry is `[start_bs, end_bs, optimal_K]` which means when the concurrency is within range `[start_bs, end_bs]` then `optimal_K` number of draft tokens are used.
++
++Every `optimal_K` must be less than or equal to `num_speculative_tokens`, which defines the maximum draft window.
+ 
+ ```bash
+ --speculative-config '{
+@@ -32,8 +34,37 @@ implies that:
+ * K=1 will be used when the concurrency is in range [65, 128]
+ * K=0 will be used when the concurrency is in range [129, 512], i.e., no draft tokens will be produced.
+ 
++## Adaptive verification
++
++Adaptive verification is supported with the Model Runner V2 DSpark implementation. Enable it by setting `adaptive_verification` to `true` in the speculative config.
++
++In this mode, `num_speculative_tokens` is the maximum per-request draft length. The drafter returns `num_speculative_tokens` tokens per request, and the scheduler behaves like ordinary fixed-length speculative decoding, including reserving KV-cache capacity for that full window. The worker uses `num_speculative_tokens_per_batch_size` as a cost model. For `N` decode requests, it selects a total verification budget of `N * optimal_K` and distributes that budget across draft prefixes using the DSpark confidence head. Only the allocated draft positions, plus one bonus position per request, run through the target model. Batches containing prefills use the largest-batch schedule entry as a conservative fixed-K fallback.
++
+ ## Online Examples
+ 
++### Adaptive Dynamic SD with DSpark
++
++```bash
++vllm serve Qwen/Qwen3-4B-FP8 \
++  --trust-remote-code \
++  --max-model-len 4096 \
++  --attention-backend FLASH_ATTN \
++  --speculative-config '{
++    "method": "dspark",
++    "model": "deepseek-ai/dspark_qwen3_4b_block7",
++    "num_speculative_tokens": 11,
++    "num_speculative_tokens_per_batch_size": [
++      [1, 32, 7],
++      [33, 128, 5],
++      [129, 512, 3]
++    ],
++    "adaptive_verification": true,
++    "draft_sample_method": "probabilistic"
++  }'
++```
++
++Here the drafter produces 11 draft tokens for each request, but uses a different total verification budget depending on the batch size.
++
+ ### Dynamic SD Eagle Drafter
+ 
+ ```bash
+@@ -57,7 +88,7 @@ VLLM_USE_V2_MODEL_RUNNER=0 vllm serve meta-llama/Llama-3.1-8B-Instruct \
+   --speculative-config '{
+     "method": "eagle3",
+     "model": "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B",
+-    "num_speculative_tokens": 3,
++    "num_speculative_tokens": 5,
+     "num_speculative_tokens_per_batch_size": [
+       [1, 16, 5],
+       [17, 32, 4],
+@@ -73,4 +104,4 @@ VLLM_USE_V2_MODEL_RUNNER=0 vllm serve meta-llama/Llama-3.1-8B-Instruct \
+ 
+ * Tested with Eagle, Eagle-3, and DFlash. Other SD methods may or may not work out of the box
+ * Full Cudagraph only works with Model Runner V2. MRv1 only supports piece-wise cuda graph with this feature
+-* Not compatible with data parallelism (`--data-parallel-size > 1`). Each DP rank schedules independently, so ranks can pick different K values, causing DP collective divergence and deadlocks. When DP is enabled, vLLM automatically disables `num_speculative_tokens_per_batch_size` and falls back to the static `num_speculative_tokens` value.
++* Dynamic SD is not compatible with data parallelism (`--data-parallel-size > 1`). vLLM disables its batch-size schedule and falls back to `num_speculative_tokens`. Adaptive verification instead requires DP, DCP, and PP sizes of one.
+diff --git a/tests/kernels/attention/test_attention_selector.py b/tests/kernels/attention/test_attention_selector.py
+index 1e85f76b64c3..8723bf60f892 100644
+--- a/tests/kernels/attention/test_attention_selector.py
++++ b/tests/kernels/attention/test_attention_selector.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++from types import SimpleNamespace
+ from unittest.mock import patch
+ 
+ import pytest
+@@ -35,6 +36,33 @@ def clear_cache():
+     _cached_get_attn_backend.cache_clear()
+ 
+ 
++def test_adaptive_verification_requires_device_query_lengths_for_target(monkeypatch):
++    from vllm.compilation.backends import set_model_tag
++    from vllm.v1.attention import selector
++
++    vllm_config = SimpleNamespace(
++        cache_config=None,
++        kv_transfer_config=None,
++        speculative_config=SimpleNamespace(adaptive_verification=True),
++        attention_config=SimpleNamespace(backend=None, use_non_causal=False),
++    )
++    monkeypatch.setattr("vllm.config.get_current_vllm_config", lambda: vllm_config)
++
++    selector_configs = []
++
++    def capture_selector_config(*, backend, attn_selector_config, num_heads):
++        selector_configs.append(attn_selector_config)
++
++    monkeypatch.setattr(selector, "_cached_get_attn_backend", capture_selector_config)
++
++    selector.get_attn_backend(16, torch.float16, None)
++    with set_model_tag("dspark_head"):
++        selector.get_attn_backend(16, torch.float16, None)
++
++    assert selector_configs[0].requires_device_query_lengths
++    assert not selector_configs[1].requires_device_query_lengths
++
++
+ # Define MLA and non-MLA backends separately
+ DEVICE_MLA_BACKENDS = {
+     "cuda": [
+diff --git a/tests/v1/core/test_scheduler.py b/tests/v1/core/test_scheduler.py
+index 157170400b0d..f72c8c9f5311 100644
+--- a/tests/v1/core/test_scheduler.py
++++ b/tests/v1/core/test_scheduler.py
+@@ -1040,21 +1040,87 @@ def test_reset_connector_cache_no_connector_is_no_op_success():
+ 
+ # Note - these test cases mirror some of those in test_rejection_sampler.py
+ @pytest.mark.parametrize(
+-    "spec_tokens,output_tokens,expected",
++    (
++        "spec_tokens,output_tokens,actual_num_draft_tokens,"
++        "invalid_spec_tokens_per_req,missing_req_indices,expected"
++    ),
+     [
+-        ([[1, 2, 3]], [[1, 2, 3, 4]], (1, 3, 3, [1, 1, 1])),  # perfect match
+-        ([[1, 2, 3]], [[1, 5]], (1, 3, 1, [1, 0, 0])),  # early mismatch
+-        ([[1, 2], [3]], [[1, 2, 5], [3, 4]], (2, 3, 3, [2, 1])),  # multiple sequences
+-        ([[1]], [[1, 2]], (1, 1, 1, [1])),  # single token sequence
+-        ([[]], [[5]], (0, 0, 0, [0])),  # empty sequence
++        (
++            [[1, 2, 3]],
++            [[1, 2, 3, 4]],
++            None,
++            None,
++            None,
++            (1, 3, 3, [1, 1, 1]),
++        ),  # perfect match
++        (
++            [[1, 2, 3]],
++            [[1, 5]],
++            None,
++            None,
++            None,
++            (1, 3, 1, [1, 0, 0]),
++        ),  # early mismatch
++        (
++            [[1, 2], [3]],
++            [[1, 2, 5], [3, 4]],
++            None,
++            None,
++            None,
++            (2, 3, 3, [2, 1]),
++        ),  # multiple sequences
++        ([[1]], [[1, 2]], None, None, None, (1, 1, 1, [1])),  # single token
++        ([[]], [[5]], None, None, None, (0, 0, 0, [0])),  # empty sequence
+         (
+             [[1, 2, 3], [4, 5, 6]],
+             [[1, 2, 7], [4, 8]],
++            None,
++            None,
++            None,
+             (2, 6, 3, [2, 1, 0]),
+         ),  # multiple mismatches
++        (
++            [list(range(7)), list(range(7)), list(range(7))],
++            [[10], [10], [10]],
++            [7, 0, 6],
++            None,
++            None,
++            (3, 13, 0, [0] * 7),
++        ),  # adaptive allocation including zero
++        (
++            [[-1] * 7] * 3,
++            [[10], [10], [10]],
++            [7, 0, 6],
++            None,
++            None,
++            (3, 13, 0, [0] * 7),
++        ),  # GPU-only adaptive draft placeholders
++        (
++            [[0, 1, 2, 3, 4, -1, -1]] * 3,
++            [[10], [10], [10]],
++            [3, 6, 0],
++            [2, 2, 2],
++            None,
++            (3, 8, 0, [0] * 7),
++        ),  # adaptive allocation with invalid suffixes
++        (
++            [[-1] * 7] * 3,
++            [[10], [10], [10]],
++            [1, 7, 7],
++            None,
++            [0],
++            (3, 15, 0, [0] * 7),
++        ),  # completed async request still counts
+     ],
+ )
+-def test_schedule_spec_decoding_stats(spec_tokens, output_tokens, expected):
++def test_schedule_spec_decoding_stats(
++    spec_tokens,
++    output_tokens,
++    actual_num_draft_tokens,
++    invalid_spec_tokens_per_req,
++    missing_req_indices,
++    expected,
++):
+     """Test scheduling behavior with speculative decoding.
+ 
+     This test verifies that:
+@@ -1122,6 +1188,8 @@ def test_schedule_spec_decoding_stats(spec_tokens, output_tokens, expected):
+             )
+         else:
+             assert req_id not in output.scheduled_spec_decode_tokens
++    if invalid_spec_tokens_per_req is not None:
++        output.num_invalid_spec_tokens = dict(zip(req_ids, invalid_spec_tokens_per_req))
+ 
+     model_runner_output = ModelRunnerOutput(
+         req_ids=req_ids,
+@@ -1130,7 +1198,11 @@ def test_schedule_spec_decoding_stats(spec_tokens, output_tokens, expected):
+         logprobs=None,
+         prompt_logprobs_dict={},
+         pooler_output=[],
++        num_draft_tokens=actual_num_draft_tokens,
+     )
++    if missing_req_indices is not None:
++        for req_index in missing_req_indices:
++            del scheduler.requests[req_ids[req_index]]
+     engine_core_outputs = scheduler.update_from_output(output, model_runner_output)
+ 
+     scheduler_stats = (
+diff --git a/tests/v1/e2e/spec_decode/test_spec_decode.py b/tests/v1/e2e/spec_decode/test_spec_decode.py
+index 96d6684594cc..e5b86ba5f2bb 100644
+--- a/tests/v1/e2e/spec_decode/test_spec_decode.py
++++ b/tests/v1/e2e/spec_decode/test_spec_decode.py
+@@ -1434,11 +1434,27 @@ def dspark_config():
+             "attention_backend": "FLASH_ATTN",
+             "draft_sample_method": "probabilistic",
+         },
++        gpu_memory_utilization=0.8,
+         max_model_len=4096,
+         disable_log_stats=False,
+     )
+ 
+ 
++@pytest.fixture
++def dspark_adaptive_config(dspark_config):
++    speculative_config = dspark_config["speculative_config"] | {
++        "num_speculative_tokens": 7,
++        "num_speculative_tokens_per_batch_size": [(1, 1024, 5)],
++        "adaptive_verification": True,
++    }
++    speculative_config.pop("attention_backend")
++    return dspark_config | {
++        "attention_backend": "FLASH_ATTN",
++        "speculative_config": speculative_config,
++        "max_num_seqs": 1024,
++    }
++
++
+ @single_gpu_only
+ @large_gpu_mark(min_gb=24)
+ def test_dspark_correctness_and_acceptance_rate(dspark_config):
+@@ -1471,8 +1487,43 @@ def test_dspark_correctness_and_acceptance_rate(dspark_config):
+         f"gsm8k_accuracy={gsm8k_accuracy:.3f}"
+     )
+ 
+-    assert acceptance_rate >= 0.428 * 0.9
+-    assert acceptance_len >= 3.994 * 0.9
++    assert acceptance_rate >= 0.428 * 0.95
++    assert acceptance_len >= 3.994 * 0.95
++    assert gsm8k_accuracy >= 0.801 * 0.9
++
++    del spec_llm
++    torch.accelerator.empty_cache()
++    cleanup_dist_env_and_memory()
++
++
++@single_gpu_only
++@large_gpu_mark(min_gb=24)
++def test_dspark_adaptive_correctness_and_acceptance_length(dspark_adaptive_config):
++    """Check adaptive verification quality with a larger draft window.
++    The drafter produces up to 7 candidates per request, while the target verifies an
++    average budget of 5 draft tokens per request.
++    """
++    spec_llm = LLM(**dspark_adaptive_config)
++
++    results = evaluate_gsm8k_offline(spec_llm, temperature=1.0)
++    gsm8k_accuracy = results["accuracy"]
++    metrics = spec_llm.get_metrics()
++    acceptance_len = compute_acceptance_len(metrics)
++
++    # Check the actual low-level stats to ensure we're not over- or under-allocating.
++    name2metric = {metric.name: metric for metric in metrics}
++    num_drafts = name2metric["vllm:spec_decode_num_drafts"].value
++    num_draft_tokens = name2metric["vllm:spec_decode_num_draft_tokens"].value
++
++    print(
++        f"Adaptive DSpark acceptance_len={acceptance_len:.2f}, "
++        f"gsm8k_accuracy={gsm8k_accuracy:.3f}"
++    )
++
++    assert num_drafts > 0
++    assert num_draft_tokens < num_drafts * 7
++    assert 0.99 * (num_drafts * 5) <= num_draft_tokens <= 1.01 * (num_drafts * 5)
++    assert acceptance_len >= 3.62 * 0.95  # Measured on non-adaptive K=5 baseline
+     assert gsm8k_accuracy >= 0.801 * 0.9
+ 
+     del spec_llm
+diff --git a/tests/v1/spec_decode/test_dynamic_sd.py b/tests/v1/spec_decode/test_dynamic_sd.py
+index 8d46b241c628..09e35fe12bf0 100644
+--- a/tests/v1/spec_decode/test_dynamic_sd.py
++++ b/tests/v1/spec_decode/test_dynamic_sd.py
+@@ -3,11 +3,15 @@
+ """Regression tests for the Dynamic SD batch-size schedule helpers."""
+ 
+ import logging
++from unittest.mock import Mock
+ 
++import numpy as np
+ import pytest
+ 
+ from tests.v1.core.utils import create_requests, create_scheduler
++from vllm.v1.core.sched.output import SchedulerOutput
+ from vllm.v1.core.sched.scheduler import Scheduler
++from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+ from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
+ from vllm.v1.structured_output import StructuredOutputManager
+ 
+@@ -31,6 +35,7 @@ def _make_scheduler_with_dynamic_sd(
+     max_num_seqs: int = 16,
+     max_num_batched_tokens: int = 8192,
+     runtime_num_speculative_tokens: int = 3,
++    adaptive_verification: bool = False,
+ ) -> Scheduler:
+     base_scheduler = create_scheduler(
+         max_num_seqs=max_num_seqs,
+@@ -41,6 +46,7 @@ def _make_scheduler_with_dynamic_sd(
+     speculative_config = base_scheduler.vllm_config.speculative_config
+     assert speculative_config is not None
+     speculative_config.num_speculative_tokens_per_batch_size = schedule
++    speculative_config.adaptive_verification = adaptive_verification
+ 
+     return Scheduler(
+         vllm_config=base_scheduler.vllm_config,
+@@ -164,6 +170,21 @@ def test_scheduler_uses_dsd_k_based_on_number_of_scheduled_requests():
+         assert output.num_spec_tokens_to_schedule == expected_k
+ 
+ 
++def test_v2_scheduler_selects_dynamic_sd_k():
++    scheduler = _make_scheduler_with_dynamic_sd(
++        [(1, 1, 4), (2, 2, 2)],
++        max_num_seqs=2,
++        max_num_batched_tokens=20,
++        runtime_num_speculative_tokens=4,
++    )
++    scheduler.use_v2_model_runner = True
++
++    output = _add_requests_and_schedule(scheduler, 2)
++
++    assert len(output.num_scheduled_tokens) == 2
++    assert output.num_spec_tokens_to_schedule == 2
++
++
+ def test_scheduler_clamps_dsd_k_to_runtime_num_speculative_tokens():
+     scheduler = _make_scheduler_with_dynamic_sd(
+         [(1, 256, 5)],
+@@ -177,6 +198,167 @@ def test_scheduler_clamps_dsd_k_to_runtime_num_speculative_tokens():
+     assert output.num_spec_tokens_to_schedule == 3
+ 
+ 
++@pytest.mark.parametrize("optimal_k", [0, 2])
++def test_adaptive_scheduler_ignores_dynamic_schedule_for_mixed_batch(optimal_k: int):
++    scheduler = _make_scheduler_with_dynamic_sd(
++        [(1, 2, optimal_k)],
++        max_num_seqs=2,
++        max_num_batched_tokens=32,
++        runtime_num_speculative_tokens=4,
++        adaptive_verification=True,
++    )
++    decode_req, prefill_req = create_requests(num_requests=2, num_tokens=1)
++    scheduler.add_request(decode_req)
++    prefill_output = scheduler.schedule()
++    scheduler.update_from_output(
++        prefill_output,
++        ModelRunnerOutput(
++            req_ids=[decode_req.request_id],
++            req_id_to_index={decode_req.request_id: 0},
++            sampled_token_ids=[[0]],
++            logprobs=None,
++            prompt_logprobs_dict={},
++            pooler_output=[],
++        ),
++    )
++    scheduler.update_draft_token_ids(
++        DraftTokenIds([decode_req.request_id], [[10, 11, 12, 13]])
++    )
++
++    scheduler.add_request(prefill_req)
++    output = scheduler.schedule()
++
++    assert scheduler.dynamic_sd_lookup is None
++    assert output.scheduled_spec_decode_tokens == {
++        decode_req.request_id: [10, 11, 12, 13],
++        prefill_req.request_id: [-1, -1, -1, -1],
++    }
++    assert output.num_scheduled_tokens == {
++        decode_req.request_id: 5,
++        prefill_req.request_id: 5,
++    }
++    assert output.total_num_scheduled_tokens == 10
++    assert output.num_spec_tokens_to_schedule == 4
++
++
++def test_adaptive_scheduler_uses_fixed_k_max():
++    scheduler = _make_scheduler_with_dynamic_sd(
++        [(1, 2, 2)],
++        max_num_seqs=2,
++        max_num_batched_tokens=32,
++        runtime_num_speculative_tokens=4,
++        adaptive_verification=True,
++    )
++    requests = create_requests(num_requests=2, num_tokens=1)
++    for request in requests:
++        scheduler.add_request(request)
++    prefill_output = scheduler.schedule()
++    scheduler.update_from_output(
++        prefill_output,
++        ModelRunnerOutput(
++            req_ids=[request.request_id for request in requests],
++            req_id_to_index={
++                request.request_id: i for i, request in enumerate(requests)
++            },
++            sampled_token_ids=[[0], [0]],
++            logprobs=None,
++            prompt_logprobs_dict={},
++            pooler_output=[],
++        ),
++    )
++    scheduler.update_draft_token_ids(
++        DraftTokenIds(
++            [request.request_id for request in requests],
++            [[10, 11, 12, 13], [20, 21, 22, 23]],
++        )
++    )
++
++    output = scheduler.schedule()
++
++    assert output.scheduled_spec_decode_tokens == {
++        requests[0].request_id: [10, 11, 12, 13],
++        requests[1].request_id: [20, 21, 22, 23],
++    }
++    assert output.num_scheduled_tokens == {
++        requests[0].request_id: 5,
++        requests[1].request_id: 5,
++    }
++    assert output.total_num_scheduled_tokens == 10
++    assert output.num_spec_tokens_to_schedule == 4
++
++
++def test_scheduler_uses_valid_structured_output_draft_prefix():
++    scheduler = create_scheduler(
++        num_speculative_tokens=4,
++        use_v2_model_runner=True,
++    )
++    request = create_requests(num_requests=1, num_tokens=1)[0]
++    scheduler.add_request(request)
++    prefill_output = scheduler.schedule()
++    scheduler.update_from_output(
++        prefill_output,
++        ModelRunnerOutput(
++            req_ids=[request.request_id],
++            req_id_to_index={request.request_id: 0},
++            sampled_token_ids=[[0]],
++            logprobs=None,
++            prompt_logprobs_dict={},
++            pooler_output=[],
++        ),
++    )
++
++    grammar = Mock()
++    grammar.validate_tokens.return_value = [10, 11, 12]
++    request.structured_output_request = Mock(grammar=grammar)
++    scheduler.update_draft_token_ids(
++        DraftTokenIds(
++            [request.request_id],
++            [[10, 11, 12, 13]],
++        )
++    )
++
++    expected_spec_token_ids = [10, 11, 12]
++    assert request.spec_token_ids == expected_spec_token_ids
++    grammar.validate_tokens.assert_called_once_with([10, 11, 12, 13])
++
++    output = scheduler.schedule()
++    assert (
++        output.scheduled_spec_decode_tokens[request.request_id]
++        == expected_spec_token_ids
++    )
++
++    bitmask = np.zeros((len(expected_spec_token_ids) + 1, 1), dtype=np.int32)
++    scheduler.structured_output_manager.grammar_bitmask = Mock(return_value=bitmask)
++    grammar_output = scheduler.get_grammar_bitmask(output)
++
++    assert grammar_output is not None
++    assert grammar_output.grammar_bitmask is bitmask
++    assert scheduler.structured_output_manager.grammar_bitmask.call_args.args[2] == {
++        request.request_id: expected_spec_token_ids
++    }
++
++
++def test_async_scheduler_output_keeps_full_draft_window_for_grammar_masks():
++    scheduler = create_scheduler(
++        num_speculative_tokens=4,
++        use_v2_model_runner=True,
++    )
++    request = create_requests(num_requests=1, num_tokens=1)[0]
++    grammar = Mock()
++    grammar.validate_tokens.return_value = [10, 11, 12]
++    request.structured_output_request = Mock(grammar=grammar)
++    scheduler.requests[request.request_id] = request
++
++    output = SchedulerOutput.make_empty()
++    output.scheduled_spec_decode_tokens = {request.request_id: [-1, -1, -1, -1]}
++    scheduler.update_draft_token_ids_in_output(
++        DraftTokenIds([request.request_id], [[10, 11, 12, 13]]),
++        output,
++    )
++
++    assert output.scheduled_spec_decode_tokens == {request.request_id: [10, 11, 12, -1]}
++
++
+ def test_scheduler_falls_back_to_static_k_when_dsd_not_configured():
+     scheduler = create_scheduler(
+         max_num_seqs=4,
+diff --git a/tests/v1/spec_decode/test_dynamic_sd_cug.py b/tests/v1/spec_decode/test_dynamic_sd_cug.py
+index d75495ea606a..c671f7716885 100644
+--- a/tests/v1/spec_decode/test_dynamic_sd_cug.py
++++ b/tests/v1/spec_decode/test_dynamic_sd_cug.py
+@@ -15,9 +15,67 @@
+     SchedulerConfig,
+     VllmConfig,
+ )
++from vllm.v1.spec_decode.dynamic.drafting_manager import DynamicSDDraftingManager
+ from vllm.v1.worker.gpu import cudagraph_utils as gpu_cudagraph_utils
+ 
+-pytestmark = pytest.mark.cpu_test
++
++@pytest.fixture(autouse=True)
++def _mock_cudagraph_runtime(monkeypatch):
++    monkeypatch.setattr(
++        gpu_cudagraph_utils.current_platform,
++        "get_global_graph_pool",
++        lambda: None,
++    )
++
++
++def test_adaptive_drafting_manager_builds_worker_ordered_mixed_layout():
++    device = torch.device("cuda")
++    req_states = SimpleNamespace(
++        req_id_to_index={"decode": 0, "prefill": 1},
++        num_computed_prefill_tokens=[1, 0],
++        prefill_len=SimpleNamespace(np=[1, 1]),
++    )
++    speculator = MagicMock()
++    drafting_manager = DynamicSDDraftingManager(
++        [(1, 2, 2), (3, 3, 1)],
++        max_num_reqs=3,
++        max_num_spec_tokens=4,
++        device=device,
++        req_states=req_states,
++        speculator=speculator,
++    )
++    scheduler_output = SimpleNamespace(
++        num_scheduled_tokens={"decode": 5, "prefill": 4},
++        scheduled_spec_decode_tokens={"decode": [1, 2, 3, 4]},
++        total_num_scheduled_tokens=9,
++    )
++    num_tokens, draft_token_budget = drafting_manager.plan_batch(scheduler_output)
++    assert (num_tokens, draft_token_budget) == (6, 1)
++
++    speculator.allocate_draft_token_budget.return_value = torch.tensor(
++        [0, 1], dtype=torch.int32, device=device
++    )
++    query_start_loc = torch.empty(4, dtype=torch.int32, device=device)
++
++    num_draft_tokens, cu_num_logits, query_start_loc_np = (
++        drafting_manager.prepare_verification_layout(
++            scheduler_output,
++            ["prefill", "decode"],
++            torch.tensor([1, 0], dtype=torch.int32, device=device),
++            draft_token_budget=draft_token_budget,
++            query_start_loc=query_start_loc,
++            num_reqs_padded=2,
++        )
++    )
++
++    assert num_draft_tokens.tolist() == [0, 1]
++    assert query_start_loc.tolist() == [0, 4, 6, 6]
++    assert query_start_loc_np.tolist() == [0, 4, 6]
++    assert cu_num_logits.tolist() == [0, 1, 3]
++    assert speculator.allocate_draft_token_budget.call_args.args[2].tolist() == [
++        0,
++        4,
++    ]
+ 
+ 
+ def _create_vllm_config_for_dsd(
+@@ -26,6 +84,7 @@ def _create_vllm_config_for_dsd(
+     *,
+     cudagraph_mode: str = "FULL_AND_PIECEWISE",
+     use_dynamic_sd: bool = True,
++    adaptive_verification: bool = False,
+     num_spec_per_batch_size: list[tuple[int, int, int]] | None = None,
+ ) -> MagicMock:
+     """Create a minimal config that exercises DSD cudagraph dispatch.
+@@ -63,6 +122,7 @@ def _create_vllm_config_for_dsd(
+ 
+     speculative_config = MagicMock()
+     speculative_config.uses_dynamic_speculative_decoding.return_value = use_dynamic_sd
++    speculative_config.adaptive_verification = adaptive_verification
+     if use_dynamic_sd:
+         # DSD reads the per-batch-size schedule; a schedule entry with K
+         # speculative tokens maps to decode query length K + 1. By default
+@@ -150,7 +210,7 @@ def test_dynamic_sd_full_cudagraph_covers_all_uniform_decode_shapes(monkeypatch)
+ 
+ 
+ def test_dynamic_sd_non_uniform_batch_falls_back_to_piecewise(monkeypatch):
+-    """DSD should use PIECEWISE when the batch is not a uniform decode batch.
++    """Non-varlen DSD should use PIECEWISE for a nonuniform decode batch.
+ 
+     FULL DSD graphs are captured separately for each decode query length k.
+     When runtime tokens are not uniform, uniform_token_count is None and those
+@@ -196,6 +256,72 @@ def test_dynamic_sd_non_uniform_batch_falls_back_to_piecewise(monkeypatch):
+     assert desc.num_active_loras == 0
+ 
+ 
++def test_adaptive_verification_non_uniform_batch_uses_full_cudagraph(monkeypatch):
++    """Adaptive verification should select its bounded FULL descriptor.
++
++    Both the adaptive-verification FULL descriptor and the mixed-batch
++    PIECEWISE wildcard use uniform_token_count=None. max_query_len identifies
++    the adaptive-verification descriptor, while cg_mode determines that replay
++    remains a FULL CUDA graph.
++    """
++
++    max_num_seqs = 8
++    max_spec_tokens = 7
++    max_decode_query_len = max_spec_tokens + 1
++    scheduled_num_spec_tokens = 3
++    scheduled_query_len = scheduled_num_spec_tokens + 1
++
++    monkeypatch.setattr(
++        gpu_cudagraph_utils,
++        "get_pp_group",
++        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
++    )
++
++    vllm_config = _create_vllm_config_for_dsd(
++        max_num_seqs=max_num_seqs,
++        max_spec_tokens=max_spec_tokens,
++        adaptive_verification=True,
++        num_spec_per_batch_size=[(1, max_num_seqs, scheduled_num_spec_tokens)],
++    )
++    manager = gpu_cudagraph_utils.CudaGraphManager(
++        vllm_config=vllm_config,
++        device=torch.device("cpu"),
++        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
++        decode_query_len=max_decode_query_len,
++    )
++    manager._graphs_captured = True
++
++    num_reqs = 4
++    num_tokens = num_reqs * scheduled_query_len
++    candidates = manager._candidates[(num_tokens, 0)]
++    assert any(desc.cg_mode == CUDAGraphMode.FULL for desc in candidates)
++    assert any(desc.cg_mode == CUDAGraphMode.PIECEWISE for desc in candidates)
++
++    desc = manager.dispatch(
++        num_reqs=num_reqs,
++        num_tokens=num_tokens,
++        uniform_token_count=None,
++        num_active_loras=0,
++        max_query_len=max_decode_query_len,
++    )
++
++    assert desc.cg_mode == CUDAGraphMode.FULL
++    assert desc.uniform_token_count is None
++    assert desc.max_query_len == max_decode_query_len
++    assert desc.num_tokens == num_tokens
++    assert desc.num_reqs == num_reqs
++
++    # Without the adaptive-verification max-query discriminator, the same
++    # nonuniform shape follows the ordinary mixed-batch PIECEWISE path.
++    fallback_desc = manager.dispatch(
++        num_reqs=num_reqs,
++        num_tokens=num_tokens,
++        uniform_token_count=None,
++        num_active_loras=0,
++    )
++    assert fallback_desc.cg_mode == CUDAGraphMode.PIECEWISE
++
++
+ def test_basic_sd_does_not_capture_shorter_full_decode_shapes(monkeypatch):
+     """Without DSD, only the max decode query length should get FULL graphs.
+ 
+diff --git a/tests/v1/test_outputs.py b/tests/v1/test_outputs.py
+index 89d551e344cf..8297f150a9d5 100644
+--- a/tests/v1/test_outputs.py
++++ b/tests/v1/test_outputs.py
+@@ -1,8 +1,39 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from unittest import TestCase
++from unittest.mock import Mock
+ 
+-from vllm.v1.outputs import LogprobsLists
++import numpy as np
++import torch
++
++from vllm.v1.outputs import LogprobsLists, LogprobsTensors, ModelRunnerOutput
++from vllm.v1.worker.gpu.async_utils import AsyncOutput
++
++
++def test_async_output_groups_adaptive_logprobs_by_actual_draft_counts():
++    """Adaptive-verification logprobs must use device-selected, not planned, lengths."""
++    output = AsyncOutput.__new__(AsyncOutput)
++    output.copy_event = Mock()
++    output.sampled_token_ids = np.zeros((3, 4), dtype=np.int32)
++    output.num_sampled_tokens_np = np.ones(3, dtype=np.int32)
++    output.num_draft_tokens_np = np.array([3, 1, 2], dtype=np.int32)
++    output.num_nans = None
++    output.prompt_logprobs_dict = {}
++    output.model_runner_output = ModelRunnerOutput(
++        req_ids=["a", "b", "c"],
++        req_id_to_index={"a": 0, "b": 1, "c": 2},
++    )
++    output.logprobs_tensors = LogprobsTensors(
++        logprob_token_ids=torch.zeros((9, 1), dtype=torch.int32),
++        logprobs=torch.zeros((9, 1)),
++        selected_token_ranks=torch.zeros(9, dtype=torch.int32),
++        cu_num_generated_tokens=[0, 3, 6, 9],
++    )
++
++    result = output.get_output()
++
++    assert result.logprobs is not None
++    assert result.logprobs.cu_num_generated_tokens == [0, 4, 6, 9]
+ 
+ 
+ class TestLogprobsLists(TestCase):
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index b9c612621982..7e2c509e586c 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -177,6 +177,17 @@ class SpeculativeConfig:
+     inclusive batch-size range.
+     """
+ 
++    adaptive_verification: bool = False
++    """Allow the speculator to distribute the batch-wide verification-token
++    budget unevenly among requests.
++
++    This currently requires ``method="dspark"`` and a
++    ``num_speculative_tokens_per_batch_size`` schedule. The configured
++    ``num_speculative_tokens`` is the per-request maximum. The model runner
++    uses the batch-size schedule as a cost model and redistributes its token
++    budget across request prefixes on device.
++    """
++
+     # params generated in the post-init stage
+     draft_model_config: SkipValidation[ModelConfig] = None  # type: ignore
+     """The configuration of the draft model initialized internal."""
+@@ -1211,6 +1222,18 @@ def _verify_args(self) -> Self:
+ 
+         if not self.use_heterogeneous_vocab:
+             self.verify_equal_vocab_size_if_draft_model()
++
++        if self.adaptive_verification:
++            if self.method != "dspark":
++                raise ValueError(
++                    "adaptive_verification is currently supported only with "
++                    "method='dspark'."
++                )
++            if not self.num_speculative_tokens_per_batch_size:
++                raise ValueError(
++                    "adaptive_verification requires a non-empty "
++                    "num_speculative_tokens_per_batch_size schedule."
++                )
+         return self
+ 
+     def verify_equal_vocab_size_if_draft_model(self):
+@@ -1275,7 +1298,10 @@ def use_dspark(self) -> bool:
+         return self.method == "dspark"
+ 
+     def uses_dynamic_speculative_decoding(self) -> bool:
+-        return self.num_speculative_tokens_per_batch_size is not None
++        return (
++            self.num_speculative_tokens_per_batch_size is not None
++            and not self.adaptive_verification
++        )
+ 
+     def uses_draft_model(self) -> bool:
+         return self.method == "draft_model"
+diff --git a/vllm/model_executor/models/qwen3_dspark.py b/vllm/model_executor/models/qwen3_dspark.py
+index 219819759ac0..9eb49064f1cb 100644
+--- a/vllm/model_executor/models/qwen3_dspark.py
++++ b/vllm/model_executor/models/qwen3_dspark.py
+@@ -10,8 +10,10 @@
+ DFlash Qwen3 draft (see qwen3_dflash.py). DSpark adds:
+   * ``markov_head``: low-rank V x r / r x V transition bias added to the base
+     logits, sampled left-to-right by the speculator (the sequential stage).
++  * ``confidence_head``: per-position acceptance-probability estimate.
+ 
+-DSparkMarkovHead is shared with the DSV4-style DSpark model.
++DSparkMarkovHead and DSparkConfidenceHead are shared with the DSV4-style
++DSpark model.
+ """
+ 
+ from collections.abc import Iterable
+@@ -21,6 +23,7 @@
+ 
+ from vllm.config import VllmConfig
+ from vllm.logger import init_logger
++from vllm.model_executor.layers.linear import ReplicatedLinear
+ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+ from vllm.model_executor.layers.vocab_parallel_embedding import (
+     ParallelLMHead,
+@@ -67,8 +70,36 @@ def bias(self, markov_embed: torch.Tensor, logits_processor) -> torch.Tensor:
+         return logits_processor(self.markov_w2, markov_embed)
+ 
+ 
++class DSparkConfidenceHead(nn.Module):
++    """Per-position acceptance-probability head."""
++
++    def __init__(
++        self,
++        input_dim: int,
++        prefix: str,
++        *,
++        bias: bool = False,
++        params_dtype: torch.dtype,
++        with_markov: bool = True,
++    ) -> None:
++        super().__init__()
++        self.with_markov = with_markov
++        self.proj = ReplicatedLinear(
++            input_dim,
++            1,
++            bias=bias,
++            return_bias=False,
++            params_dtype=params_dtype,
++            prefix=maybe_prefix(prefix, "proj"),
++        )
++
++    def forward(self, hidden: torch.Tensor, markov_embed: torch.Tensor) -> torch.Tensor:
++        x = torch.cat([hidden, markov_embed], dim=-1) if self.with_markov else hidden
++        return self.proj(x).float().squeeze(-1)
++
++
+ class Qwen3DSparkModel(DFlashQwen3Model):
+-    """DFlash Qwen3 backbone + DSpark Markov head."""
++    """DFlash Qwen3 backbone + DSpark Markov and confidence heads."""
+ 
+     def __init__(
+         self,
+@@ -90,6 +121,17 @@ def __init__(
+             config.markov_rank,
+             prefix=maybe_prefix(prefix, "markov_head"),
+         )
++        self.confidence_head: DSparkConfidenceHead | None = None
++        assert vllm_config.speculative_config is not None
++        if vllm_config.speculative_config.adaptive_verification:
++            with_markov = getattr(config, "confidence_head_with_markov", True)
++            self.confidence_head = DSparkConfidenceHead(
++                config.hidden_size + (config.markov_rank if with_markov else 0),
++                prefix=maybe_prefix(prefix, "confidence_head"),
++                bias=True,
++                params_dtype=vllm_config.model_config.dtype,
++                with_markov=with_markov,
++            )
+ 
+ 
+ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
+@@ -146,12 +188,22 @@ def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
+     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
+         return self.model.markov_head.bias(markov_embed, self.logits_processor)
+ 
++    def compute_confidence(
++        self, head_hidden: torch.Tensor, markov_embed: torch.Tensor
++    ) -> torch.Tensor | None:
++        if self.model.confidence_head is None:
++            return None
++        return self.model.confidence_head(head_hidden, markov_embed)
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+         model_weights = {}
+         includes_embed_tokens = False
+         includes_lm_head = False
+         includes_draft_id_mapping = False
++        includes_confidence_head = False
+         for name, loaded_weight in weights:
++            if "confidence_head" in name and self.model.confidence_head is None:
++                continue
+             # t2d is training-only; the draft remaps via d2t at sampling time.
+             if "t2d" in name:
+                 continue
+@@ -164,22 +216,30 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+                 includes_embed_tokens = True
+             if "lm_head" in name:
+                 includes_lm_head = True
++            if "confidence_head" in name:
++                includes_confidence_head = True
+             model_weights[name] = loaded_weight
+             # Sets has_own_embed_tokens / has_own_lm_head so load_dspark_model
+             # knows whether to keep these or alias the target's.
+             process_eagle_weight(self, name)
+ 
+         # mask_embedding is an unused placeholder param; DSpark masks via the vocab row.
+-        # confidence_head is not wired into inference yet; skip its weights.
+         # embed_tokens / lm_head are optional; when omitted they are shared from
+         # the target by load_dspark_model, so skip the unloaded params here.
+-        skip_substrs = ["mask_embedding", "confidence_head"]
++        skip_substrs = ["mask_embedding"]
+         if not includes_embed_tokens:
+             skip_substrs.append("embed_tokens")
+         if not includes_lm_head:
+             skip_substrs.append("lm_head")
+         if not includes_draft_id_mapping:
+             skip_substrs.append("draft_id_to_target_id")
++        if self.model.confidence_head is None:
++            skip_substrs.append("confidence_head")
++        elif not includes_confidence_head:
++            raise ValueError(
++                "adaptive_verification requires confidence-head weights, but none "
++                "were found in the Qwen3 DSpark checkpoint."
++            )
+         loader = AutoWeightsLoader(self, skip_substrs=skip_substrs)
+         loader.load_weights(model_weights.items())
+         self.model._build_fused_kv_buffers()
+diff --git a/vllm/models/deepseek_v4/nvidia/dspark.py b/vllm/models/deepseek_v4/nvidia/dspark.py
+index e4e258372a29..29eed06ff59f 100644
+--- a/vllm/models/deepseek_v4/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4/nvidia/dspark.py
+@@ -37,6 +37,7 @@
+ )
+ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+ from vllm.model_executor.models.qwen3_dspark import (
++    DSparkConfidenceHead,
+     DSparkMarkovHead,
+ )
+ from vllm.model_executor.models.utils import maybe_prefix
+@@ -96,7 +97,7 @@ def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+             ]
+         )
+ 
+-        # Heads: final norm + hc_head, and the Markov head
++        # Heads: final norm + hc_head, and the Markov + confidence heads
+         # Loaded from the "final" MTP layer weights (mtp.*) in the target checkpoint
+         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+         hc_dim = self.hc_mult * config.hidden_size
+@@ -119,6 +120,13 @@ def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+             config.dspark_markov_rank,
+             prefix=maybe_prefix(prefix, "markov_head"),
+         )
++        self.confidence_head: DSparkConfidenceHead | None = None
++        if vllm_config.speculative_config.adaptive_verification:
++            self.confidence_head = DSparkConfidenceHead(
++                config.hidden_size + config.dspark_markov_rank,
++                prefix=maybe_prefix(prefix, "confidence_head"),
++                params_dtype=vllm_config.model_config.dtype,
++            )
+ 
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         return self.embed_tokens(input_ids)
+@@ -337,6 +345,13 @@ def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
+     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
+         return self.model.markov_head.bias(markov_embed, self.logits_processor)
+ 
++    def compute_confidence(
++        self, head_hidden: torch.Tensor, markov_embed: torch.Tensor
++    ) -> torch.Tensor | None:
++        if self.model.confidence_head is None:
++            return None
++        return self.model.confidence_head(head_hidden, markov_embed)
++
+     # --- Weight loading ----------------------------------------------------
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+@@ -375,6 +390,7 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+ 
+         params_dict = dict(self.named_parameters())
+         loaded_params: set[str] = set()
++        loaded_confidence_head = False
+ 
+         tp_size = get_tensor_model_parallel_world_size()
+         tp_rank = get_tensor_model_parallel_rank()
+@@ -387,6 +403,8 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+             if mapped is None:
+                 continue
+             name = mapped
++            if "confidence_head." in name:
++                loaded_confidence_head = True
+ 
+             # ``.scale`` -> per-method scale suffix.
+             if name.endswith(".scale"):
+@@ -423,8 +441,7 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+                 continue
+ 
+             # Stacked rules only apply to decoder-layer weights. Head-stack params
+-            # (main_proj/norm/hc_head/markov_head) load directly — otherwise e.g.
+-            # "markov_w1" would collide with the "w1" shard rule.
++            # load directly so their names cannot collide with decoder shard rules.
+             is_layer_param = name.startswith("model.layers.")
+             for param_name, weight_name, stacked_shard_id in stacked_params_mapping:
+                 if not is_layer_param or weight_name not in name:
+@@ -454,6 +471,11 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+                 loaded_params.add(name)
+ 
+         self._finalize_moe()
++        if self.model.confidence_head is not None and not loaded_confidence_head:
++            raise ValueError(
++                "adaptive_verification requires confidence-head weights, but none "
++                "were found in the DeepSeek-V4 DSpark checkpoint."
++            )
+         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
+         return loaded_params
+ 
+@@ -471,8 +493,7 @@ def _remap_dspark_name(self, name: str) -> str | None:
+             return None
+         stage = int(m.group(1))
+         rest = m.group(2)
+-        # The confidence head is not wired into inference yet; drop its weights.
+-        if rest.startswith("confidence_head."):
++        if rest.startswith("confidence_head.") and self.model.confidence_head is None:
+             return None
+         # Head-stack params live at model level (mtp.last), context combiner at
+         # model level (mtp.0); everything else is a per-layer decoder block.
+@@ -482,6 +503,7 @@ def _remap_dspark_name(self, name: str) -> str | None:
+             "hc_head_base",
+             "hc_head_scale",
+             "markov_head.",
++            "confidence_head.",
+         )
+         if rest.startswith(("main_proj.", "main_norm.")) or rest.startswith(
+             head_prefixes
+diff --git a/vllm/v1/attention/backend.py b/vllm/v1/attention/backend.py
+index 2708e0ab1f0e..3d54eb36445a 100644
+--- a/vllm/v1/attention/backend.py
++++ b/vllm/v1/attention/backend.py
+@@ -281,6 +281,10 @@ def supports_batch_invariance(cls) -> bool:
+     def supports_kv_connector(cls) -> bool:
+         return True
+ 
++    @classmethod
++    def supports_device_query_lengths(cls) -> bool:
++        return False
++
+     @classmethod
+     def supports_attn_type(cls, attn_type: str) -> bool:
+         """Check if backend supports a given attention type.
+@@ -327,6 +331,7 @@ def validate_configuration(
+         use_non_causal: bool = False,
+         use_batch_invariant: bool = False,
+         use_kv_connector: bool = False,
++        requires_device_query_lengths: bool = False,
+     ) -> list[str]:
+         invalid_reasons = []
+         if not cls.supports_head_size(head_size):
+@@ -367,6 +372,8 @@ def validate_configuration(
+             invalid_reasons.append("batch invariance not supported")
+         if use_kv_connector and not cls.supports_kv_connector():
+             invalid_reasons.append("KV connector not supported")
++        if requires_device_query_lengths and not cls.supports_device_query_lengths():
++            invalid_reasons.append("device-side query lengths not supported")
+         combination_reason = cls.supports_combination(
+             head_size,
+             dtype,
+diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
+index 86198dda61c0..7dad12ac9368 100755
+--- a/vllm/v1/attention/backends/flash_attn.py
++++ b/vllm/v1/attention/backends/flash_attn.py
+@@ -100,6 +100,10 @@ def supports_sliding_window(cls) -> bool:
+     def supports_batch_invariance(cls) -> bool:
+         return True
+ 
++    @classmethod
++    def supports_device_query_lengths(cls) -> bool:
++        return True
++
+     @classmethod
+     def supports_non_causal(cls) -> bool:
+         return True
+diff --git a/vllm/v1/attention/selector.py b/vllm/v1/attention/selector.py
+index 917f2f6f7093..0a3054835c14 100644
+--- a/vllm/v1/attention/selector.py
++++ b/vllm/v1/attention/selector.py
+@@ -33,6 +33,7 @@ class AttentionSelectorConfig(NamedTuple):
+     use_non_causal: bool = False
+     use_batch_invariant: bool = False
+     use_kv_connector: bool = False
++    requires_device_query_lengths: bool = False
+ 
+     def __repr__(self):
+         return (
+@@ -49,7 +50,8 @@ def __repr__(self):
+             f"has_sliding_window={self.has_sliding_window}, "
+             f"use_non_causal={self.use_non_causal}, "
+             f"use_batch_invariant={self.use_batch_invariant}, "
+-            f"use_kv_connector={self.use_kv_connector})"
++            f"use_kv_connector={self.use_kv_connector}, "
++            f"requires_device_query_lengths={self.requires_device_query_lengths})"
+         )
+ 
+ 
+@@ -90,6 +92,15 @@ def get_attn_backend(
+     use_kv_connector = (
+         kv_transfer_config is not None and kv_transfer_config.is_kv_transfer_instance
+     )
++    speculative_config = vllm_config.speculative_config
++    adaptive_verification = bool(
++        speculative_config is not None and speculative_config.adaptive_verification
++    )
++    if adaptive_verification:
++        from vllm.compilation.backends import model_tag
++
++        # Only the verifier requires device query lengths.
++        adaptive_verification = model_tag != "dspark_head"
+ 
+     attn_selector_config = AttentionSelectorConfig(
+         head_size=head_size,
+@@ -106,6 +117,7 @@ def get_attn_backend(
+         use_non_causal=vllm_config.attention_config.use_non_causal,
+         use_batch_invariant=envs.VLLM_BATCH_INVARIANT,
+         use_kv_connector=use_kv_connector,
++        requires_device_query_lengths=adaptive_verification,
+     )
+ 
+     return _cached_get_attn_backend(
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 371139fa7226..399018783ee3 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -235,7 +235,7 @@ def __init__(
+         self.num_lookahead_tokens = 0
+         self.dynamic_sd_lookup: list[int] | None = None
+         if speculative_config is not None:
+-            if speculative_config.num_speculative_tokens_per_batch_size:
++            if speculative_config.uses_dynamic_speculative_decoding():
+                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
+                     speculative_config.num_speculative_tokens_per_batch_size,
+                     vllm_max_batch_size=self.scheduler_config.max_num_seqs,
+@@ -1601,15 +1601,6 @@ def update_from_output(
+             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
+                 # skip failed or rescheduled requests from KV load failure
+                 continue
+-            if request is None or request.is_finished():
+-                # The request is already finished. This can happen if the
+-                # request is aborted while the model is executing it (e.g.,
+-                # in pipeline parallelism or in async scheduling).
+-                # NOTE(Kuntai): When delay_free_blocks=True (for async KV
+-                # cache transfer in KV connector), the aborted request will not
+-                # be set to None (in order to finish async KV transfer).
+-                # In this case, we use is_finished() to check.
+-                continue
+ 
+             req_index = model_runner_output.req_id_to_index[req_id]
+             generated_token_ids = (
+@@ -1619,36 +1610,66 @@ def update_from_output(
+             scheduled_spec_token_ids = (
+                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
+             )
+-            # Skip a stale frame still pending discard (async_tokens_to_discard
+-            # > 0): its pre-reset rejection count would underflow the counters.
+-            if (
+-                scheduled_spec_token_ids
+-                and (generated_token_ids or self.num_sampled_tokens_per_step == 0)
+-                and request.async_tokens_to_discard == 0
++            if scheduled_spec_token_ids and (
++                generated_token_ids or self.num_sampled_tokens_per_step == 0
+             ):
+-                num_draft_tokens = len(scheduled_spec_token_ids)
++                planned_num_draft_tokens = len(scheduled_spec_token_ids)
++                num_draft_tokens = planned_num_draft_tokens
++                if model_runner_output.num_draft_tokens is not None:
++                    # Support dynamic speculation where the model runner might verify
++                    # fewer than the "planned" number of spec tokens. In this case,
++                    # the scheduler needs to roll back according to its "planned" number
++                    # of spec tokens, and we use the actual number of draft tokens
++                    # **only for statistics**
++                    num_draft_tokens = model_runner_output.num_draft_tokens[req_index]
++                num_invalid_draft_tokens = 0
++                if scheduler_output.num_invalid_spec_tokens:
++                    num_invalid_draft_tokens = (
++                        scheduler_output.num_invalid_spec_tokens.get(req_id, 0)
++                    )
++                elif request is not None and request.use_structured_output:
++                    num_invalid_draft_tokens = scheduled_spec_token_ids.count(-1)
++                if num_invalid_draft_tokens:
++                    num_draft_tokens = min(
++                        num_draft_tokens,
++                        planned_num_draft_tokens - num_invalid_draft_tokens,
++                    )
+                 num_sampled = self.num_sampled_tokens_per_step
+                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
+-                num_rejected = num_draft_tokens - num_accepted
+-                # num_computed_tokens represents the number of tokens
+-                # processed in the current step, considering scheduled
+-                # tokens and rejections. If some tokens are rejected,
+-                # num_computed_tokens is decreased by the number of rejected
+-                # tokens.
+-                if request.num_computed_tokens > 0:
+-                    request.num_computed_tokens -= num_rejected
+-                # If async scheduling, num_output_placeholders also includes
+-                # the scheduled spec tokens count and so is similarly adjusted.
+-                if request.num_output_placeholders > 0:
+-                    request.num_output_placeholders -= num_rejected
+                 spec_decoding_stats = self.make_spec_decoding_stats(
+                     spec_decoding_stats,
+                     num_draft_tokens=num_draft_tokens,
+                     num_accepted_tokens=num_accepted,
+-                    num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
+-                    request_id=req_id,
+                 )
+ 
++                if (
++                    request is not None
++                    and not request.is_finished()
++                    and request.async_tokens_to_discard == 0
++                ):
++                    num_rejected_from_plan = planned_num_draft_tokens - num_accepted
++                    # num_computed_tokens represents the number of tokens
++                    # processed in the current step, considering scheduled
++                    # tokens and rejections. If some tokens are rejected,
++                    # num_computed_tokens is decreased by the number of rejected
++                    # tokens.
++                    if request.num_computed_tokens > 0:
++                        request.num_computed_tokens -= num_rejected_from_plan
++                    # If async scheduling, num_output_placeholders also includes
++                    # the scheduled spec tokens count and so is similarly adjusted.
++                    if request.num_output_placeholders > 0:
++                        request.num_output_placeholders -= num_rejected_from_plan
++
++            if request is None or request.is_finished():
++                # The request is already finished. This can happen if the
++                # request is aborted while the model is executing it (e.g.,
++                # in pipeline parallelism or in async scheduling).
++                # NOTE(Kuntai): When delay_free_blocks=True (for async KV
++                # cache transfer in KV connector), the aborted request will not
++                # be set to None (in order to finish async KV transfer).
++                # In this case, we use is_finished() to check.
++                continue
++
+             # Free encoder inputs only after the step has actually executed.
+             if request.has_encoder_inputs:
+                 self._free_encoder_inputs(request)
+@@ -2377,15 +2398,11 @@ def make_spec_decoding_stats(
+         spec_decoding_stats: SpecDecodingStats | None,
+         num_draft_tokens: int,
+         num_accepted_tokens: int,
+-        num_invalid_spec_tokens: dict[str, int] | None,
+-        request_id: str,
+     ) -> SpecDecodingStats | None:
+-        if not self.log_stats or not num_draft_tokens:
++        if not self.log_stats:
+             return None
+         if spec_decoding_stats is None:
+             spec_decoding_stats = SpecDecodingStats.new(self.num_spec_tokens)
+-        if num_invalid_spec_tokens:
+-            num_draft_tokens -= num_invalid_spec_tokens.get(request_id, 0)
+         spec_decoding_stats.observe_draft(
+             num_draft_tokens=num_draft_tokens, num_accepted_tokens=num_accepted_tokens
+         )
+diff --git a/vllm/v1/outputs.py b/vllm/v1/outputs.py
+index 9f13ad939fc8..75af9be426ae 100644
+--- a/vllm/v1/outputs.py
++++ b/vllm/v1/outputs.py
+@@ -269,6 +269,10 @@ class ModelRunnerOutput:
+     # information related to cudagraph execution
+     cudagraph_stats: CUDAGraphStat | None = None
+ 
++    # Actual per-request draft counts used by device-side variable-length
++    # verification. None means the scheduler-planned draft counts were used.
++    num_draft_tokens: list[int] | None = None
++
+     # Per-step routed experts data captured by the worker.
+     # ``routing_data`` shape: (num_scheduled_tokens, num_layers,
+     #                         num_experts_per_tok); expert IDs as uint8/uint16.
+diff --git a/vllm/v1/spec_decode/dynamic/drafting_manager.py b/vllm/v1/spec_decode/dynamic/drafting_manager.py
+new file mode 100644
+index 000000000000..99da2a47a3da
+--- /dev/null
++++ b/vllm/v1/spec_decode/dynamic/drafting_manager.py
+@@ -0,0 +1,184 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from __future__ import annotations
++
++from abc import ABC, abstractmethod
++from collections.abc import Sequence
++from typing import TYPE_CHECKING
++
++import numpy as np
++import torch
++
++from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
++from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
++
++if TYPE_CHECKING:
++    from vllm.v1.core.sched.output import SchedulerOutput
++    from vllm.v1.worker.gpu.spec_decode.speculator import BaseSpeculator
++    from vllm.v1.worker.gpu.states import RequestState
++
++
++class AdaptiveDraftingManager(ABC):
++    @abstractmethod
++    def plan_batch(self, scheduler_output: SchedulerOutput) -> tuple[int, int]:
++        """Choose the target token count and aggregate draft-token budget."""
++        raise NotImplementedError
++
++    @abstractmethod
++    def prepare_verification_layout(
++        self,
++        scheduler_output: SchedulerOutput,
++        req_ids: Sequence[str],
++        idx_mapping: torch.Tensor,
++        draft_token_budget: int,
++        query_start_loc: torch.Tensor,
++        num_reqs_padded: int,
++    ) -> tuple[torch.Tensor, torch.Tensor, np.ndarray]:
++        """Allocate drafts per request and build query and logit layouts."""
++        raise NotImplementedError
++
++
++class DynamicSDDraftingManager(AdaptiveDraftingManager):
++    def __init__(
++        self,
++        num_speculative_tokens_per_batch_size: object,
++        max_num_reqs: int,
++        max_num_spec_tokens: int,
++        device: torch.device,
++        speculator: BaseSpeculator,
++        req_states: RequestState,
++    ) -> None:
++        """Build the batch-size lookup and reusable device-side layout buffers."""
++        self._speculator = speculator
++        self._req_states = req_states
++        self._num_spec_tokens_by_batch_size = build_dynamic_sd_schedule_lookup(
++            num_speculative_tokens_per_batch_size,
++            vllm_max_batch_size=max_num_reqs,
++            vllm_num_speculative_tokens=max_num_spec_tokens,
++        )
++        self._draft_token_caps = torch.empty(
++            max_num_reqs, dtype=torch.int32, device=device
++        )
++        self._base_query_counts = torch.empty_like(self._draft_token_caps)
++        self._cu_num_logits = torch.empty(
++            max_num_reqs + 1, dtype=torch.int32, device=device
++        )
++
++    def plan_batch(self, scheduler_output: SchedulerOutput) -> tuple[int, int]:
++        """Apply the schedule to the request mix and cap it by available drafts.
++
++        Prefills receive no draft budget and select the schedule's largest bucket.
++        """
++        req_ids = tuple(scheduler_output.num_scheduled_tokens)
++        if not req_ids:
++            return 0, 0
++
++        draft_caps, base_query_counts, is_prefill = self._get_request_layout(
++            scheduler_output, req_ids
++        )
++        target_k = self._num_spec_tokens_by_batch_size[
++            -1 if is_prefill.any() else len(req_ids)
++        ]
++        num_decode_reqs = len(req_ids) - int(is_prefill.sum())
++        draft_token_budget = min(
++            int(draft_caps.sum()),
++            target_k * num_decode_reqs,
++        )
++        return int(base_query_counts.sum()) + draft_token_budget, draft_token_budget
++
++    def prepare_verification_layout(
++        self,
++        scheduler_output: SchedulerOutput,
++        req_ids: Sequence[str],
++        idx_mapping: torch.Tensor,
++        draft_token_budget: int,
++        query_start_loc: torch.Tensor,
++        num_reqs_padded: int,
++    ) -> tuple[torch.Tensor, torch.Tensor, np.ndarray]:
++        draft_caps, base_query_counts, is_prefill = self._get_request_layout(
++            scheduler_output, req_ids
++        )
++        num_reqs = len(req_ids)
++        draft_caps_gpu = async_copy_to_gpu(
++            draft_caps, out=self._draft_token_caps[:num_reqs]
++        )
++        base_query_counts_gpu = async_copy_to_gpu(
++            base_query_counts, out=self._base_query_counts[:num_reqs]
++        )
++        num_draft_tokens_per_req = self._speculator.allocate_draft_token_budget(
++            idx_mapping,
++            draft_token_budget,
++            draft_caps_gpu,
++        )
++
++        query_start_loc[:1].zero_()
++        torch.cumsum(
++            base_query_counts_gpu + num_draft_tokens_per_req,
++            dim=0,
++            out=query_start_loc[1 : num_reqs + 1],
++        )
++        num_tokens = int(base_query_counts.sum()) + draft_token_budget
++        query_start_loc[num_reqs + 1 :].fill_(num_tokens)
++
++        cu_num_logits = self._cu_num_logits[: num_reqs + 1]
++        cu_num_logits[:1].zero_()  #  Non-blocking way to zero the first element
++        torch.cumsum(
++            num_draft_tokens_per_req + 1,
++            dim=0,
++            out=cu_num_logits[1:],
++        )
++
++        if is_prefill.any():
++            # Prompt logprobs use host-side query offsets, so mixed prefill
++            # batches need the exact device allocation reflected on the host.
++            if draft_token_budget == int(draft_caps.sum()):
++                actual_draft_counts = draft_caps
++            else:
++                actual_draft_counts = (
++                    num_draft_tokens_per_req.detach().to("cpu").numpy()
++                )
++            query_counts = base_query_counts + actual_draft_counts
++        else:
++            query_counts = np.fromiter(
++                map(scheduler_output.num_scheduled_tokens.get, req_ids),
++                dtype=np.int32,
++                count=num_reqs,
++            )
++
++        query_start_loc_np = np.empty(num_reqs_padded + 1, dtype=np.int32)
++        query_start_loc_np[0] = 0
++        np.cumsum(query_counts, out=query_start_loc_np[1 : num_reqs + 1])
++        query_start_loc_np[num_reqs + 1 :] = query_start_loc_np[num_reqs]
++        return num_draft_tokens_per_req, cu_num_logits, query_start_loc_np
++
++    def _get_request_layout(
++        self,
++        scheduler_output: SchedulerOutput,
++        req_ids: Sequence[str],
++    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
++        """Derive draft caps, base query counts, and prefill flags in worker order."""
++        num_reqs = len(req_ids)
++        draft_caps = np.empty(num_reqs, dtype=np.int32)
++        base_query_counts = np.empty(num_reqs, dtype=np.int32)
++        is_prefill = np.empty(num_reqs, dtype=np.bool_)
++        draft_tokens = scheduler_output.scheduled_spec_decode_tokens
++        scheduled_tokens = scheduler_output.num_scheduled_tokens
++
++        for index, req_id in enumerate(req_ids):
++            token_ids = draft_tokens.get(req_id, ())
++            base_query_counts[index] = scheduled_tokens[req_id] - len(token_ids)
++            if base_query_counts[index] < 0:
++                raise ValueError(
++                    f"Request {req_id} has more draft tokens than scheduled tokens."
++                )
++            is_prefill[index] = self._is_prefill(req_id)
++            draft_caps[index] = 0 if is_prefill[index] else len(token_ids)
++        return draft_caps, base_query_counts, is_prefill
++
++    def _is_prefill(self, req_id: str) -> bool:
++        req_index = self._req_states.req_id_to_index.get(req_id)
++        return req_index is not None and (
++            self._req_states.num_computed_prefill_tokens[req_index]
++            < self._req_states.prefill_len.np[req_index]
++        )
+diff --git a/vllm/v1/worker/gpu/async_utils.py b/vllm/v1/worker/gpu/async_utils.py
+index e4659104f49e..e6589c6c8b46 100644
+--- a/vllm/v1/worker/gpu/async_utils.py
++++ b/vllm/v1/worker/gpu/async_utils.py
+@@ -17,6 +17,7 @@ def __init__(
+         num_sampled_tokens: torch.Tensor,
+         main_stream: torch.cuda.Stream,
+         copy_stream: torch.cuda.Stream,
++        num_draft_tokens: torch.Tensor | None = None,
+     ):
+         # NOTE(woosuk): We must retain references to the GPU tensors,
+         # as the copy operations are performed on a different CUDA stream than
+@@ -24,9 +25,9 @@ def __init__(
+         self.model_runner_output = model_runner_output
+         self.sampler_output = sampler_output
+         self.num_sampled_tokens = num_sampled_tokens
++        self.num_draft_tokens = num_draft_tokens  # for adaptive speculation
+         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
+         self.copy_event = torch.cuda.Event(blocking=True)
+-
+         with stream(copy_stream, main_stream):
+             copy_stream.wait_stream(main_stream)
+ 
+@@ -40,6 +41,9 @@ def __init__(
+             if sampler_output.num_nans is not None:
+                 self.num_nans = async_copy_to_np(sampler_output.num_nans)
+             self.num_sampled_tokens_np = async_copy_to_np(num_sampled_tokens)
++            self.num_draft_tokens_np = (
++                None if num_draft_tokens is None else async_copy_to_np(num_draft_tokens)
++            )
+             self.prompt_logprobs_dict = {
+                 k: v.to_cpu_nonblocking() if v is not None else None
+                 for k, v in self.model_runner_output.prompt_logprobs_dict.items()
+@@ -58,6 +62,10 @@ def get_output(self) -> ModelRunnerOutput:
+         for token_ids, num_tokens in zip(sampled_token_ids, num_sampled_tokens):
+             del token_ids[num_tokens:]
+         self.model_runner_output.sampled_token_ids = sampled_token_ids
++        if self.num_draft_tokens_np is not None:
++            self.model_runner_output.num_draft_tokens = (
++                self.num_draft_tokens_np.tolist()
++            )
+ 
+         if self.num_nans is not None:
+             self.model_runner_output.num_nans_in_logits = dict(
+@@ -65,7 +73,17 @@ def get_output(self) -> ModelRunnerOutput:
+             )
+ 
+         if self.logprobs_tensors is not None:
+-            self.model_runner_output.logprobs = self.logprobs_tensors.tolists()
++            cu_num_generated_tokens = None
++            if self.num_draft_tokens_np is not None:
++                cu_num_generated_tokens = np.concatenate(
++                    (
++                        np.zeros(1, dtype=self.num_draft_tokens_np.dtype),
++                        np.cumsum(self.num_draft_tokens_np + 1),
++                    )
++                ).tolist()
++            self.model_runner_output.logprobs = self.logprobs_tensors.tolists(
++                cu_num_generated_tokens
++            )
+         self.model_runner_output.prompt_logprobs_dict = self.prompt_logprobs_dict
+         return self.model_runner_output
+ 
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index 9898fadc25e9..08cedf686fad 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -54,6 +54,8 @@ class BatchExecutionDescriptor:
+     num_reqs: int | None  # None means no request padding is needed (PIECEWISE graphs)
+     uniform_token_count: int | None = None
+     num_active_loras: int = 0
++    # Explicit max query length for nonuniform FULL graphs.
++    max_query_len: int | None = None
+ 
+ 
+ class CreateForwardFn(Protocol):
+@@ -74,9 +76,11 @@ def _is_compatible(
+     num_tokens: int,
+     uniform_token_count: int | None,
+     num_active_loras: int,
++    max_query_len: int | None = None,
+ ) -> bool:
+-    # desc.uniform_token_count=None (PIECEWISE) can handle any uniform_token_count
+-    # desc.num_reqs=None means no request padding needed (PIECEWISE)
++    # A descriptor with uniform_token_count=None accepts any runtime uniformity.
++    # PIECEWISE and nonuniform FULL descriptors both use this wildcard.
++    # num_reqs=None means no request padding is needed (currently limited to PIECEWISE).
+     return (
+         (
+             desc.uniform_token_count is None
+@@ -85,6 +89,7 @@ def _is_compatible(
+         and (desc.num_reqs is None or desc.num_reqs >= num_reqs)
+         and desc.num_tokens >= num_tokens
+         and desc.num_active_loras == num_active_loras
++        and (desc.max_query_len is None or desc.max_query_len == max_query_len)
+     )
+ 
+ 
+@@ -94,7 +99,7 @@ def get_uniform_token_count(
+     max_query_len: int,
+ ) -> int | None:
+     """
+-    Return the uniform token count if batch is uniform, else None.
++    Return the uniform token count if the runtime batch is uniform, else None.
+     A batch is uniform if all requests have the same number of tokens.
+     """
+     if (max_query_len == num_tokens // num_reqs) and (
+@@ -112,6 +117,7 @@ def __init__(
+         cudagraph_mode: CUDAGraphMode,
+         decode_query_len: int,
+         lora_capture_cases: list[int] | None = None,
++        allow_dynamic_decode_shapes: bool = True,
+     ):
+         self.vllm_config = vllm_config
+         self.device = device
+@@ -120,6 +126,7 @@ def __init__(
+         assert self.compilation_config is not None
+         self.cudagraph_mode = cudagraph_mode
+         self.decode_query_len = decode_query_len
++        self.allow_dynamic_decode_shapes = allow_dynamic_decode_shapes
+ 
+         self.dp_size = vllm_config.parallel_config.data_parallel_size
+         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
+@@ -193,18 +200,23 @@ def _init_candidates(self) -> None:
+             defaultdict(list)
+         )
+ 
+-        # When using Dynamic SD, num_speculative_tokens is the max number of
+-        # draft tokens. The scheduler might use a smaller number so we need
+-        # to capture graphs for all possible values during decode.
++        # Dynamic SD and adaptive verification can execute fewer than the
++        # configured maximum number of draft tokens, so capture every query
++        # length selected by their shared schedule.
+         speculative_config = self.vllm_config.speculative_config
++        adaptive_verification = (
++            self.allow_dynamic_decode_shapes
++            and speculative_config is not None
++            and getattr(speculative_config, "adaptive_verification", False) is True
++        )
+         if (
+-            speculative_config
+-            and speculative_config.uses_dynamic_speculative_decoding()
++            self.allow_dynamic_decode_shapes
++            and speculative_config
++            and speculative_config.num_speculative_tokens_per_batch_size
+         ):
+             num_spec_per_batch_size = (
+                 speculative_config.num_speculative_tokens_per_batch_size
+             )
+-            # uses_dynamic_speculative_decoding() guarantees this is set.
+             assert num_spec_per_batch_size is not None
+             # decode_query_len = num_speculative_steps + num_new_sampled_tokens
+             # _per_step. Recover num_new_sampled_tokens_per_step
+@@ -212,7 +224,6 @@ def _init_candidates(self) -> None:
+             num_new_sampled_tokens_per_step = (
+                 self.decode_query_len - self.vllm_config.num_speculative_tokens
+             )
+-            # Each entry is (range_start, range_end, num_speculative_tokens).
+             decode_query_lens = [
+                 x[2] + num_new_sampled_tokens_per_step for x in num_spec_per_batch_size
+             ]
+@@ -222,8 +233,8 @@ def _init_candidates(self) -> None:
+         for num_tokens, num_active_loras in product(
+             capture_sizes, self.lora_capture_cases
+         ):
+-            # Capture uniform decode specfifc graphs if required
+-            #  (i.e. separate decode routine)
++            # Capture decode-specific graphs when decode and mixed batches use
++            # separate routines.
+             if separate_decode_routine and decode_mode:
+                 for decode_query_len in decode_query_lens:
+                     rounded_num_tokens = round_up(num_tokens, decode_query_len)
+@@ -240,8 +251,13 @@ def _init_candidates(self) -> None:
+                         cg_mode=decode_mode,
+                         num_tokens=rounded_num_tokens,
+                         num_reqs=rounded_num_reqs,
+-                        uniform_token_count=decode_query_len,
++                        uniform_token_count=(
++                            None if adaptive_verification else decode_query_len
++                        ),
+                         num_active_loras=num_active_loras,
++                        max_query_len=(
++                            self.decode_query_len if adaptive_verification else None
++                        ),
+                     )
+ 
+                     # avoid duplicate graphs
+@@ -359,6 +375,7 @@ def dispatch(
+         num_tokens: int,
+         uniform_token_count: int | None,
+         num_active_loras: int,
++        max_query_len: int | None = None,
+     ) -> BatchExecutionDescriptor:
+         """Find matching cudagraph descriptor from priority-ordered candidates."""
+ 
+@@ -372,6 +389,7 @@ def dispatch(
+                     num_tokens,
+                     uniform_token_count,
+                     effective_loras,
++                    max_query_len,
+                 ):
+                     return desc
+         return BatchExecutionDescriptor(
+@@ -490,6 +508,7 @@ def create_forward_fn(
+                 attn_groups,
+                 kv_cache_config,
+                 skip_attn=(desc.cg_mode == CUDAGraphMode.PIECEWISE),
++                max_query_len=desc.max_query_len,
+             )
+ 
+             # Capture with dummy rows marked as padding.
+@@ -582,8 +601,14 @@ def prepare_inputs_to_capture(
+     attn_groups: list[list[AttentionGroup]],
+     kv_cache_config: KVCacheConfig,
+     skip_attn: bool = False,
++    max_query_len: int | None = None,
+ ) -> AttentionState:
+-    input_batch = InputBatch.make_dummy(num_reqs, num_tokens, input_buffers)
++    input_batch = InputBatch.make_dummy(
++        num_reqs,
++        num_tokens,
++        input_buffers,
++        max_query_len=max_query_len,
++    )
+     input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
+     slot_mappings = block_tables.get_dummy_slot_mappings(num_tokens)
+     slot_mappings_by_layer = build_slot_mappings_by_layer(
+diff --git a/vllm/v1/worker/gpu/dp_utils.py b/vllm/v1/worker/gpu/dp_utils.py
+index ee9b924ba13a..daf217384da7 100644
+--- a/vllm/v1/worker/gpu/dp_utils.py
++++ b/vllm/v1/worker/gpu/dp_utils.py
+@@ -94,6 +94,7 @@ def dispatch_cg_and_sync_dp(
+     dp_rank: int,
+     need_eager: bool = False,
+     num_active_loras: int = 0,
++    max_query_len: int | None = None,
+ ) -> tuple[BatchExecutionDescriptor, torch.Tensor | None]:
+     if need_eager:
+         batch_desc = BatchExecutionDescriptor(
+@@ -112,6 +113,7 @@ def dispatch_cg_and_sync_dp(
+             num_tokens,
+             uniform_token_count,
+             num_active_loras=num_active_loras,
++            max_query_len=max_query_len,
+         )
+ 
+     if dp_size == 1:
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index 64c1096dfbec..b7f156142dee 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -89,8 +89,10 @@ class InputBatch:
+ 
+     # [total_num_logits]
+     logits_indices: torch.Tensor
+-    # [num_reqs + 1]
++    # [num_reqs + 1] device-side actual cumulative logit counts.
+     cu_num_logits: torch.Tensor
++    # [num_reqs + 1] host-side scheduled cumulative logit counts.
++    # This is an upper bound when adaptive verification is active.
+     cu_num_logits_np: np.ndarray
+ 
+     # Whether any requests in batch use structured output.
+@@ -99,12 +101,18 @@ class InputBatch:
+     # [num_reqs] per-request prompt length, only populated for R-SWA.
+     prompt_lens: torch.Tensor | None
+ 
++    # Device-side actual draft counts after variable-length allocation.
++    num_draft_tokens_per_req_gpu: torch.Tensor | None = None
++    # Host-known upper bound passed to attention kernels. Zero means infer it.
++    max_query_len: int = 0
++
+     @classmethod
+     def make_dummy(
+         cls,
+         num_reqs: int,
+         num_tokens: int,
+         input_buffers: InputBuffers,
++        max_query_len: int | None = None,
+     ) -> "InputBatch":
+         assert 0 < num_reqs <= num_tokens
+         device = input_buffers.device
+@@ -161,6 +169,12 @@ def make_dummy(
+             num_tokens_after_padding=num_tokens,
+             num_draft_tokens=0,
+             num_draft_tokens_per_req=None,
++            num_draft_tokens_per_req_gpu=None,
++            max_query_len=(
++                int(num_scheduled_tokens.max())
++                if max_query_len is None
++                else max_query_len
++            ),
+             query_start_loc=query_start_loc,
+             query_start_loc_np=query_start_loc_np,
+             seq_lens=seq_lens,
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 1dee0d1b9553..1e32e7802851 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -51,6 +51,10 @@
+ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+ from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+ from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
++from vllm.v1.spec_decode.dynamic.drafting_manager import (
++    AdaptiveDraftingManager,
++    DynamicSDDraftingManager,
++)
+ from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
+ from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
+ from vllm.v1.worker.gpu.attn_utils import (
+@@ -189,6 +193,22 @@ def __init__(self, vllm_config: VllmConfig, device: torch.device):
+         self.speculator = None
+         self.use_aux_hidden_state_outputs = False
+         self.num_speculative_steps = vllm_config.num_speculative_tokens
++        self.adaptive_verification = (
++            self.speculative_config is not None
++            and self.speculative_config.adaptive_verification
++        )
++        self.adaptive_drafting_manager: AdaptiveDraftingManager | None = None
++        if self.adaptive_verification:
++            assert self.speculative_config is not None
++            if self.dp_size != 1 or self.dcp_size != 1 or self.use_pp:
++                raise NotImplementedError(
++                    "adaptive_verification currently requires DP=1, DCP=1, and PP=1."
++                )
++            if self.lora_config is not None or self.supports_mm_inputs:
++                raise NotImplementedError(
++                    "adaptive_verification currently supports text-only models "
++                    "without LoRA."
++                )
+         if self.speculative_config is not None:
+             if self.is_last_pp_rank:
+                 self.speculator = init_speculator(self.vllm_config, self.device)
+@@ -223,6 +243,17 @@ def __init__(self, vllm_config: VllmConfig, device: torch.device):
+             max_num_tokens=self.max_num_tokens,
+             device=self.device,
+         )
++        if self.adaptive_verification:
++            assert self.speculative_config is not None
++            assert self.speculator is not None
++            self.adaptive_drafting_manager = DynamicSDDraftingManager(
++                self.speculative_config.num_speculative_tokens_per_batch_size,
++                max_num_reqs=self.max_num_reqs,
++                max_num_spec_tokens=self.num_speculative_steps,
++                device=self.device,
++                speculator=self.speculator,
++                req_states=self.req_states,
++            )
+         if self.use_pp:
+             self.pp_handler = PPHandler(
+                 max_num_reqs=self.max_num_reqs,
+@@ -346,6 +377,7 @@ def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
+                 max_num_logits=self.max_num_reqs * self.decode_query_len,
+                 vocab_size=self.vocab_size,
+                 device=self.device,
++                mask_stride=self.decode_query_len,
+             )
+ 
+         if self.is_pooling_model and self.is_last_pp_rank:
+@@ -858,9 +890,12 @@ def update_requests(self, scheduler_output: SchedulerOutput) -> None:
+             )
+ 
+     def prepare_inputs(
+-        self, scheduler_output: SchedulerOutput, batch_desc: BatchExecutionDescriptor
++        self,
++        scheduler_output: SchedulerOutput,
++        batch_desc: BatchExecutionDescriptor,
++        num_tokens: int,
++        draft_token_budget: int | None,
+     ) -> InputBatch:
+-        num_tokens = scheduler_output.total_num_scheduled_tokens
+         num_tokens_after_padding = batch_desc.num_tokens
+         assert num_tokens > 0
+         if envs.VLLM_MOE_SKIP_PADDING:
+@@ -886,17 +921,9 @@ def prepare_inputs(
+         draft_tokens = scheduler_output.scheduled_spec_decode_tokens
+         num_draft_tokens_per_req = None
+         if not draft_tokens:
+-            # No draft token scheduled (common case).
+             total_num_draft_tokens = 0
+             total_num_logits = num_reqs
+             cu_num_logits_np = np.arange(num_reqs + 1, dtype=np.int32)
+-            cu_num_logits = torch.arange(
+-                num_reqs + 1, device=self.device, dtype=torch.int32
+-            )
+-            expanded_idx_mapping = idx_mapping
+-            expanded_local_pos = torch.zeros(
+-                num_reqs, dtype=torch.int32, device=self.device
+-            )
+         else:
+             num_draft_tokens_per_req = np.fromiter(
+                 (len(draft_tokens.get(req_id, ())) for req_id in req_ids),
+@@ -904,18 +931,16 @@ def prepare_inputs(
+                 count=num_reqs,
+             )
+             num_bonus_tokens = self.model_state.num_new_sampled_tokens_per_step
+-            total_num_draft_tokens = int(num_draft_tokens_per_req.sum())
++            total_num_draft_tokens = (
++                int(num_draft_tokens_per_req.sum())
++                if draft_token_budget is None
++                else draft_token_budget
++            )
+             total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
+             num_logits = num_draft_tokens_per_req + num_bonus_tokens
+             cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
+             cu_num_logits_np[0] = 0
+             np.cumsum(num_logits, out=cu_num_logits_np[1:])
+-            cu_num_logits = async_copy_to_gpu(cu_num_logits_np, device=self.device)
+-
+-            max_expand_len = self.decode_query_len
+-            expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
+-                idx_mapping, total_num_logits, cu_num_logits, max_expand_len
+-            )
+ 
+         # Get query_start_loc.
+         # num_reqs_padded is None for PIECEWISE graphs (no request padding needed)
+@@ -925,10 +950,52 @@ def prepare_inputs(
+         np.cumsum(num_scheduled_tokens, out=query_start_loc_np[1 : num_reqs + 1])
+         # Pad for full CUDA graph mode.
+         # Some attention backends like FA3 require query_start_loc to be non-decreasing.
+-        query_start_loc_np[num_reqs + 1 :] = num_tokens
+-        async_copy_to_gpu(query_start_loc_np, out=self.input_buffers.query_start_loc)
++        query_start_loc_np[num_reqs + 1 :] = query_start_loc_np[num_reqs]
++
++        num_draft_tokens_per_req_gpu = None
++        drafting_manager = self.adaptive_drafting_manager
++        if drafting_manager is not None:
++            assert draft_token_budget is not None
++            assert self.model_state.num_new_sampled_tokens_per_step == 1
++            (
++                num_draft_tokens_per_req_gpu,
++                cu_num_logits,
++                query_start_loc_np,
++            ) = drafting_manager.prepare_verification_layout(
++                scheduler_output,
++                req_ids,
++                idx_mapping,
++                draft_token_budget,
++                self.input_buffers.query_start_loc,
++                num_reqs_padded,
++            )
++        else:
++            async_copy_to_gpu(
++                query_start_loc_np,
++                out=self.input_buffers.query_start_loc,
++            )
++            if num_draft_tokens_per_req is None:
++                cu_num_logits = torch.arange(
++                    num_reqs + 1, device=self.device, dtype=torch.int32
++                )
++            else:
++                cu_num_logits = async_copy_to_gpu(cu_num_logits_np, device=self.device)
++
+         query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]
+         query_start_loc = self.input_buffers.query_start_loc[: num_reqs_padded + 1]
++
++        if draft_tokens:
++            expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
++                idx_mapping,
++                total_num_logits,
++                cu_num_logits,
++                self.decode_query_len,
++            )
++        else:
++            expanded_idx_mapping = idx_mapping
++            expanded_local_pos = torch.zeros(
++                num_reqs, dtype=torch.int32, device=self.device
++            )
+         prefill_len_np = self.req_states.prefill_len.np[idx_mapping_np]
+         computed_prefill_tokens_np = self.req_states.num_computed_prefill_tokens
+         num_computed_prefill_tokens_np = computed_prefill_tokens_np[idx_mapping_np]
+@@ -1017,6 +1084,7 @@ def prepare_inputs(
+             num_tokens_after_padding=num_tokens_after_padding,
+             num_draft_tokens=total_num_draft_tokens,
+             num_draft_tokens_per_req=num_draft_tokens_per_req,
++            num_draft_tokens_per_req_gpu=num_draft_tokens_per_req_gpu,
+             query_start_loc=query_start_loc,
+             query_start_loc_np=query_start_loc_np,
+             seq_lens=seq_lens,
+@@ -1153,7 +1221,12 @@ def execute_model(
+ 
+         # Get batch descriptor and sync across DP ranks.
+         num_reqs = len(scheduler_output.num_scheduled_tokens)
+-        num_toks = scheduler_output.total_num_scheduled_tokens
++        drafting_manager = self.adaptive_drafting_manager
++        if drafting_manager is None:
++            num_toks = scheduler_output.total_num_scheduled_tokens
++            draft_token_budget = None
++        else:
++            num_toks, draft_token_budget = drafting_manager.plan_batch(scheduler_output)
+         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
+         uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
+ 
+@@ -1180,6 +1253,7 @@ def execute_model(
+             self.dp_rank,
+             need_eager=is_profile or skip_compiled,
+             num_active_loras=num_active_loras,
++            max_query_len=max_query_len if drafting_manager is not None else None,
+         )
+ 
+         if batch_desc.num_tokens == 0:
+@@ -1190,7 +1264,12 @@ def execute_model(
+         if not dummy_run:
+             # Common case.
+             # Prepare all the inputs and copy to the input buffers.
+-            input_batch = self.prepare_inputs(scheduler_output, batch_desc)
++            input_batch = self.prepare_inputs(
++                scheduler_output,
++                batch_desc,
++                num_toks,
++                draft_token_budget,
++            )
+             block_tables, slot_mappings = self.prepare_attn(input_batch)
+             # Mamba "align" pre-copy: migrate recurrent state across block
+             # boundaries before the forward. Runs only on real batches, and
+@@ -1365,6 +1444,7 @@ def execute_model(
+             hidden_states=hidden_states,
+             aux_hidden_states=aux_hidden_states,
+             finished_req_ids=finished_req_ids,
++            num_spec_tokens_to_schedule=scheduler_output.num_spec_tokens_to_schedule,
+         )
+ 
+         if not self.is_last_pp_rank:
+@@ -1387,6 +1467,9 @@ def sample_tokens(
+         hidden_states = self.execute_model_state.hidden_states
+         aux_hidden_states = self.execute_model_state.aux_hidden_states
+         finished_req_ids = self.execute_model_state.finished_req_ids
++        num_spec_tokens_to_schedule = (
++            self.execute_model_state.num_spec_tokens_to_schedule
++        )
+         self.execute_model_state = None
+ 
+         if not self.is_last_pp_rank:
+@@ -1447,6 +1530,7 @@ def sample_tokens(
+             num_sampled_tokens=num_sampled,
+             main_stream=self.main_stream,
+             copy_stream=self.output_copy_stream,
++            num_draft_tokens=input_batch.num_draft_tokens_per_req_gpu,
+         )
+ 
+         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
+@@ -1504,6 +1588,7 @@ def sample_tokens(
+             self.draft_tokens_handler.set_draft_tokens(
+                 input_batch,
+                 self.req_states.draft_tokens[input_batch.idx_mapping],
++                (None if self.adaptive_verification else num_spec_tokens_to_schedule),
+             )
+ 
+         # Post-step KV connector related operations.
+@@ -1625,6 +1710,7 @@ class ExecuteModelState(NamedTuple):
+     hidden_states: torch.Tensor | None
+     aux_hidden_states: list[torch.Tensor] | None
+     finished_req_ids: set[str]
++    num_spec_tokens_to_schedule: int
+ 
+ 
+ def sort_batch_req_ids(
+diff --git a/vllm/v1/worker/gpu/model_states/default.py b/vllm/v1/worker/gpu/model_states/default.py
+index 854b71b69fcb..b74ae1cab4c7 100644
+--- a/vllm/v1/worker/gpu/model_states/default.py
++++ b/vllm/v1/worker/gpu/model_states/default.py
+@@ -148,7 +148,9 @@ def prepare_attn(
+             num_reqs = input_batch.num_reqs
+             num_tokens = input_batch.num_tokens
+         query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
+-        max_query_len = input_batch.num_scheduled_tokens.max().item()
++        max_query_len = input_batch.max_query_len or int(
++            input_batch.num_scheduled_tokens.max()
++        )
+         seq_lens_cpu_upper_bound = input_batch.seq_lens_cpu_upper_bound
+         if for_capture:
+             # Capture with worst-case max_seq_len so the graph is valid at any replay.
+diff --git a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+index 3cb478348a98..233e4e170bc0 100644
+--- a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+@@ -79,6 +79,7 @@ def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+             self.device,
+             cudagraph_mode,
+             decode_query_len=1,
++            allow_dynamic_decode_shapes=False,  # adaptive specdec is only for verifier
+         )
+ 
+     def capture(self) -> None:
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+index 6fd99d55fc73..cbac3051104e 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+@@ -96,6 +96,7 @@ def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+             self.device,
+             cudagraph_mode,
+             decode_query_len=self.num_query_per_req,
++            allow_dynamic_decode_shapes=False,  # adaptive specdec is only for verifier
+         )
+ 
+     def capture(self) -> None:
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+index 0236017cf2fc..b68f4dbd14f1 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -34,6 +34,53 @@
+ from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
+ 
+ 
++def allocate_draft_token_budget_from_confidence(
++    confidence_logits: torch.Tensor,
++    draft_token_budget: int,
++    draft_token_caps: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """Allocate exactly ``draft_token_budget`` prefix tokens on device.
++
++    Confidence logits are converted to cumulative prefix-survival probabilities.
++    Selecting the globally best scores therefore maximizes the sum of admitted
++    prefix-survival probabilities. Stable tie-breaking preserves prefix order.
++    """
++    num_reqs, num_speculative_steps = confidence_logits.shape
++    max_budget = num_reqs * num_speculative_steps
++    if not 0 <= draft_token_budget <= max_budget:
++        raise ValueError(
++            f"draft_token_budget must be in [0, {max_budget}], got "
++            f"{draft_token_budget}."
++        )
++    if draft_token_budget == 0:
++        return torch.zeros(num_reqs, dtype=torch.int32, device=confidence_logits.device)
++    if draft_token_budget == max_budget and draft_token_caps is None:
++        return torch.full(
++            (num_reqs,),
++            num_speculative_steps,
++            dtype=torch.int32,
++            device=confidence_logits.device,
++        )
++
++    survival_probs = confidence_logits.float().sigmoid().cumprod(dim=1)
++    if draft_token_caps is not None:
++        valid_positions = (
++            torch.arange(num_speculative_steps, device=confidence_logits.device)
++            < draft_token_caps[:, None]
++        )
++        survival_probs = survival_probs.masked_fill(~valid_positions, float("-inf"))
++    ranked_indices = torch.argsort(
++        survival_probs.flatten(), descending=True, stable=True
++    )
++    selected = torch.zeros(
++        max_budget, dtype=torch.bool, device=confidence_logits.device
++    )
++    selected_indices = ranked_indices[:draft_token_budget]
++    selected_values = torch.ones_like(selected_indices, dtype=torch.bool)
++    selected.scatter_(0, selected_indices, selected_values)
++    return selected.view(num_reqs, num_speculative_steps).sum(dim=1, dtype=torch.int32)
++
++
+ class DSparkSpeculator(DFlashSpeculator):
+     _speculator_name = "DSpark"
+ 
+@@ -74,12 +121,28 @@ def __init__(self, vllm_config: VllmConfig, device: torch.device):
+         self._d2t_scatter_index: torch.Tensor | None = None
+         self._draft_scatter_buf: torch.Tensor | None = None
+ 
++        self.adaptive_verification = self.speculative_config.adaptive_verification
++        self.draft_token_confidence_logits = torch.empty(
++            self.max_num_reqs,
++            self.num_speculative_steps,
++            dtype=torch.float32,
++            device=device,
++        )
++
+     def load_draft_model(
+         self,
+         target_model: torch.nn.Module,
+         target_attn_layer_names: set[str],
+     ) -> torch.nn.Module:
+         model = load_dspark_model(target_model, self.vllm_config)
++        if (
++            self.adaptive_verification
++            and getattr(model.model, "confidence_head", None) is None
++        ):
++            raise ValueError(
++                "adaptive_verification requires a DSpark checkpoint with "
++                "confidence-head weights."
++            )
+         # Reduced draft vocab: probabilistic rejection sampling indexes draft
+         # logits by target id, so precompute the draft->target column map and a
+         # scratch buffer to scatter logits into target vocab before sampling.
+@@ -98,14 +161,35 @@ def load_draft_model(
+             )
+         return model
+ 
++    def allocate_draft_token_budget(
++        self,
++        req_state_indices: torch.Tensor,
++        draft_token_budget: int,
++        draft_token_caps: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        if not self.adaptive_verification:
++            return super().allocate_draft_token_budget(
++                req_state_indices, draft_token_budget, draft_token_caps
++            )
++        confidence_logits = self.draft_token_confidence_logits[req_state_indices]
++        return allocate_draft_token_budget_from_confidence(
++            confidence_logits,
++            draft_token_budget,
++            draft_token_caps,
++        )
++
+     def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
+         # Sequential Markov sampling over the backbone's output hidden states.
+         n_spec = self.num_speculative_steps
+         num_sample = num_reqs * n_spec
+         # Per-(req, position) head hidden, ordered (req, step).
+-        sample_hidden = head_hidden[self.sample_indices[:num_sample]]
++        sample_hidden = head_hidden[self.sample_indices[:num_sample]].view(
++            num_reqs, n_spec, -1
++        )
+         # Draft-vocab logits; sampled ids are remapped to target vocab below.
+-        base_logits = self.model.compute_draft_logits(sample_hidden)
++        base_logits = self.model.compute_draft_logits(
++            sample_hidden.reshape(num_sample, -1)
++        )
+         vocab_size = base_logits.shape[-1]
+         base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
+ 
+@@ -119,6 +203,12 @@ def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
+         for i in range(n_spec):
+             # Sequential stage: Markov bias from the previously sampled token.
+             markov_embed = self.model.markov_embed(prev)
++            if self.adaptive_verification:
++                confidence_i = self.model.compute_confidence(
++                    sample_hidden[:, i], markov_embed
++                )
++                assert confidence_i is not None
++                self.draft_token_confidence_logits[idx_map[:, i], i] = confidence_i
+             bias = self.model.markov_bias(markov_embed)
+             logits_i = base_logits[:, i] + bias
+             if self.draft_logits is not None:
+diff --git a/vllm/v1/worker/gpu/spec_decode/speculator.py b/vllm/v1/worker/gpu/spec_decode/speculator.py
+index 36be47322115..01ee6a9fdda3 100644
+--- a/vllm/v1/worker/gpu/spec_decode/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/speculator.py
+@@ -27,6 +27,15 @@
+ 
+ 
+ class BaseSpeculator(ABC):
++    def allocate_draft_token_budget(
++        self,
++        req_state_indices: torch.Tensor,
++        draft_token_budget: int,
++        draft_token_caps: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        """Allocate a batch-wide draft-token budget across request prefixes."""
++        raise NotImplementedError
++
+     @abstractmethod
+     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+         pass
+diff --git a/vllm/v1/worker/gpu/spec_decode/utils.py b/vllm/v1/worker/gpu/spec_decode/utils.py
+index e25672e953bd..c99c8ef0ce0a 100644
+--- a/vllm/v1/worker/gpu/spec_decode/utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/utils.py
+@@ -20,10 +20,15 @@ def __init__(self, device: torch.device | None = None):
+         self.num_draft_tokens: int = 0
+ 
+     def set_draft_tokens(
+-        self, input_batch: InputBatch, draft_tokens: torch.Tensor
++        self,
++        input_batch: InputBatch,
++        draft_tokens: torch.Tensor,
++        num_draft_tokens: int | None = None,
+     ) -> None:
+         self.req_ids = input_batch.req_ids
+-        self.num_draft_tokens = draft_tokens.shape[1]
++        self.num_draft_tokens = (
++            draft_tokens.shape[1] if num_draft_tokens is None else num_draft_tokens
++        )
+         if not input_batch.has_structured_output_reqs:
+             # No draft token validation needs to be performed by
+             # the scheduler for this batch.
+@@ -35,6 +40,7 @@ def set_draft_tokens(
+         current_stream = torch.cuda.current_stream(self.device)
+         self.copy_stream.wait_stream(current_stream)
+         with torch.cuda.stream(self.copy_stream):
++            draft_tokens = draft_tokens[:, : self.num_draft_tokens]
+             self.draft_tokens_np = async_copy_to_np(draft_tokens)
+             # draft_tokens is a temporary allocation on the main stream and read here on
+             # copy_stream; without record_stream, the caching allocator may reuse its
+diff --git a/vllm/v1/worker/gpu/structured_outputs.py b/vllm/v1/worker/gpu/structured_outputs.py
+index 34f00086d2a2..6a76c8e2c3ef 100644
+--- a/vllm/v1/worker/gpu/structured_outputs.py
++++ b/vllm/v1/worker/gpu/structured_outputs.py
+@@ -10,7 +10,13 @@
+ 
+ 
+ class StructuredOutputsWorker:
+-    def __init__(self, max_num_logits: int, vocab_size: int, device: torch.device):
++    def __init__(
++        self,
++        max_num_logits: int,
++        vocab_size: int,
++        device: torch.device,
++        mask_stride: int,
++    ):
+         self.logits_indices = torch.zeros(
+             max_num_logits, dtype=torch.int32, device=device
+         )
+@@ -19,6 +25,7 @@ def __init__(self, max_num_logits: int, vocab_size: int, device: torch.device):
+         )
+         self.device = device
+         self.copy_stream = torch.cuda.Stream()
++        self.mask_stride = mask_stride
+ 
+     def apply_grammar_bitmask(
+         self,
+@@ -45,7 +52,10 @@ def apply_grammar_bitmask(
+             req_idx = req_id_to_idx[grammar_req_id]
+             logits_start_idx = cu_num_logits[req_idx]
+             logits_end_idx = cu_num_logits[req_idx + 1]
+-            mapping.extend(range(logits_start_idx, logits_end_idx))
++            mapping.extend(
++                req_idx * self.mask_stride + position
++                for position in range(logits_end_idx - logits_start_idx)
++            )
+ 
+         # Asynchronously copy the mapping to GPU.
+         with torch.cuda.stream(self.copy_stream):
+@@ -61,7 +71,6 @@ def apply_grammar_bitmask(
+         current_stream.wait_stream(self.copy_stream)
+ 
+         num_masks = bitmask.shape[0]
+-        assert num_masks == len(mapping)
+         vocab_size = logits.shape[-1]
+         BLOCK_SIZE = 8192
+         grid = (num_masks, triton.cdiv(vocab_size, BLOCK_SIZE))
+@@ -69,9 +78,11 @@ def apply_grammar_bitmask(
+             logits,
+             logits.stride(0),
+             logits_indices,
++            input_batch.cu_num_logits,
+             bitmask,
+             bitmask.stride(0),
+             vocab_size,
++            MASK_STRIDE=self.mask_stride,
+             BLOCK_SIZE=BLOCK_SIZE,
+         )
+ 
+@@ -87,13 +98,21 @@ def _apply_grammar_bitmask_kernel(
+     logits_ptr,
+     logits_stride,
+     logits_indices_ptr,
++    cu_num_logits_ptr,
+     bitmask_ptr,
+     bitmask_stride,
+     vocab_size,
++    MASK_STRIDE: tl.constexpr,
+     BLOCK_SIZE: tl.constexpr,
+ ):
+     bitmask_idx = tl.program_id(0)
+-    logits_idx = tl.load(logits_indices_ptr + bitmask_idx)
++    mapping_idx = tl.load(logits_indices_ptr + bitmask_idx)
++    req_idx = mapping_idx // MASK_STRIDE
++    position_idx = mapping_idx % MASK_STRIDE
++    logits_idx = tl.load(cu_num_logits_ptr + req_idx)
++    num_req_logits = tl.load(cu_num_logits_ptr + req_idx + 1) - logits_idx
++    logits_idx += position_idx
++    position_is_active = position_idx < num_req_logits
+ 
+     # Load the bitmask.
+     block_id = tl.program_id(1)
+@@ -111,5 +130,5 @@ def _apply_grammar_bitmask_kernel(
+     tl.store(
+         logits_ptr + logits_idx * logits_stride + block_offset,
+         -float("inf"),
+-        mask=bitmask & (block_offset < vocab_size),
++        mask=position_is_active & bitmask & (block_offset < vocab_size),
+     )

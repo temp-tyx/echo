@@ -32,6 +32,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
@@ -67,7 +68,6 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
-    DraftTokenIds,
     ECConnectorOutput,
     LogprobsLists,
     LogprobsTensors,
@@ -472,7 +472,6 @@ class NPUModelRunner(GPUModelRunner):
             self.kvcomp_meta_data = initialize_kvcomp_metadata(max_num_reqs=self.max_num_reqs,
                 block_size=self.block_size, device=self.device, vllm_config=self.vllm_config,
                 parallel_config=self.parallel_config, dtype=self.dtype)
-        self.echo_cu_draft_tokens = []
 
     @property
     def use_cp(self) -> bool:
@@ -1328,10 +1327,10 @@ class NPUModelRunner(GPUModelRunner):
             if envs.VLLM_ECHO_ENABLED:
                 echo_k_max = envs.VLLM_ECHO_K_MAX
                 batch_size = spec_decode_common_attn_metadata.batch_size()
-                draft_max = getattr(
-                    self.drafter, "_echo_draft_max_tokens", self.drafter.num_speculative_tokens
-                )
-                draft_step = min(max(int(envs.VLLM_ECHO_STEPS_MULTIPLIER * echo_k_max // batch_size), 1), draft_max)
+                draft_max = self.drafter.num_speculative_tokens
+                # TODO: modify draft length
+                # draft_step = min(max(int(envs.VLLM_ECHO_STEPS_MULTIPLIER * echo_k_max // batch_size), 1), draft_max)
+                draft_step = draft_max
                 draft_num_spec_restore = self.drafter.num_speculative_tokens
                 self.drafter.num_speculative_tokens = draft_step
             common_attn_metadata = spec_decode_common_attn_metadata
@@ -1461,6 +1460,98 @@ class NPUModelRunner(GPUModelRunner):
 
         return draft_token_ids
 
+    def _echo_prune_drafts(
+            self,
+            num_reqs: int,
+            scheduler_output: "SchedulerOutput",
+    ) -> None:
+        """48692-style pruning at execute_model start, BEFORE num_scheduled_tokens_np
+        is built. Modifies scheduler_output.scheduled_spec_decode_tokens AND
+        scheduler_output.num_scheduled_tokens in-place, so num_scheduled_tokens_np
+        (built after) and _prepare_inputs see consistent pruned data."""
+        if not envs.VLLM_ECHO_ENABLED:
+            return
+        if self._draft_token_ids is None or not torch.is_tensor(self._draft_token_ids):
+            return
+        drafter = self.drafter
+        if drafter is None or not hasattr(drafter, "_echo_logits_list") or not drafter._echo_logits_list:
+            return
+
+        draft_token_ids = self._draft_token_ids  # [bs_drafter, num_spec]
+        bs_drafter, total_steps = draft_token_ids.shape
+        k_max = envs.VLLM_ECHO_K_MAX
+
+        spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        sched_tokens_dict = scheduler_output.num_scheduled_tokens
+        # Use _draft_token_req_ids (saved at drafter time) instead of
+        # input_batch.req_ids (updated by _update_states which removes
+        # finished reqs). Otherwise the row-to-req mapping shifts and we
+        # select the WRONG drafter row for pruning.
+        req_ids_drafter = self._draft_token_req_ids[:bs_drafter]
+
+        # Async scheduling: the drafter ran on the PREVIOUS step's
+        # input_batch, so some reqs may have finished and are no longer in
+        # the current scheduler_output. Filter to only reqs that are still
+        # scheduled, and map them to their row in the drafter output.
+        sched_indices = [
+            i for i, req_id in enumerate(req_ids_drafter)
+            if req_id in sched_tokens_dict
+        ]
+        actual_bs = len(sched_indices)
+        if actual_bs == 0:
+            return
+
+        # Select only the scheduled reqs' rows from drafter output
+        idx_tensor = torch.tensor(sched_indices, device=draft_token_ids.device)
+        draft_token_ids = draft_token_ids.index_select(0, idx_tensor)  # [actual_bs, total_steps]
+        logits_stack = torch.stack(drafter._echo_logits_list, dim=0)  # [T, bs_drafter, V]
+        logits_stack = logits_stack.index_select(1, idx_tensor)  # [T, actual_bs, V]
+
+        log_probs = F.log_softmax(logits_stack, dim=-1)
+        step_tokens = draft_token_ids.transpose(0, 1)  # [T, actual_bs]
+        step_log_probs = log_probs.gather(2, step_tokens.unsqueeze(-1)).squeeze(-1)
+        cond_log_probs = step_log_probs.transpose(0, 1)  # [actual_bs, T]
+        cum_log_probs = torch.cumsum(cond_log_probs, dim=1)  # [actual_bs, T]
+
+        n_select = min(max(k_max - actual_bs, 0), cum_log_probs.numel())
+        flat_log_probs = cum_log_probs.flatten()
+        mask = torch.zeros_like(flat_log_probs, dtype=torch.bool)
+        if n_select > 0:
+            _, top_flat_indices = torch.topk(flat_log_probs, k=n_select, sorted=False)
+            mask[top_flat_indices] = True
+        mask = mask.view(actual_bs, total_steps)
+
+        num_accepted_drafts = mask.sum(dim=1).to(torch.int32)
+        per_req_counts = num_accepted_drafts + 1
+
+        sched_req_ids = [req_ids_drafter[i] for i in sched_indices]
+        for i, req_id in enumerate(sched_req_ids):
+            if req_id not in spec_tokens:
+                continue
+            full_drafts = spec_tokens[req_id]
+            n_in_layout = min(len(full_drafts), total_steps)
+            req_mask = mask[i, :n_in_layout].tolist()
+            pruned = [t for t, keep in zip(full_drafts, req_mask) if keep]
+            if pruned:
+                spec_tokens[req_id] = pruned
+                sched_tokens_dict[req_id] = len(pruned) + 1
+            else:
+                # 0 drafts selected → keep empty list in spec_tokens so
+                # downstream classifies it as spec-decode with 0 drafts
+                # (NOT regular decode). num_scheduled_tokens = 1 (bonus only).
+                spec_tokens[req_id] = []
+                sched_tokens_dict[req_id] = 1
+        scheduler_output.total_num_scheduled_tokens = sum(sched_tokens_dict.values())
+
+        logger.info(
+            "[ECHO] pruned: bs=%s/%s num_spec=%s k_max=%s n_select=%s "
+            "total=%s per_req=%s sched_tokens=%s",
+            actual_bs, bs_drafter, total_steps, k_max, n_select,
+            scheduler_output.total_num_scheduled_tokens,
+            per_req_counts.tolist(),
+            dict(sched_tokens_dict),
+        )
+
     def _copy_draft_token_ids_to_cpu(
             self, scheduler_output: "SchedulerOutput", zeros_only: bool = False
     ) -> None:
@@ -1490,13 +1581,6 @@ class NPUModelRunner(GPUModelRunner):
                 self.draft_token_ids_event.record()
             return
         super()._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=zeros_only)
-
-    def take_draft_token_ids(self) -> DraftTokenIds | None:
-        draft = super().take_draft_token_ids()
-        if draft is None or not envs.VLLM_ECHO_ENABLED:
-            return draft
-        filtered = [[t for t in row if t != -1] for row in draft.draft_token_ids]
-        return DraftTokenIds(draft.req_ids, filtered)
 
     @torch.inference_mode()
     def execute_model(
@@ -1573,6 +1657,14 @@ class NPUModelRunner(GPUModelRunner):
 
                 num_reqs = self.input_batch.num_reqs
                 req_ids = self.input_batch.req_ids
+
+                # ECHO: prune BEFORE building num_scheduled_tokens_np, so the
+                # numpy array is built from the already-modified scheduler_output
+                # dict (num_scheduled_tokens + scheduled_spec_decode_tokens).
+                # This ensures _prepare_inputs sees consistent data.
+                if envs.VLLM_ECHO_ENABLED:
+                    self._echo_prune_drafts(num_reqs, scheduler_output)
+
                 tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
@@ -1934,8 +2026,6 @@ class NPUModelRunner(GPUModelRunner):
                 sample_hidden_states,
                 batch_desc,
             )
-            mask = (self._draft_token_ids != -1)
-            self.echo_cu_draft_tokens = mask.int().sum(dim=1).cpu().tolist()
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         (
@@ -2732,6 +2822,15 @@ class NPUModelRunner(GPUModelRunner):
         elif profile_cpp:
             num_reqs = 1
             num_scheduled_tokens_list = [num_tokens] * num_reqs
+        elif envs.VLLM_ECHO_ENABLED and not uniform_decode:
+            # ECHO graph capture/warmup: build a single-request spec-decode
+            # dummy so build_for_cudagraph_capture derives
+            # num_decode_draft_tokens = num_tokens - 1 > 0 and produces
+            # spec-decode metadata. The captured graph shape is pinned to
+            # num_tokens=K_MAX; runtime num_reqs varies and is distinguished
+            # via device query_start_loc, so a 1-req dummy suffices.
+            num_reqs = 1
+            num_scheduled_tokens_list = [num_tokens]
         else:
             num_reqs = min(num_tokens, max_num_reqs)
             min_tokens_per_req = num_tokens // num_reqs
