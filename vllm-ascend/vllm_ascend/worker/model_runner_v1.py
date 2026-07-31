@@ -1488,16 +1488,6 @@ class NPUModelRunner(GPUModelRunner):
         # finished reqs). Otherwise the row-to-req mapping shifts and we
         # select the WRONG drafter row for pruning.
         req_ids_drafter = self._draft_token_req_ids[:bs_drafter]
-        # Save originals so update_from_output sees the UNPRUNED data
-        # (scheduler's _update_after_schedule already advanced
-        # num_computed_tokens by the original num_scheduled_tokens; if
-        # we leave the pruned values, num_rejected is computed as 0 and
-        # num_computed_tokens is over-advanced).
-        self._echo_restore = (
-            dict(sched_tokens_dict),
-            dict(spec_tokens),
-            scheduler_output.total_num_scheduled_tokens,
-        )
 
         # Async scheduling: the drafter ran on the PREVIOUS step's
         # input_batch, so some reqs may have finished and are no longer in
@@ -2075,20 +2065,6 @@ class NPUModelRunner(GPUModelRunner):
             # draft model runs so KV pool save/put can complete.
             if self.speculative_config is not None:
                 self.finalize_kv_connector()
-
-        # Restore original scheduler_output so update_from_output sees
-        # the UNPRUNED num_scheduled_tokens and spec_decode_tokens.
-        # _update_after_schedule already advanced num_computed_tokens
-        # by the original values; update_from_output computes
-        # num_rejected = original_drafts - accepted and adjusts
-        # num_computed_tokens accordingly. If we leave pruned values,
-        # num_rejected = 0 and num_computed_tokens is over-advanced.
-        if hasattr(self, '_echo_restore'):
-            orig_tokens, orig_spec, orig_total = self._echo_restore
-            scheduler_output.num_scheduled_tokens = orig_tokens
-            scheduler_output.scheduled_spec_decode_tokens = orig_spec
-            scheduler_output.total_num_scheduled_tokens = orig_total
-            del self._echo_restore
 
         if self.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
