@@ -344,7 +344,7 @@ class NPUModelRunner(GPUModelRunner):
             self.input_ids = self._make_buffer(max_buffer_num_tokens, dtype=torch.int32)
             self.positions = torch.zeros(
                 max_buffer_num_tokens, dtype=torch.int64, device=self.device)
-            
+
         # Create a CPU numpy buffer for positions computation when
         # self.positions is a plain tensor (non-CpuGpuBuffer case).
         self._positions_cpu_buf = torch.zeros(
@@ -1286,8 +1286,8 @@ class NPUModelRunner(GPUModelRunner):
 
         # Initialize a new stream to overlap the copy operation with
         # prepare_input of draft model.
-        with torch.npu.stream(self.valid_sampled_token_count_copy_stream):  
-            self.valid_sampled_token_count_copy_stream.wait_stream(torch.npu.current_stream())  
+        with torch.npu.stream(self.valid_sampled_token_count_copy_stream):
+            self.valid_sampled_token_count_copy_stream.wait_stream(torch.npu.current_stream())
             counts = valid_sampled_tokens_count
             counts_cpu = self.valid_sampled_token_count_cpu
             assert counts_cpu is not None
@@ -1325,13 +1325,12 @@ class NPUModelRunner(GPUModelRunner):
             )
         elif self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model():
             if envs.VLLM_ECHO_ENABLED:
-                echo_k_max = envs.VLLM_ECHO_K_MAX
-                batch_size = spec_decode_common_attn_metadata.batch_size()
+                # echo_k_max = envs.VLLM_ECHO_K_MAX
+                # batch_size = spec_decode_common_attn_metadata.batch_size()
                 draft_max = self.drafter.num_speculative_tokens
                 # TODO: modify draft length
                 # draft_step = min(max(int(envs.VLLM_ECHO_STEPS_MULTIPLIER * echo_k_max // batch_size), 1), draft_max)
                 draft_step = draft_max
-                draft_num_spec_restore = self.drafter.num_speculative_tokens
                 self.drafter.num_speculative_tokens = draft_step
             common_attn_metadata = spec_decode_common_attn_metadata
             sampled_token_ids = valid_sampled_token_ids
@@ -1451,10 +1450,6 @@ class NPUModelRunner(GPUModelRunner):
                 num_scheduled_tokens=num_scheduled_tokens,
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
             )
-            if envs.VLLM_ECHO_ENABLED:
-                self.drafter.num_speculative_tokens = draft_num_spec_restore
-                if isinstance(draft_token_ids, torch.Tensor):
-                    self.num_spec_tokens = draft_token_ids.shape[1]
         else:
             raise ValueError(f"Unknown speculative decoding method: {self.speculative_config.method}")
 
@@ -1610,9 +1605,9 @@ class NPUModelRunner(GPUModelRunner):
         if ((
             self.use_async_scheduling and self.num_spec_tokens and self._draft_token_ids is None  # type: ignore[has-type]
         ) or (
-            # NOTE: This branch specifically triggers a deepcopy during the prefill phase 
-            # only for PCP (Parallel Context Processing) + Multi-Modal (MM) scenarios. 
-            # It does not affect other use cases. This is a temporary workaround and 
+            # NOTE: This branch specifically triggers a deepcopy during the prefill phase
+            # only for PCP (Parallel Context Processing) + Multi-Modal (MM) scenarios.
+            # It does not affect other use cases. This is a temporary workaround and
             # will be removed once upstream vLLM provides native support for PCP + MM.
             self.pcp_size > 1 and self.supports_mm_inputs and get_pp_group().is_first_rank
             and not self.model_config.is_encoder_decoder
@@ -2373,7 +2368,7 @@ class NPUModelRunner(GPUModelRunner):
             return round_up(num_scheduled_tokens, tp_size)
         return num_scheduled_tokens
 
-    # This is a function from the upstream vllm used to handle PP+SP. Since the judgment logic 
+    # This is a function from the upstream vllm used to handle PP+SP. Since the judgment logic
     # of flashcomm1 in Ascend is inconsistent with SP in vllm, it needs to be overridden.
     def sync_and_slice_intermediate_tensors(
         self,
@@ -2822,15 +2817,6 @@ class NPUModelRunner(GPUModelRunner):
         elif profile_cpp:
             num_reqs = 1
             num_scheduled_tokens_list = [num_tokens] * num_reqs
-        elif envs.VLLM_ECHO_ENABLED and not uniform_decode:
-            # ECHO graph capture/warmup: build a single-request spec-decode
-            # dummy so build_for_cudagraph_capture derives
-            # num_decode_draft_tokens = num_tokens - 1 > 0 and produces
-            # spec-decode metadata. The captured graph shape is pinned to
-            # num_tokens=K_MAX; runtime num_reqs varies and is distinguished
-            # via device query_start_loc, so a 1-req dummy suffices.
-            num_reqs = 1
-            num_scheduled_tokens_list = [num_tokens]
         else:
             num_reqs = min(num_tokens, max_num_reqs)
             min_tokens_per_req = num_tokens // num_reqs
