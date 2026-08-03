@@ -110,6 +110,16 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Whether to enable ECHO (Enhanced Concurrency with High-confidence prOuning).
+    # When enabled, low-confidence requests are pruned during speculative decoding
+    # by setting their draft tokens to -1, improving throughput in high-concurrency scenarios.
+    "VLLM_ECHO_ENABLED":lambda:bool(int(os.getenv("VLLM_ECHO_ENABLED","1"))),
+    # Maximum number of draft tokens to keep per request in ECHO.
+    # Only the top K_max requests by confidence (log probability) are retained.
+    "VLLM_ECHO_K_MAX":lambda:int(os.getenv("VLLM_ECHO_K_MAX","8")),
+    # Multiplier for extending speculation steps in ECHO.
+    # The actual number of draft steps will be k * steps_multiplier.
+    "VLLM_ECHO_STEPS_MULTIPLIER":lambda:int(os.getenv("VLLM_ECHO_STEPS_MULTIPLIER","2")),
 }
 
 # end-env-vars-definition
