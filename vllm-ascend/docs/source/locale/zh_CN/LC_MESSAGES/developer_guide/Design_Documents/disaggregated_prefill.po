@@ -8,7 +8,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: vllm-ascend \n"
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-04-21 02:03+0000\n"
+"POT-Creation-Date: 2026-07-02 07:02+0000\n"
 "PO-Revision-Date: 2026-04-09 18:37+0800\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language: zh_CN\n"
@@ -97,7 +97,7 @@ msgstr "工作原理"
 
 #: ../../source/developer_guide/Design_Documents/disaggregated_prefill.md:29
 msgid "1. Design Approach"
-msgstr "1. 设计思路"
+msgstr "1.设计思路"
 
 #: ../../source/developer_guide/Design_Documents/disaggregated_prefill.md:31
 msgid ""
@@ -111,7 +111,7 @@ msgstr ""
 
 #: ../../source/developer_guide/Design_Documents/disaggregated_prefill.md:33
 msgid "2. Implementation Design"
-msgstr "2. 实现设计"
+msgstr "2.实现设计"
 
 #: ../../source/developer_guide/Design_Documents/disaggregated_prefill.md:35
 msgid ""
@@ -220,7 +220,7 @@ msgstr "D 节点执行解码并返回结果。"
 
 #: ../../source/developer_guide/Design_Documents/disaggregated_prefill.md:56
 msgid "3. Interface Design"
-msgstr "3. 接口设计"
+msgstr "3.接口设计"
 
 #: ../../source/developer_guide/Design_Documents/disaggregated_prefill.md:58
 msgid ""
@@ -247,7 +247,7 @@ msgstr "**MooncakeConnectorWorker**：在工作进程中管理 KV 缓存注册�
 
 #: ../../source/developer_guide/Design_Documents/disaggregated_prefill.md:64
 msgid "4. Specifications Design"
-msgstr "4. 规格设计"
+msgstr "4.规格设计"
 
 #: ../../source/developer_guide/Design_Documents/disaggregated_prefill.md:66
 msgid ""
@@ -323,20 +323,17 @@ msgstr "DFX 分析"
 
 #: ../../source/developer_guide/Design_Documents/disaggregated_prefill.md:87
 msgid "1. Config Parameter Validation"
-msgstr "1. 配置参数验证"
+msgstr "1.配置参数验证"
 
 #: ../../source/developer_guide/Design_Documents/disaggregated_prefill.md:89
 msgid ""
 "Validate KV transfer config by checking whether the kv_connector type is "
-"supported and whether kv_connector_module_path exists and is loadable. On"
-" transfer failures, emit clear error logs for diagnostics."
-msgstr ""
-"通过检查 kv_connector 类型是否受支持以及 kv_connector_module_path 是否存在且可加载，来验证 KV "
-"传输配置。传输失败时，输出清晰的错误日志以便诊断。"
+"supported. On transfer failures, emit clear error logs for diagnostics."
+msgstr "通过检查 kv_connector 类型是否受支持，来验证 KV 传输配置。传输失败时，输出清晰的错误日志以便诊断。"
 
 #: ../../source/developer_guide/Design_Documents/disaggregated_prefill.md:91
 msgid "2. Port Conflict Detection"
-msgstr "2. 端口冲突检测"
+msgstr "2.端口冲突检测"
 
 #: ../../source/developer_guide/Design_Documents/disaggregated_prefill.md:93
 msgid ""
@@ -349,7 +346,7 @@ msgstr ""
 
 #: ../../source/developer_guide/Design_Documents/disaggregated_prefill.md:95
 msgid "3. PD Ratio Validation"
-msgstr "3. PD 比例验证"
+msgstr "3.PD 比例验证"
 
 #: ../../source/developer_guide/Design_Documents/disaggregated_prefill.md:97
 msgid ""
@@ -364,7 +361,7 @@ msgstr "限制"
 
 #: ../../source/developer_guide/Design_Documents/disaggregated_prefill.md:103
 msgid ""
-"Heterogeneous P and D nodes are not supported—for example, running P "
+"Heterogeneous P and D nodes are not supported, for example, running P "
 "nodes on A2 and D nodes on A3."
 msgstr "不支持异构的 P 节点和 D 节点，例如在 A2 上运行 P 节点、在 A3 上运行 D 节点。"
 

@@ -8,7 +8,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: vllm-ascend \n"
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-04-21 02:03+0000\n"
+"POT-Creation-Date: 2026-07-02 07:02+0000\n"
 "PO-Revision-Date: 2026-04-09 18:37+0800\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language: zh_CN\n"
@@ -61,7 +61,7 @@ msgstr "概述"
 
 #: ../../source/developer_guide/Design_Documents/ModelRunner_prepare_inputs.md:26
 msgid "1. Obtain inputs"
-msgstr "1. 获取输入"
+msgstr "1.获取输入"
 
 #: ../../source/developer_guide/Design_Documents/ModelRunner_prepare_inputs.md:28
 msgid "The workflow of obtaining inputs:"
@@ -86,11 +86,11 @@ msgstr "获取 `Token IDs`：使用 token indices 从 **token id table** 中检�
 #: ../../source/developer_guide/Design_Documents/ModelRunner_prepare_inputs.md:36
 msgid ""
 "At last, these `Token IDs` are required to be fed into a model, and "
-"`positions` should also be sent into the model to create `Rope` (Rotary "
+"`positions` should also be sent into the model to create `RoPE` (Rotary "
 "positional embedding). Both of them are the inputs of the model."
 msgstr ""
 "最后，需要将这些 `Token IDs` 输入模型，同时 `positions` 也应传入模型以创建 "
-"`Rope`（旋转位置编码）。这两者都是模型的输入。"
+"`RoPE`（旋转位置编码）。这两者都是模型的输入。"
 
 #: ../../source/developer_guide/Design_Documents/ModelRunner_prepare_inputs.md:38
 msgid ""
@@ -100,7 +100,7 @@ msgstr "**注意**：`Token IDs` 是模型的输入，因此我们也称之为 `
 
 #: ../../source/developer_guide/Design_Documents/ModelRunner_prepare_inputs.md:40
 msgid "2. Build inputs attention metadata"
-msgstr "2. 构建输入的注意力元数据"
+msgstr "2.构建输入的注意力元数据"
 
 #: ../../source/developer_guide/Design_Documents/ModelRunner_prepare_inputs.md:42
 msgid "A model requires these attention metadata during the forward pass:"
@@ -264,6 +264,7 @@ msgid "Obtain inputs"
 msgstr "获取输入"
 
 #: ../../source/developer_guide/Design_Documents/ModelRunner_prepare_inputs.md:103
+#, python-brace-format
 msgid ""
 "As the maximum number of tokens that can be scheduled is 10, the "
 "scheduled tokens of each request can be represented as `{'0': 3, '1': 2, "
@@ -275,7 +276,7 @@ msgstr ""
 
 #: ../../source/developer_guide/Design_Documents/ModelRunner_prepare_inputs.md:105
 msgid "1. Get token positions"
-msgstr "1. 获取 token positions"
+msgstr "1.获取 token positions"
 
 #: ../../source/developer_guide/Design_Documents/ModelRunner_prepare_inputs.md:107
 msgid ""
@@ -315,7 +316,7 @@ msgstr ""
 
 #: ../../source/developer_guide/Design_Documents/ModelRunner_prepare_inputs.md:115
 msgid "2. Get token indices"
-msgstr "2. 获取 token indices"
+msgstr "2.获取 token indices"
 
 #: ../../source/developer_guide/Design_Documents/ModelRunner_prepare_inputs.md:117
 msgid ""
@@ -360,7 +361,7 @@ msgstr ""
 
 #: ../../source/developer_guide/Design_Documents/ModelRunner_prepare_inputs.md:139
 msgid "3. Retrieve the Token IDs"
-msgstr "3. 检索 Token IDs"
+msgstr "3.检索 Token IDs"
 
 #: ../../source/developer_guide/Design_Documents/ModelRunner_prepare_inputs.md:141
 msgid ""

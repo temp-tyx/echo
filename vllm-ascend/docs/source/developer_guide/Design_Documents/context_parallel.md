@@ -1,6 +1,6 @@
 # Context Parallel (CP)
 
-TL;DR PCP accelerates prefill via sequence splitting. DCP eliminates KV cache redundancy.
+TL;DR: PCP accelerates prefill via sequence splitting. DCP eliminates KV cache redundancy.
 
 ![ContextParallel](../../assets/cp/overview.png)
 
@@ -75,6 +75,52 @@ After computing the results with the local KV cache, the results are updated via
 
 ![DCP-Decode](../../assets/cp/dcp-decode.png)
 
+### GLM-5.2 SFA DCP Replicated Indexer
+
+GLM-5.2 uses Sparse Flash Attention (SFA) with a LightningIndexer.  For DCP,
+the indexer needs a full-sequence view to select the same sparse top-k blocks
+as non-DCP SFA, while the much larger SFA KV cache should remain sharded to
+retain DCP's memory benefit.  The replicated-indexer path provides this split
+layout:
+
+- The LightningIndexer cache is replicated on every DCP rank.  Index selection
+  therefore uses the complete sequence and produces globally consistent sparse
+  top-k indices.
+- The SFA KV cache remains DCP-local.  The global indices from the replicated
+  indexer view are remapped to local KV indices before SFA runs.
+- During prefill or a mixed batch, only the KV blocks referenced by the sparse
+  block table are compacted and all-gathered after the current layer has
+  written its KV cache.  The gathered KV uses a remapped block table for SFA,
+  so this path does not all-gather Q and does not need LSE or output
+  post-processing.
+- Decode-only batches retain the DCP SFA Q-gather and result-merge path.
+
+This mode is selected automatically for SFA sparse models when
+`prefill_context_parallel_size=1` and `decode_context_parallel_size>1`.  It
+requires `decode_context_parallel_size == tensor_parallel_size`; PCP combined
+with this replicated-indexer path is not supported.
+
+For a GLM-5.2 DSA-CP deployment, enable FlashComm1 and DSA CP and keep the CP
+interleave size equal to the KV-cache block size:
+
+```bash
+export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
+
+vllm serve <glm-5.2-model> \
+  --tensor-parallel-size <N> \
+  --prefill-context-parallel-size 1 \
+  --decode-context-parallel-size <N> \
+  --block-size <B> \
+  --cp-kv-cache-interleave-size <B> \
+  --additional-config '{"enable_dsa_cp": true}'
+```
+
+The replicated indexer increases indexer-cache memory in proportion to the
+DCP world size; the SFA KV cache itself remains sharded.  For this SFA CP path,
+`cp_kv_cache_interleave_size` must equal `block_size`.  A mismatched setting is
+overridden during configuration validation, but deployments should set both
+values explicitly to avoid relying on that fallback.
+
 ### Prefill Context Parallel (PCP)
 
 **Tokens Partition in Head-Tail Style**
@@ -121,9 +167,31 @@ By predefining the maximum amount of KV cache processed per round, we sequential
 
 ![PCP-ChunkedPrefill](../../assets/cp/chunkedprefill.png)
 
+### SFA DSA-CP Mixed `o_proj` Path
+
+SFA DSA-CP mixed execution intentionally reuses the normal TP-sharded `o_proj`.
+This is part of the DSA-CP mixed data path, not a standalone user-facing `o_proj` TP switch.
+The mixed path is used when one instance may handle both decode-only and prefill/mixed batches, so `o_proj` must support two layouts at runtime:
+
+- **Decode-only batches** keep the decode TP path.
+  SFA outputs are exchanged with an all-to-all in the TP group, then the original TP-sharded `o_proj` runs normally.
+- **Prefill or mixed batches** produce SFA outputs that are not directly compatible with the TP-sharded `o_proj` input layout.
+  Before `o_proj` forward, each rank all-gathers the TP-sharded `o_proj` weight and all input-sharded quantization parameters into temporary full-weight buffers.
+  The full-weight `o_proj` forward runs once for that batch, and the module is then restored to the TP parameter aliases.
+
+The storage invariant is that the original TP-sharded `o_proj` parameter remains the only persistent source of truth.
+`o_proj_tp_*` tensors are aliases of the original parameter storage.
+`o_proj_full_*` tensors are reusable communication buffers for prefill/mixed full-gather execution only.
+They must not become a second persistent copy of the TP weight.
+
+This coupling preserves the existing decode TP behavior, supports prefill/mixed DSA-CP batches, and avoids adding an extra configuration path whose state can drift from DSA-CP mixed execution.
+
 ### Related Files
 
 - slot_mapping computation: `vllm_ascend/worker/block_table.py`
 - sequences splitting and metadata prepare: `vllm_ascend/worker/model_runner_v1.py`
-- GQA backend: `vllm_ascend/attention/attention_cp.py`
-- MLA backend: `vllm_ascend/attention/mla_cp.py`
+- PCP token splitting and metadata generation: `vllm_ascend/worker/pcp_utils.py`
+- GQA backend: `vllm_ascend/attention/context_parallel/attention_cp.py`
+- MLA backend: `vllm_ascend/attention/context_parallel/mla_cp.py`
+- DSA backend: `vllm_ascend/attention/context_parallel/dsa_cp.py`
+- SFA backend: `vllm_ascend/attention/context_parallel/sfa_cp.py`
