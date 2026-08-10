@@ -1059,7 +1059,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # `model_hidden_states` represent the speculative model inputs.
         model_input_ids = self.input_ids[:num_input_tokens]
         model_positions = self._get_positions(num_input_tokens)
-        self._echo_logits_list = []
+        self._echo_logits_list=[]
 
         if self.method == "dflash":
             model_kwargs = self.build_model_inputs_first_pass(num_input_tokens)
@@ -1173,6 +1173,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 )
             draft_token_ids = logits.argmax(dim=-1)
             self._echo_logits_list.append(logits)
+
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
             # [batch_size, 1]

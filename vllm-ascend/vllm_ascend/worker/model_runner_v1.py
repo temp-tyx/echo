@@ -192,7 +192,6 @@ if TYPE_CHECKING:
 else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
 
-
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSlidingWindowMLASpec
@@ -603,7 +602,8 @@ class NPUModelRunner(GPUModelRunner):
         if self.enable_hamming_sparse is True:
             from vllm_ascend.worker.kvcomp_utils import initialize_kvcomp_metadata
             self.kvcomp_meta_data = initialize_kvcomp_metadata(max_num_reqs=self.max_num_reqs,
-                block_size=self.block_size, device=self.device, vllm_config=self.vllm_config,
+                                                               block_size=self.block_size, device=self.device,
+                                                               vllm_config=self.vllm_config,
                                                                parallel_config=self.parallel_config, dtype=self.dtype)
 
     @property
@@ -1010,7 +1010,6 @@ class NPUModelRunner(GPUModelRunner):
             self.gdn_query_start_loc.np[1: num_reqs + 1] = cu_num_tokens
             self.gdn_query_start_loc.np[num_reqs + 1:].fill(cu_num_tokens[-1])
             copy_snapshot_to_gpu(self.gdn_query_start_loc)
-
 
         # Compute optimistic seq_lens (assumes all draft tokens from previous
         # iteration accepted). Store in optimistic_seq_lens_cpu for use by
@@ -1518,8 +1517,6 @@ class NPUModelRunner(GPUModelRunner):
             logits_indices_pcp += self._arange_scratch[: cu_num_sampled_tokens[-1]]
             logits_indices_pcp = torch.from_numpy(logits_indices_pcp).pin_memory().to(self.device, non_blocking=True)
 
-
-
         # Compute the bonus logits indices.
         bonus_logits_indices = cu_num_sampled_tokens - 1
 
@@ -1896,6 +1893,7 @@ class NPUModelRunner(GPUModelRunner):
             return
 
         draft_token_ids = self._draft_token_ids  # [bs_drafter, num_spec]
+        logger.info("[ECHO] total draft: %s", draft_token_ids.tolist())
         bs_drafter, total_steps = draft_token_ids.shape
         k_max = envs.VLLM_ECHO_K_MAX
 
@@ -1906,9 +1904,9 @@ class NPUModelRunner(GPUModelRunner):
         # finished reqs). Otherwise the row-to-req mapping shifts and we
         # select the WRONG drafter row for pruning.
         if self._draft_token_req_ids is not None:
-            req_ids_drafter=self._draft_token_req_ids[:bs_drafter]
+            req_ids_drafter = self._draft_token_req_ids[:bs_drafter]
         else:
-            req_ids_drafter=self.input_batch.req_ids[:bs_drafter]
+            req_ids_drafter = self.input_batch.req_ids[:bs_drafter]
 
         # Async scheduling: the drafter ran on the PREVIOUS step's
         # input_batch, so some reqs may have finished and are no longer in
@@ -1935,33 +1933,33 @@ class NPUModelRunner(GPUModelRunner):
             for idx in idx_tensor:
                 start = idx * tokens_per_req
                 selected_token_indices.append(
-                    torch.arange(start,start + tokens_per_req,device=draft_token_ids.device)
+                    torch.arange(start, start + tokens_per_req, device=draft_token_ids.device)
                 )
             token_idx_tensor = torch.cat(selected_token_indices)
 
-            logits_flat = torch.cat(drafter._echo_logits_list,dim=0)  # [bs_drafter*T, V]
-            logits_flat = logits_flat.index_select(0,token_idx_tensor)  # [actual_bs*T, V]
-            log_probs = F.log_softmax(logits_flat,dim=-1)  # [actual_bs*T, V]
+            logits_flat = torch.cat(drafter._echo_logits_list, dim=0)  # [bs_drafter*T, V]
+            logits_flat = logits_flat.index_select(0, token_idx_tensor)  # [actual_bs*T, V]
+            log_probs = F.log_softmax(logits_flat, dim=-1)  # [actual_bs*T, V]
 
             # ⚠️ 关键修复：step_tokens 也必须展平为 1D，匹配 2D log_probs
             step_tokens_flat = draft_token_ids.reshape(-1)  # [actual_bs*T]
 
             # gather 在 dim=1 (vocab) 上执行，index 需 unsqueeze 到 2D
             step_log_probs_flat = log_probs.gather(
-                1,step_tokens_flat.unsqueeze(-1)  # [actual_bs*T, 1]
+                1, step_tokens_flat.unsqueeze(-1)  # [actual_bs*T, 1]
             ).squeeze(-1)  # [actual_bs*T]
 
             # reshape 回 [actual_bs, T] 以复用后续 cumsum/mask 逻辑
-            cond_log_probs = step_log_probs_flat.view(actual_bs,total_steps)
+            cond_log_probs = step_log_probs_flat.view(actual_bs, total_steps)
 
         else:
             # === MTP 3D 路径（保持不变）===
-            logits_stack = torch.stack(drafter._echo_logits_list,dim=0)  # [T, bs_drafter, V]
-            logits_stack = logits_stack.index_select(1,idx_tensor)  # [T, actual_bs, V]
-            log_probs = F.log_softmax(logits_stack,dim=-1)
-            step_tokens = draft_token_ids.transpose(0,1)  # [T, actual_bs]
-            step_log_probs = log_probs.gather(2,step_tokens.unsqueeze(-1)).squeeze(-1)
-            cond_log_probs = step_log_probs.transpose(0,1)  # [actual_bs, T]
+            logits_stack = torch.stack(drafter._echo_logits_list, dim=0)  # [T, bs_drafter, V]
+            logits_stack = logits_stack.index_select(1, idx_tensor)  # [T, actual_bs, V]
+            log_probs = F.log_softmax(logits_stack, dim=-1)
+            step_tokens = draft_token_ids.transpose(0, 1)  # [T, actual_bs]
+            step_log_probs = log_probs.gather(2, step_tokens.unsqueeze(-1)).squeeze(-1)
+            cond_log_probs = step_log_probs.transpose(0, 1)  # [actual_bs, T]
         cum_log_probs = torch.cumsum(cond_log_probs, dim=1)  # [actual_bs, T]
 
         n_select = min(max(k_max - actual_bs, 0), cum_log_probs.numel())
@@ -1979,6 +1977,8 @@ class NPUModelRunner(GPUModelRunner):
         for i, req_id in enumerate(sched_req_ids):
             if req_id not in spec_tokens:
                 continue
+            accepted = draft_token_ids[i][mask[i]].tolist()
+            logger.info("[ECHO] req_id: %s, pruned draft: %s", req_id, accepted)
             full_drafts = spec_tokens[req_id]
             n_in_layout = min(len(full_drafts), total_steps)
             req_mask = mask[i, :n_in_layout].tolist()
@@ -2004,13 +2004,13 @@ class NPUModelRunner(GPUModelRunner):
         )
 
     def _copy_draft_token_ids_to_cpu(
-        self, scheduler_output: "SchedulerOutput", zeros_only: bool = False
+            self, scheduler_output: "SchedulerOutput", zeros_only: bool = False
     ) -> None:
         if not self.num_spec_tokens:
             return
         if self.use_async_scheduling and not (
-            scheduler_output.has_structured_output_requests
-            or self.input_batch.sampling_metadata.output_token_ids
+                scheduler_output.has_structured_output_requests
+                or self.input_batch.sampling_metadata.output_token_ids
         ):
             return
         self._draft_token_req_ids = self.input_batch.req_ids.copy()
@@ -2035,9 +2035,9 @@ class NPUModelRunner(GPUModelRunner):
 
     @torch.inference_mode()
     def execute_model(
-        self,
-        scheduler_output: "SchedulerOutput",
-        intermediate_tensors: IntermediateTensors | None = None,
+            self,
+            scheduler_output: "SchedulerOutput",
+            intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if self.vllm_config.model_config.enable_return_routed_experts:
             if self.routed_experts_initialized:
@@ -2055,13 +2055,13 @@ class NPUModelRunner(GPUModelRunner):
                 self._execution_start_time = time.perf_counter()
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
-       
+
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
         # The replace is much faster than deepcopy.
         if (
-            self.speculative_config is not None
-            and self.speculative_config.use_ngram_gpu()
+                self.speculative_config is not None
+                and self.speculative_config.use_ngram_gpu()
         ):
             num_scheduled_tokens_copy = scheduler_output.num_scheduled_tokens.copy()
             spec_decode_tokens_copy = (
@@ -2082,16 +2082,16 @@ class NPUModelRunner(GPUModelRunner):
         # TODO(Ronald1995): deepcopy is expensive when there is a large
         # number of requests, optimize it later.
         if ((
-            self.use_async_scheduling
-            and self.num_spec_tokens
-            and self._draft_token_ids is None  # type: ignore[has-type]
+                self.use_async_scheduling
+                and self.num_spec_tokens
+                and self._draft_token_ids is None  # type: ignore[has-type]
         ) or (
-            # NOTE: This branch specifically triggers a deepcopy during the prefill phase 
-            # only for PCP (Parallel Context Processing) + Multi-Modal (MM) scenarios. 
-            # It does not affect other use cases. This is a temporary workaround and 
-            # will be removed once upstream vLLM provides native support for PCP + MM.
-            self.pcp_size > 1 and self.supports_mm_inputs and get_pp_group().is_first_rank
-            and not self.model_config.is_encoder_decoder
+                # NOTE: This branch specifically triggers a deepcopy during the prefill phase
+                # only for PCP (Parallel Context Processing) + Multi-Modal (MM) scenarios.
+                # It does not affect other use cases. This is a temporary workaround and
+                # will be removed once upstream vLLM provides native support for PCP + MM.
+                self.pcp_size > 1 and self.supports_mm_inputs and get_pp_group().is_first_rank
+                and not self.model_config.is_encoder_decoder
         )):
             scheduler_output = deepcopy(scheduler_output)
         pp_group = get_pp_group()
@@ -3157,7 +3157,6 @@ class NPUModelRunner(GPUModelRunner):
         else:
             max_seq_len = self.optimistic_seq_lens_cpu.numpy()[:num_reqs].max().item()
 
-
         kv_cache_groups = self.kv_cache_config.kv_cache_groups
 
         def _get_pcp_metadata(block_table_tensor):
@@ -3813,6 +3812,7 @@ class NPUModelRunner(GPUModelRunner):
             # remove this part after the mix placement merged into vllm
             def mock_true():
                 return True
+
             rocm_aiter_ops.is_fusion_moe_shared_experts_enabled = mock_true
             rocm_aiter_ops.is_fused_moe_enabled = mock_true
 
@@ -3820,6 +3820,7 @@ class NPUModelRunner(GPUModelRunner):
             if self.eplb_enable:
                 def mock_pass(param1, param2):
                     return
+
                 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
                 DefaultModelLoader._init_ep_weight_filter = mock_pass
             self.model: nn.Module = get_model(vllm_config=self.vllm_config)
@@ -4437,7 +4438,6 @@ class NPUModelRunner(GPUModelRunner):
             reshaped_kv_tensors.append(tensor)
             storage_offset_bytes += stride[0] * dtype_size
         return reshaped_kv_tensors
-
 
     def _reshape_kv_cache_tensors(
             self,
