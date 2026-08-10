@@ -40,6 +40,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import AttentionSpec, CrossAttentionSpec
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend import envs
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.context_parallel.common_cp import AscendMetadataForDecode, AscendMetadataForPrefill
 from vllm_ascend.attention.kvcomp_attn.attention_utils import (
@@ -742,7 +743,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         metadata = attn_metadata[draft_step][key]
                         seq_lens = metadata.seq_lens_list
                         actual_seq_lengths_q = metadata.actual_seq_lengths_q
-                        block_tables = metadata.block_tables
+                        if not envs.VLLM_ECHO_ENABLED:
+                            block_tables = metadata.block_tables
                         attn_count = attn_count + 1
                         if not metadata.causal:
                             sparse_mode = 0
@@ -758,7 +760,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         # Keep the captured block_tables tensor on this affected path.
                         # Non-SWA models preserve the original behavior and continue to refresh
                         # block_tables from attn_metadata.
-                        if sliding_window is None:
+                        if sliding_window is None and not envs.VLLM_ECHO_ENABLED:
                             block_tables = attn_metadata[metadata_key].block_tables
 
                     torch.npu.graph_task_update_begin(update_stream, handle)

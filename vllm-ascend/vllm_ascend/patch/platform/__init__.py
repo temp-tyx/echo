@@ -53,3 +53,8 @@ import vllm_ascend.patch.platform.patch_speculative_config  # noqa
 if not vllm_version_is("0.23.0"):
     import vllm_ascend.patch.platform.patch_fused_moe  # noqa
     import vllm_ascend.patch.platform.patch_dp_device_ids  # noqa
+
+if envs.VLLM_ECHO_ENABLED:
+    from vllm_ascend.patch.platform.patch_echo_cudagraph import apply_patch as _apply_echo_cudagraph_patch
+
+    _apply_echo_cudagraph_patch()

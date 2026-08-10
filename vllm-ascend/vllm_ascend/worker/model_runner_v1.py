@@ -3502,6 +3502,15 @@ class NPUModelRunner(GPUModelRunner):
         elif profile_cpp:
             num_reqs = 1
             num_scheduled_tokens_list = [num_tokens] * num_reqs
+        elif envs.VLLM_ECHO_ENABLED and not uniform_decode:
+            # ECHO graph capture/warmup: build a single-request spec-decode
+            # dummy so build_for_cudagraph_capture derives
+            # num_decode_draft_tokens = num_tokens - 1 > 0 and produces
+            # spec-decode metadata. The captured graph shape is pinned to
+            # num_tokens=K_MAX; runtime num_reqs varies and is distinguished
+            # via device query_start_loc, so a 1-req dummy suffices.
+            num_reqs = 1
+            num_scheduled_tokens_list = [num_tokens]
         else:
             num_reqs = min(num_tokens, max_num_reqs)
             min_tokens_per_req = num_tokens // num_reqs
