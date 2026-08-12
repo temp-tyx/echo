@@ -3502,8 +3502,9 @@ class NPUModelRunner(GPUModelRunner):
         elif profile_cpp:
             num_reqs = 1
             num_scheduled_tokens_list = [num_tokens] * num_reqs
-        elif envs.VLLM_ECHO_ENABLED and not uniform_decode:
-            # ECHO graph capture/warmup: build a single-request spec-decode
+        elif (envs.VLLM_ECHO_ENABLED and not uniform_decode
+              and cudagraph_runtime_mode == CUDAGraphMode.FULL):
+            # ECHO FULL graph capture: build a single-request spec-decode
             # dummy so build_for_cudagraph_capture derives
             # num_decode_draft_tokens = num_tokens - 1 > 0 and produces
             # spec-decode metadata. The captured graph shape is pinned to

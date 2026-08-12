@@ -10,12 +10,19 @@ every ECHO decode step falls through to ``CUDAGraphMode.NONE`` (eager).
 
 This patch registers a single wildcard FULL descriptor
 (``num_tokens=K_MAX, num_reqs=None, uniform=False``) and makes ``dispatch``
-return it for any ECHO nonuniform batch with ``num_tokens <= K_MAX``. The graph
-shape is pinned to ``K_MAX`` tokens; per-request boundaries (``query_start_loc``)
+return it for any ECHO batch with ``num_tokens <= K_MAX``. The graph shape is
+pinned to ``K_MAX`` tokens; per-request boundaries (``query_start_loc``)
 and accepted counts (``num_accepted_tokens``) are device-side tensors whose
-*content* changes every replay while their shape stays fixed. GDN kernels
-already read these from device pointers (triton ``tl.load`` / C++ tiling uses
-shape only), so no host sync is needed inside the graph.
+*content* changes every replay while their shape stays fixed.
+
+When ``K_MAX`` coincides with a standard FULL decode capture size (e.g.
+``K_MAX == uniform_decode_query_len``), the ECHO wildcard *replaces* the
+standard descriptor at that size to avoid double-capturing FIA ops into the
+same ``graph_params.attn_params[K_MAX]`` list (which would double
+``attn_keys_length`` and pull GDN layer names into the FIA replay loop).
+The ECHO wildcard graph is structurally identical to the standard graph at
+that size (1 req × K_MAX tokens), so it serves both uniform-spec-decode and
+nonuniform-ECHO batches.
 """
 
 from __future__ import annotations
@@ -45,12 +52,9 @@ def _echo_initialize_cudagraph_keys(
         return
     if cudagraph_mode == CUDAGraphMode.NONE:
         return
-    # Only add the wildcard FULL key when FULL decode graphs are captured.
     if cudagraph_mode.decode_mode() != CUDAGraphMode.FULL:
         return
     k_max = _echo_k_max()
-    # Single wildcard graph: num_tokens fixed to K_MAX, num_reqs open
-    # (any bs <= K_MAX replays against it via device query_start_loc).
     wildcard = BatchDescriptor(
         num_tokens=k_max,
         num_reqs=None,
@@ -58,6 +62,18 @@ def _echo_initialize_cudagraph_keys(
         has_lora=False,
         num_active_loras=0,
     )
+    to_remove = {
+        d for d in self.cudagraph_keys[CUDAGraphMode.FULL]
+        if d.num_tokens == k_max
+    }
+    if to_remove:
+        self.cudagraph_keys[CUDAGraphMode.FULL] -= to_remove
+        logger.info(
+            "[ECHO_CG] replaced %s standard FULL descriptor(s) at "
+            "num_tokens=%s with ECHO wildcard",
+            len(to_remove),
+            k_max,
+        )
     self.add_cudagraph_key(CUDAGraphMode.FULL, wildcard)
     logger.info(
         "[ECHO_CG] registered ECHO FULL wildcard key: num_tokens=%s "
@@ -75,10 +91,9 @@ def _echo_dispatch(
     valid_modes=None,
     invalid_modes=None,
 ):
-    if envs.VLLM_ECHO_ENABLED and not uniform_decode:
-        # NOTE: the ECHO drafter is kept eager via use_cuda_graph=False in
-        # eagle_proposer (TODO: MTP num_spec=k_max//bs is structural, per-bs capture graph),
-        # so it never reaches this dispatch. Here we only handle the target.
+    if envs.VLLM_ECHO_ENABLED and (
+        not uniform_decode or num_tokens == _echo_k_max()
+    ):
         k_max = _echo_k_max()
         if num_tokens <= k_max:
             allowed = valid_modes or CUDAGraphMode.valid_runtime_modes()
@@ -95,15 +110,16 @@ def _echo_dispatch(
                 if wildcard in self.cudagraph_keys[CUDAGraphMode.FULL]:
                     logger.info(
                         "[ECHO_CG] dispatch FULL wildcard: num_tokens=%s "
-                        "-> padded=%s (nonuniform ECHO batch)",
+                        "uniform=%s -> padded=%s",
                         num_tokens,
+                        uniform_decode,
                         k_max,
                     )
                     return CUDAGraphMode.FULL, wildcard
                 logger.warning(
-                    "[ECHO_CG] ECHO nonuniform batch num_tokens=%s <= k_max=%s "
-                    "but no wildcard FULL key captured; fallback to orig "
-                    "dispatch (will be NONE).",
+                    "[ECHO_CG] ECHO batch num_tokens=%s <= k_max=%s "
+                    "but no wildcard FULL key captured; fallback to "
+                    "orig dispatch.",
                     num_tokens,
                     k_max,
                 )

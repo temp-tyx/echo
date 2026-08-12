@@ -760,7 +760,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         # Keep the captured block_tables tensor on this affected path.
                         # Non-SWA models preserve the original behavior and continue to refresh
                         # block_tables from attn_metadata.
-                        if sliding_window is None and not envs.VLLM_ECHO_ENABLED:
+                        if sliding_window is None:
                             block_tables = attn_metadata[metadata_key].block_tables
 
                     torch.npu.graph_task_update_begin(update_stream, handle)

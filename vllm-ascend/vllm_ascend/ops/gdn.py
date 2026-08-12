@@ -15,6 +15,7 @@
 # limitations under the License.
 #
 
+import logging
 import torch
 from einops import rearrange
 from vllm.distributed import get_pcp_group
@@ -27,6 +28,7 @@ from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata  # typ
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
@@ -34,6 +36,8 @@ from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
+
+logger = logging.getLogger(__name__)
 
 
 class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
@@ -336,6 +340,15 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
             actual_seq_lengths = attn_metadata.spec_decode_metadata.actual_seq_lengths
+            logger.info(
+                "[ECHO_DBG] GDN kernel: actual_seq_lengths.shape=%s val=%s "
+                "ssm_state_indices.shape=%s num_accepted_tokens.shape=%s "
+                "capturing=%s",
+                actual_seq_lengths.shape, actual_seq_lengths.tolist(),
+                spec_state_indices_tensor.flatten().shape,
+                spec_causal_conv1d_meta.num_accepted_tokens.to(torch.int32).shape,
+                _EXTRA_CTX.capturing,
+            )
             query_spec = l2norm_fwd(query_spec)
             key_spec = l2norm_fwd(key_spec)
             # Dispatches to the vllm-ascend AscendC custom operator

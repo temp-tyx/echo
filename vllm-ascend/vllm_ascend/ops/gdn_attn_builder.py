@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import torch
 from vllm.config import VllmConfig
 from vllm.distributed import get_pcp_group
+from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionCGSupport, CommonAttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionBackend,
@@ -39,6 +40,8 @@ from vllm_ascend.ops.triton.fla.utils import (
     prepare_final_chunk_indices,
     prepare_update_chunk_offsets,
 )
+
+logger = init_logger(__name__)
 
 _GDN_CHUNK_SIZE = 64
 # Keep this aligned with solve_tril.LARGE_BLOCK_T in ops/triton/fla/solve_tril.py.
@@ -409,17 +412,31 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             actual_seq_lengths_buffer = self.spec_actual_seq_lengths
         spec_num_rows = attn_metadata.spec_query_start_loc.size(0) - 1
 
+        actual_seq_lengths = _build_actual_seq_lengths(
+            attn_metadata.spec_query_start_loc,
+            num_sequences,
+            actual_seq_lengths_buffer,
+        )
+        logger.info(
+            "[ECHO_DBG] GDN spec: num_sequences=%s actual_seq_lengths.shape=%s "
+            "actual_seq_lengths=%s spec_query_start_loc=%s "
+            "spec_state_indices.shape=%s num_accepted_tokens.shape=%s "
+            "buffer_ptr=%s view_ptr=%s",
+            num_sequences, actual_seq_lengths.shape, actual_seq_lengths.tolist(),
+            attn_metadata.spec_query_start_loc.tolist(),
+            attn_metadata.spec_state_indices_tensor[:spec_num_rows].shape,
+            attn_metadata.num_accepted_tokens[:spec_num_rows].shape,
+            self.spec_actual_seq_lengths.data_ptr(),
+            actual_seq_lengths.data_ptr(),
+        )
+
         attn_metadata.spec_decode_metadata = GDNSpecDecodeMetadata(
             spec_causal_conv1d=GDNSpecCausalConv1dMetadata(
                 query_start_loc=attn_metadata.spec_query_start_loc,
                 cache_indices=attn_metadata.spec_state_indices_tensor[:spec_num_rows],
                 num_accepted_tokens=attn_metadata.num_accepted_tokens[:spec_num_rows],
             ),
-            actual_seq_lengths=_build_actual_seq_lengths(
-                attn_metadata.spec_query_start_loc,
-                num_sequences,
-                actual_seq_lengths_buffer,
-            ),
+            actual_seq_lengths=actual_seq_lengths,
         )
         return attn_metadata
 

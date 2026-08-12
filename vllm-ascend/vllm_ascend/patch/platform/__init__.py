@@ -54,6 +54,7 @@ if not vllm_version_is("0.23.0"):
     import vllm_ascend.patch.platform.patch_fused_moe  # noqa
     import vllm_ascend.patch.platform.patch_dp_device_ids  # noqa
 
+from vllm_ascend import envs
 if envs.VLLM_ECHO_ENABLED:
     from vllm_ascend.patch.platform.patch_echo_cudagraph import apply_patch as _apply_echo_cudagraph_patch
 
