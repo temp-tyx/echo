@@ -18,7 +18,6 @@ from dataclasses import dataclass
 import torch
 from vllm.config import VllmConfig
 from vllm.distributed import get_pcp_group
-from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionCGSupport, CommonAttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionBackend,
@@ -40,8 +39,6 @@ from vllm_ascend.ops.triton.fla.utils import (
     prepare_final_chunk_indices,
     prepare_update_chunk_offsets,
 )
-
-logger = init_logger(__name__)
 
 _GDN_CHUNK_SIZE = 64
 # Keep this aligned with solve_tril.LARGE_BLOCK_T in ops/triton/fla/solve_tril.py.
@@ -395,9 +392,6 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         attn_metadata: GDNAttentionMetadata,
     ) -> GDNAttentionMetadata:
         attn_metadata.spec_decode_metadata = None
-        print(f"[ECHO_DBG] _attach_spec: masks={attn_metadata.spec_sequence_masks} "
-              f"num_spec_decodes={attn_metadata.num_spec_decodes} "
-              f"num_prefills={attn_metadata.num_prefills} num_decodes={attn_metadata.num_decodes}")
         if attn_metadata.spec_sequence_masks is None:
             return attn_metadata
 
@@ -419,15 +413,6 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             attn_metadata.spec_query_start_loc,
             num_sequences,
             actual_seq_lengths_buffer,
-        )
-        logger.info(
-            "[ECHO_DBG] GDN spec: num_sequences=%s asl.shape=%s asl.ptr=%s "
-            "qsl.shape=%s ssi.shape=%s nat.shape=%s buffer_ptr=%s",
-            num_sequences, actual_seq_lengths.shape, actual_seq_lengths.data_ptr(),
-            attn_metadata.spec_query_start_loc.shape,
-            attn_metadata.spec_state_indices_tensor[:spec_num_rows].shape,
-            attn_metadata.num_accepted_tokens[:spec_num_rows].shape,
-            self.spec_actual_seq_lengths.data_ptr(),
         )
 
         attn_metadata.spec_decode_metadata = GDNSpecDecodeMetadata(
@@ -483,8 +468,6 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         num_decode_draft_tokens_cpu: torch.Tensor | None = None,
         fast_build: bool = False,
     ) -> GDNAttentionMetadata:
-        print(f"[ECHO_DBG] GDN build: cls={type(self).__name__} use_spec={self.use_spec_decode} "
-              f"nddt={num_decode_draft_tokens_cpu.shape if num_decode_draft_tokens_cpu is not None else None}")
         m = common_attn_metadata
 
         query_start_loc = m.query_start_loc
@@ -726,7 +709,12 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             # passed to conv1d/recurrent kernels at request granularity; padding
             # it to the token count makes the conv1d update kernel treat every
             # token as an independent decode sequence.
-            spec_batch_size = m.num_reqs
+            #
+            # ECHO: use decode_cudagraph_max_bs (not m.num_reqs) so the
+            # captured view is large enough for runtime batches with more
+            # requests.  The GDN kernel reads NULL_BLOCK_ID / zero-length
+            # padding entries as no-ops.
+            spec_batch_size = self.decode_cudagraph_max_bs
 
             self.spec_state_indices_tensor[spec_batch_size:].fill_(NULL_BLOCK_ID)
             self.spec_state_indices_tensor[:num_spec_decodes].copy_(
