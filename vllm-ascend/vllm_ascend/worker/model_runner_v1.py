@@ -59,6 +59,7 @@ from vllm.v1.attention.backend import (
     AttentionMetadata,
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
+from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.attention.selector import get_attn_backend  # type: ignore
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -3321,6 +3322,13 @@ class NPUModelRunner(GPUModelRunner):
                 )
 
             # add kvcomp_metadata into common_attn_metadata
+            if envs.VLLM_ECHO_ENABLED and isinstance(builder, GDNAttentionMetadataBuilder):
+                logger.info(
+                    "[ECHO_DBG] attn_group: builder=%s for_capture=%s "
+                    "is_gdn_subclass=%s",
+                    type(builder).__name__, for_cudagraph_capture,
+                    isinstance(builder, AscendGDNAttentionMetadataBuilder),
+                )
             if (for_cudagraph_capture
                     and not isinstance(builder, (
                             AscendDSAMetadataBuilder,

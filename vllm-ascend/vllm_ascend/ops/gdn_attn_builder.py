@@ -395,6 +395,9 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         attn_metadata: GDNAttentionMetadata,
     ) -> GDNAttentionMetadata:
         attn_metadata.spec_decode_metadata = None
+        print(f"[ECHO_DBG] _attach_spec: masks={attn_metadata.spec_sequence_masks} "
+              f"num_spec_decodes={attn_metadata.num_spec_decodes} "
+              f"num_prefills={attn_metadata.num_prefills} num_decodes={attn_metadata.num_decodes}")
         if attn_metadata.spec_sequence_masks is None:
             return attn_metadata
 
@@ -418,16 +421,13 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             actual_seq_lengths_buffer,
         )
         logger.info(
-            "[ECHO_DBG] GDN spec: num_sequences=%s actual_seq_lengths.shape=%s "
-            "actual_seq_lengths=%s spec_query_start_loc=%s "
-            "spec_state_indices.shape=%s num_accepted_tokens.shape=%s "
-            "buffer_ptr=%s view_ptr=%s",
-            num_sequences, actual_seq_lengths.shape, actual_seq_lengths.tolist(),
-            attn_metadata.spec_query_start_loc.tolist(),
+            "[ECHO_DBG] GDN spec: num_sequences=%s asl.shape=%s asl.ptr=%s "
+            "qsl.shape=%s ssi.shape=%s nat.shape=%s buffer_ptr=%s",
+            num_sequences, actual_seq_lengths.shape, actual_seq_lengths.data_ptr(),
+            attn_metadata.spec_query_start_loc.shape,
             attn_metadata.spec_state_indices_tensor[:spec_num_rows].shape,
             attn_metadata.num_accepted_tokens[:spec_num_rows].shape,
             self.spec_actual_seq_lengths.data_ptr(),
-            actual_seq_lengths.data_ptr(),
         )
 
         attn_metadata.spec_decode_metadata = GDNSpecDecodeMetadata(
@@ -483,6 +483,8 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         num_decode_draft_tokens_cpu: torch.Tensor | None = None,
         fast_build: bool = False,
     ) -> GDNAttentionMetadata:
+        print(f"[ECHO_DBG] GDN build: cls={type(self).__name__} use_spec={self.use_spec_decode} "
+              f"nddt={num_decode_draft_tokens_cpu.shape if num_decode_draft_tokens_cpu is not None else None}")
         m = common_attn_metadata
 
         query_start_loc = m.query_start_loc

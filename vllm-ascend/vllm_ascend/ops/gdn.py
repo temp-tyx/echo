@@ -341,10 +341,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         if spec_sequence_masks is not None:
             actual_seq_lengths = attn_metadata.spec_decode_metadata.actual_seq_lengths
             logger.info(
-                "[ECHO_DBG] GDN kernel: actual_seq_lengths.shape=%s val=%s "
-                "ssm_state_indices.shape=%s num_accepted_tokens.shape=%s "
-                "capturing=%s",
-                actual_seq_lengths.shape, actual_seq_lengths.tolist(),
+                "[ECHO_DBG] GDN kernel: asl.shape=%s asl.ptr=%s "
+                "ssi.shape=%s nat.shape=%s capturing=%s",
+                actual_seq_lengths.shape, actual_seq_lengths.data_ptr(),
                 spec_state_indices_tensor.flatten().shape,
                 spec_causal_conv1d_meta.num_accepted_tokens.to(torch.int32).shape,
                 _EXTRA_CTX.capturing,
