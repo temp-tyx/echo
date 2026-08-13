@@ -83,12 +83,6 @@ class AscendDflashProposer(AscendEagleProposer):
 
         self._dflash_num_context = num_context
         self._dflash_hidden_states[:num_context] = target_hidden_states
-        # Fill context_slot_mapping with -1 (PAD_SLOT_ID) so that positions
-        # beyond runtime num_context are skipped by reshape_and_cache during
-        # graph replay (precompute processes capture-time num_input_tokens
-        # which may be larger than runtime num_context). The kernel below
-        # overwrites positions [:num_context] with valid slot mappings.
-        self._context_slot_mapping_buffer.fill_(-1)
 
         token_indices_to_sample = torch.empty(
             batch_size * self.num_speculative_tokens,
@@ -242,8 +236,6 @@ class AscendDflashProposer(AscendEagleProposer):
 
             else:
                 self._dflash_num_context = num_input_tokens
-                self._dflash_num_input_tokens = num_input_tokens
-                self._before_run_draft()
                 self._runnable(
                     num_input_tokens=num_input_tokens,
                     batch_size=num_reqs,
@@ -262,18 +254,16 @@ class AscendDflashProposer(AscendEagleProposer):
         self,
         num_input_tokens: int,
     ) -> dict[str, Any]:
-        return dict(
-            input_ids=self.input_ids[:num_input_tokens],
-            positions=self.positions[:num_input_tokens],
-            inputs_embeds=None,
+        num_context = self._dflash_num_context
+
+        self.model.precompute_and_store_context_kv(
+            self._dflash_hidden_states[:num_context],
+            self._context_positions_buffer[:num_context],
+            self._context_slot_mapping_buffer[:num_context],
         )
 
-    def _before_run_draft(self):
-        num_input_tokens = self._dflash_num_input_tokens
-        self.model.precompute_and_store_context_kv(
-            self._dflash_hidden_states[:num_input_tokens],
-            self._context_positions_buffer[:num_input_tokens],
-            self._context_slot_mapping_buffer[:num_input_tokens],
+        return dict(
+            input_ids=self.input_ids[:num_input_tokens], positions=self.positions[:num_input_tokens], inputs_embeds=None
         )
 
     def _raise_if_multimodal(self):
