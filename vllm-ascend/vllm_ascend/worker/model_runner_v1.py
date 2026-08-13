@@ -1889,8 +1889,14 @@ class NPUModelRunner(GPUModelRunner):
         if self._draft_token_ids is None or not torch.is_tensor(self._draft_token_ids):
             return
         drafter = self.drafter
-        if drafter is None or not hasattr(drafter, "_echo_logits_list") or not drafter._echo_logits_list:
+        if drafter is None:
             return
+        if drafter.method == "dflash":
+            if not hasattr(drafter, "_echo_log_probs_buffer"):
+                return
+        else:
+            if not hasattr(drafter, "_echo_logits_list") or not drafter._echo_logits_list:
+                return
 
         draft_token_ids = self._draft_token_ids  # [bs_drafter, num_spec]
         logger.info("[ECHO] total draft: %s", draft_token_ids.tolist())
@@ -1925,31 +1931,23 @@ class NPUModelRunner(GPUModelRunner):
         draft_token_ids = draft_token_ids.index_select(0, idx_tensor)  # [actual_bs, total_steps]
         if drafter.method == "dflash":
             # === DFlash 2D 路径 ===
+            # Read pre-computed log probs from buffer (populated during
+            # drafter forward via _echo_store_log_probs NPU ops).
             original_bs = self._draft_token_ids.shape[0]
-            tokens_per_req = drafter._echo_logits_list[0].shape[0] // original_bs
+            buffer_size = original_bs * total_steps
+            draft_log_probs_flat = drafter._echo_log_probs_buffer[:buffer_size]
 
-            # 构建 token-level 索引并过滤 logits
-            selected_token_indices = []
+            # Select scheduled reqs' rows from buffer
+            selected_indices = []
             for idx in idx_tensor:
-                start = idx * tokens_per_req
-                selected_token_indices.append(
-                    torch.arange(start, start + tokens_per_req, device=draft_token_ids.device)
+                start = idx * total_steps
+                selected_indices.append(
+                    torch.arange(start, start + total_steps, device=draft_token_ids.device)
                 )
-            token_idx_tensor = torch.cat(selected_token_indices)
+            selected_indices = torch.cat(selected_indices)
+            step_log_probs_flat = draft_log_probs_flat[selected_indices]
 
-            logits_flat = torch.cat(drafter._echo_logits_list, dim=0)  # [bs_drafter*T, V]
-            logits_flat = logits_flat.index_select(0, token_idx_tensor)  # [actual_bs*T, V]
-            log_probs = F.log_softmax(logits_flat, dim=-1)  # [actual_bs*T, V]
-
-            # ⚠️ 关键修复：step_tokens 也必须展平为 1D，匹配 2D log_probs
-            step_tokens_flat = draft_token_ids.reshape(-1)  # [actual_bs*T]
-
-            # gather 在 dim=1 (vocab) 上执行，index 需 unsqueeze 到 2D
-            step_log_probs_flat = log_probs.gather(
-                1, step_tokens_flat.unsqueeze(-1)  # [actual_bs*T, 1]
-            ).squeeze(-1)  # [actual_bs*T]
-
-            # reshape 回 [actual_bs, T] 以复用后续 cumsum/mask 逻辑
+            # reshape to [actual_bs, T]
             cond_log_probs = step_log_probs_flat.view(actual_bs, total_steps)
 
         else:
