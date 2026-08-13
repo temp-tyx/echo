@@ -777,7 +777,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             _, ori_token_indices_to_sample = long_seq_args
 
         has_lora = len(self.runner.input_batch.lora_id_to_lora_request) > 0
-        uniform_decode = target_model_batch_desc.uniform
+        # Drafter always processes uniform spec-decode batches (each req has
+        # num_query_per_req tokens). Do NOT inherit target's uniform flag —
+        # when ECHO makes target non-uniform (uniform=False), drafter would
+        # be wrongly dispatched to ECHO wildcard graph (captured with
+        # different num_reqs), producing wrong/padding draft rows.
+        uniform_decode = True
 
         if self.use_cuda_graph:
             _, batch_descriptor = self.runner.cudagraph_dispatcher.dispatch(
@@ -1019,6 +1024,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             runnable = cast(Callable[..., Any], self._runnable)
             run_draft: Callable[[], Any] = partial(runnable, **model_inputs)
 
+            # Store num_input_tokens for dflash padding (capture-time num_context)
+            self._dflash_num_input_tokens = num_input_tokens
+
+            # Hook for drafter-specific precomputation that needs to run
+            # inside forward context but outside the graph (e.g. dflash's
+            # context padding to match capture-time num_context).
+            self._before_run_draft()
+
             if self.enable_enpu:
                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
                 draft_token_ids = run_draft()
@@ -1026,6 +1039,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 draft_token_ids = run_draft()
                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
         return draft_token_ids
+
+    def _before_run_draft(self):
+        """Hook for drafter-specific precomputation. Called inside
+        set_ascend_forward_context, before run_draft(). Override in
+        subclass if needed."""
+        pass
 
     def compute_draft_token_ids(self, hidden_states: torch.Tensor):
         if self.method in ("eagle3", "dflash"):

@@ -1939,6 +1939,22 @@ class NPUModelRunner(GPUModelRunner):
             buffer_size = original_bs * total_steps
             draft_log_probs_flat = drafter._echo_log_probs_buffer[:buffer_size]
 
+            # Debug: check buffer for NaN per req
+            for idx in sched_indices:
+                start = idx * total_steps
+                end = min(start + total_steps, buffer_size)
+                if end > start:
+                    buf_slice = draft_log_probs_flat[start:end]
+                    has_nan = torch.isnan(buf_slice).any().item()
+                    req_id = req_ids_drafter[idx] if idx < len(req_ids_drafter) else "?"
+                    draft_slice = self._draft_token_ids[idx]
+                    logger.info(
+                        "[ECHO_DBG] prune req idx=%s req_id=%s: "
+                        "buf_nan=%s buf[:3]=%s draft[:3]=%s",
+                        idx, req_id, has_nan,
+                        buf_slice[:3].tolist(), draft_slice[:3].tolist(),
+                    )
+
             # Filter to scheduled reqs
             selected_indices = []
             for idx in idx_tensor:

@@ -83,6 +83,12 @@ class AscendDflashProposer(AscendEagleProposer):
 
         self._dflash_num_context = num_context
         self._dflash_hidden_states[:num_context] = target_hidden_states
+        # Fill context_slot_mapping with -1 (PAD_SLOT_ID) so that positions
+        # beyond runtime num_context are skipped by reshape_and_cache during
+        # graph replay (precompute processes capture-time num_input_tokens
+        # which may be larger than runtime num_context). The kernel below
+        # overwrites positions [:num_context] with valid slot mappings.
+        self._context_slot_mapping_buffer.fill_(-1)
 
         token_indices_to_sample = torch.empty(
             batch_size * self.num_speculative_tokens,
@@ -236,6 +242,7 @@ class AscendDflashProposer(AscendEagleProposer):
 
             else:
                 self._dflash_num_context = num_input_tokens
+                self._before_run_draft()
                 self._runnable(
                     num_input_tokens=num_input_tokens,
                     batch_size=num_reqs,
@@ -254,17 +261,30 @@ class AscendDflashProposer(AscendEagleProposer):
         self,
         num_input_tokens: int,
     ) -> dict[str, Any]:
-        num_context = self._dflash_num_context
-
+        # precompute_and_store_context_kv runs INSIDE the graph so temporary
+        # tensors come from the graph pool (fixed size, no fragmentation).
+        # During replay, num_input_tokens is baked at capture-time (e.g. 112)
+        # but set_inputs_first_pass only fills [:runtime_num_context] (e.g.
+        # 64). The stale tail (positions 64-111) has slot_mapping filled with
+        # -1 (PAD_SLOT_ID) by set_inputs_first_pass, so reshape_and_cache
+        # skips those writes. seq_lens (set from runtime target value) limits
+        # attention's KV read range to only valid positions.
         self.model.precompute_and_store_context_kv(
-            self._dflash_hidden_states[:num_context],
-            self._context_positions_buffer[:num_context],
-            self._context_slot_mapping_buffer[:num_context],
+            self._dflash_hidden_states[:num_input_tokens],
+            self._context_positions_buffer[:num_input_tokens],
+            self._context_slot_mapping_buffer[:num_input_tokens],
         )
 
         return dict(
-            input_ids=self.input_ids[:num_input_tokens], positions=self.positions[:num_input_tokens], inputs_embeds=None
+            input_ids=self.input_ids[:num_input_tokens],
+            positions=self.positions[:num_input_tokens],
+            inputs_embeds=None,
         )
+
+    def _before_run_draft(self):
+        # precompute_and_store_context_kv is now called inside the graph
+        # (build_model_inputs_first_pass). This hook is intentionally empty.
+        pass
 
     def _raise_if_multimodal(self):
         pass
