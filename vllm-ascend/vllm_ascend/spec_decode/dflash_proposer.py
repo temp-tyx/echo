@@ -242,6 +242,7 @@ class AscendDflashProposer(AscendEagleProposer):
 
             else:
                 self._dflash_num_context = num_input_tokens
+                self._dflash_num_input_tokens = num_input_tokens
                 self._before_run_draft()
                 self._runnable(
                     num_input_tokens=num_input_tokens,
@@ -261,20 +262,6 @@ class AscendDflashProposer(AscendEagleProposer):
         self,
         num_input_tokens: int,
     ) -> dict[str, Any]:
-        # precompute_and_store_context_kv runs INSIDE the graph so temporary
-        # tensors come from the graph pool (fixed size, no fragmentation).
-        # During replay, num_input_tokens is baked at capture-time (e.g. 112)
-        # but set_inputs_first_pass only fills [:runtime_num_context] (e.g.
-        # 64). The stale tail (positions 64-111) has slot_mapping filled with
-        # -1 (PAD_SLOT_ID) by set_inputs_first_pass, so reshape_and_cache
-        # skips those writes. seq_lens (set from runtime target value) limits
-        # attention's KV read range to only valid positions.
-        self.model.precompute_and_store_context_kv(
-            self._dflash_hidden_states[:num_input_tokens],
-            self._context_positions_buffer[:num_input_tokens],
-            self._context_slot_mapping_buffer[:num_input_tokens],
-        )
-
         return dict(
             input_ids=self.input_ids[:num_input_tokens],
             positions=self.positions[:num_input_tokens],
@@ -282,9 +269,12 @@ class AscendDflashProposer(AscendEagleProposer):
         )
 
     def _before_run_draft(self):
-        # precompute_and_store_context_kv is now called inside the graph
-        # (build_model_inputs_first_pass). This hook is intentionally empty.
-        pass
+        num_input_tokens = self._dflash_num_input_tokens
+        self.model.precompute_and_store_context_kv(
+            self._dflash_hidden_states[:num_input_tokens],
+            self._context_positions_buffer[:num_input_tokens],
+            self._context_slot_mapping_buffer[:num_input_tokens],
+        )
 
     def _raise_if_multimodal(self):
         pass
