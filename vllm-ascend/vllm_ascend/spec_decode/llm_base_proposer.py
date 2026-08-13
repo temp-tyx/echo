@@ -485,7 +485,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         if self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs() and self.use_cuda_graph:
             logger.info(
                 "[spec_decode/base] Wrapping draft model with ACLGraphWrapper:"
-                " runtime_mode=FULL, use_eagle=%s, enable_enpu=%s",
+                " runtime_mode=PIECEWISE, use_eagle=%s, enable_enpu=%s",
                 self.use_eagle,
                 self.enable_enpu,
             )
@@ -493,7 +493,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             self._runnable = ACLGraphWrapper(
                 self._run_merged_draft,
                 self.vllm_config,
-                runtime_mode=CUDAGraphMode.FULL,
+                runtime_mode=CUDAGraphMode.PIECEWISE,
                 use_eagle=self.use_eagle,
                 enable_enpu=self.enable_enpu,
             )
