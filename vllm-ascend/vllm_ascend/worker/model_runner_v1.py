@@ -1892,7 +1892,7 @@ class NPUModelRunner(GPUModelRunner):
         if drafter is None:
             return
         if drafter.method == "dflash":
-            if not hasattr(drafter, "_echo_log_probs_buffer"):
+            if not hasattr(drafter, "_echo_logits_buffer"):
                 return
         else:
             if not hasattr(drafter, "_echo_logits_list") or not drafter._echo_logits_list:
@@ -1931,20 +1931,19 @@ class NPUModelRunner(GPUModelRunner):
         draft_token_ids = draft_token_ids.index_select(0, idx_tensor)  # [actual_bs, total_steps]
         if drafter.method == "dflash":
             # === DFlash 2D 路径 ===
-            # Read pre-computed log probs from buffer (populated during
-            # drafter forward via NPU ops: log_softmax + gather + copy_).
-            # Buffer layout: [bs_drafter * total_steps] flat, ordered by
-            # req then by draft step. We select scheduled reqs' rows.
+            # Read logits from buffer (copied via copy_ in graph).
+            # Compute log_softmax + gather here (outside graph, eager)
+            # to avoid large [N, V] intermediates in graph pool.
             original_bs = self._draft_token_ids.shape[0]
             buffer_size = original_bs * total_steps
-            draft_log_probs_flat = drafter._echo_log_probs_buffer[:buffer_size]
+            logits_buffer = drafter._echo_logits_buffer[:buffer_size]
 
             # Debug: check buffer for NaN per req
             for idx in sched_indices:
                 start = idx * total_steps
                 end = min(start + total_steps, buffer_size)
                 if end > start:
-                    buf_slice = draft_log_probs_flat[start:end]
+                    buf_slice = logits_buffer[start:end]
                     has_nan = torch.isnan(buf_slice).any().item()
                     req_id = req_ids_drafter[idx] if idx < len(req_ids_drafter) else "?"
                     draft_slice = self._draft_token_ids[idx]
@@ -1952,10 +1951,11 @@ class NPUModelRunner(GPUModelRunner):
                         "[ECHO_DBG] prune req idx=%s req_id=%s: "
                         "buf_nan=%s buf[:3]=%s draft[:3]=%s",
                         idx, req_id, has_nan,
-                        buf_slice[:3].tolist(), draft_slice[:3].tolist(),
+                        buf_slice[0, :3].tolist() if buf_slice.dim() > 1 else buf_slice[:3].tolist(),
+                        draft_slice[:3].tolist(),
                     )
 
-            # Filter to scheduled reqs
+            # Select scheduled reqs' rows
             selected_indices = []
             for idx in idx_tensor:
                 start = idx * total_steps
@@ -1963,7 +1963,14 @@ class NPUModelRunner(GPUModelRunner):
                     torch.arange(start, start + total_steps, device=draft_token_ids.device)
                 )
             selected_indices = torch.cat(selected_indices)
-            step_log_probs_flat = draft_log_probs_flat[selected_indices]
+            selected_logits = logits_buffer[selected_indices]  # [actual_bs*T, V]
+
+            # Compute log_probs outside graph (eager, default pool)
+            log_probs = F.log_softmax(selected_logits, dim=-1)
+            step_tokens_flat = draft_token_ids.reshape(-1)  # [actual_bs*T]
+            step_log_probs_flat = log_probs.gather(
+                1, step_tokens_flat.unsqueeze(-1)
+            ).squeeze(-1)
 
             cond_log_probs = step_log_probs_flat.view(actual_bs, total_steps)
 
@@ -2238,15 +2245,11 @@ class NPUModelRunner(GPUModelRunner):
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 )
 
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(
-                        "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
-                        "should_ubatch: %s, num_tokens_across_dp: %s",
-                        cudagraph_mode,
-                        batch_desc,
-                        should_ubatch,
-                        num_tokens_across_dp,
-                    )
+                logger.info(
+                    "[ECHO_DBG] target runtime: cudagraph_mode=%s batch_desc=%s",
+                    cudagraph_mode,
+                    batch_desc,
+                )
 
                 num_tokens_padded = batch_desc.num_tokens
                 num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
@@ -3581,6 +3584,7 @@ class NPUModelRunner(GPUModelRunner):
                 f"Cudagraph runtime mode mismatch in dummy_run. "
                 f"Expected {_cudagraph_mode}, but got {cudagraph_runtime_mode}."
             )
+        logger.info("[ECHO_DBG] target dummy_run: mode=%s num_tokens=%s", cudagraph_runtime_mode, num_tokens)
         num_tokens_padded = batch_desc.num_tokens
         num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
         if num_tokens_across_dp is not None and num_tokens_padded != num_tokens:
