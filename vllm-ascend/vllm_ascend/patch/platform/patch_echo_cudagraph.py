@@ -81,6 +81,25 @@ def _echo_initialize_cudagraph_keys(
         k_max,
     )
 
+    # Register PIECEWISE keys for drafter dispatch (target FULL + draft PIECEWISE).
+    # PIECEWISE uses relaxed matching: num_reqs=None, uniform=False.
+    # The drafter passes valid_modes={PIECEWISE, NONE} to skip FULL,
+    # so these keys only affect the drafter, not the target (which
+    # gets FULL via ECHO wildcard before PIECEWISE is checked).
+    for capture_size in self.compilation_config.cudagraph_capture_sizes:
+        piecewise_desc = BatchDescriptor(
+            num_tokens=capture_size,
+            num_reqs=None,
+            uniform=False,
+            has_lora=False,
+            num_active_loras=0,
+        )
+        self.add_cudagraph_key(CUDAGraphMode.PIECEWISE, piecewise_desc)
+    logger.info(
+        "[ECHO_CG] registered PIECEWISE keys for drafter: sizes=%s",
+        self.compilation_config.cudagraph_capture_sizes,
+    )
+
 
 def _echo_dispatch(
     self,

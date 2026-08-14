@@ -171,6 +171,11 @@ class AscendDflashProposer(AscendEagleProposer):
 
         if not self.use_cuda_graph:
             aclgraph_runtime_mode = CUDAGraphMode.NONE
+        # Override FULL to PIECEWISE for drafter — target uses FULL,
+        # drafter uses PIECEWISE. set_ascend_forward_context uses
+        # ContextVar so target's FULL context is restored after.
+        if aclgraph_runtime_mode == CUDAGraphMode.FULL:
+            aclgraph_runtime_mode = CUDAGraphMode.PIECEWISE
         num_query_per_req = 1 + self.num_speculative_tokens
         num_query_total = num_reqs * num_query_per_req
 
@@ -178,7 +183,7 @@ class AscendDflashProposer(AscendEagleProposer):
         context_states = self.hidden_states[:num_input_tokens]
 
         multi_steps_attn_metadata = []
-        if aclgraph_runtime_mode == CUDAGraphMode.FULL and len(self.runner.attn_groups) > 0:
+        if aclgraph_runtime_mode in (CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE) and len(self.runner.attn_groups) > 0:
             builder = self.draft_attn_groups[0].get_metadata_builder()
             common_attn_metadata = AscendCommonAttentionMetadata(
                 query_start_loc=self.arange_dflash[: num_reqs + 1] * num_query_per_req,

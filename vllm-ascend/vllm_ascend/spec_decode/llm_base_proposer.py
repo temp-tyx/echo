@@ -495,7 +495,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             self._runnable = ACLGraphWrapper(
                 self._run_merged_draft,
                 self.vllm_config,
-                runtime_mode=CUDAGraphMode.FULL,
+                runtime_mode=CUDAGraphMode.PIECEWISE,
                 use_eagle=self.use_eagle,
                 enable_enpu=self.enable_enpu,
             )
@@ -779,10 +779,19 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         has_lora = len(self.runner.input_batch.lora_id_to_lora_request) > 0
         uniform_decode = target_model_batch_desc.uniform
+        # For dflash: restrict dispatch to PIECEWISE+NONE so the drafter
+        # never gets FULL (which would conflict with its PIECEWISE
+        # ACLGraphWrapper). The target uses default valid_modes (all)
+        # so it still gets FULL via ECHO wildcard.
+        draft_valid_modes = (
+            {CUDAGraphMode.PIECEWISE, CUDAGraphMode.NONE}
+            if self.method == "dflash" else None
+        )
 
         if self.use_cuda_graph:
             _, batch_descriptor = self.runner.cudagraph_dispatcher.dispatch(
-                num_tokens=num_tokens, uniform_decode=uniform_decode, has_lora=has_lora
+                num_tokens=num_tokens, uniform_decode=uniform_decode, has_lora=has_lora,
+                valid_modes=draft_valid_modes,
             )
             num_input_tokens = batch_descriptor.num_tokens
         else:
@@ -796,7 +805,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         if self.use_cuda_graph:
             aclgraph_runtime_mode, batch_descriptor = self.runner.cudagraph_dispatcher.dispatch(
-                num_tokens=num_input_tokens, uniform_decode=uniform_decode, has_lora=has_lora
+                num_tokens=num_input_tokens, uniform_decode=uniform_decode, has_lora=has_lora,
+                valid_modes=draft_valid_modes,
             )
             num_input_tokens = batch_descriptor.num_tokens
         else:
