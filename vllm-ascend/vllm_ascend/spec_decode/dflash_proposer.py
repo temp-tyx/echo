@@ -256,19 +256,11 @@ class AscendDflashProposer(AscendEagleProposer):
     ) -> dict[str, Any]:
         num_context = self._dflash_num_context
 
-        # Chunk precompute when context exceeds graph-captured size to
-        # avoid large temporary tensors (e.g. 248MB for 5266 context
-        # tokens in mixed prefill+decode batches). Pure decode
-        # (num_context == num_input_tokens) runs 1 chunk, identical to
-        # original behavior — graph capture and replay unaffected.
-        chunk_size = num_input_tokens
-        for start in range(0, num_context, chunk_size):
-            end = min(start + chunk_size, num_context)
-            self.model.precompute_and_store_context_kv(
-                self._dflash_hidden_states[start:end],
-                self._context_positions_buffer[start:end],
-                self._context_slot_mapping_buffer[start:end],
-            )
+        self.model.precompute_and_store_context_kv(
+            self._dflash_hidden_states[:num_context],
+            self._context_positions_buffer[:num_context],
+            self._context_slot_mapping_buffer[:num_context],
+        )
 
         return dict(
             input_ids=self.input_ids[:num_input_tokens], positions=self.positions[:num_input_tokens], inputs_embeds=None

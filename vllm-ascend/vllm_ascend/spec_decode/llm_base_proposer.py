@@ -51,6 +51,7 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.parallel_state import get_lmhead_tp_group
 from vllm_ascend.models.llama_eagle3_vwn import Eagle3VwnLlamaForCausalLM
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
+from vllm_ascend.ops.triton.echo_prune import fused_gather_logsumexp
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 from vllm_ascend.utils import check_gdn_layer, enable_sp, lmhead_tp_enable, shared_expert_dp_enabled
 from vllm_ascend.worker.utils import copy_snapshot_to_gpu
@@ -1063,7 +1064,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if not hasattr(self.model, "draft_id_to_target_id") or self.model.draft_id_to_target_id is None:
                 draft_tokens = greedy_sample(logits)
                 if envs.VLLM_ECHO_ENABLED:
-                    self._echo_store_logits(logits)
+                    self._echo_store_log_probs(logits, draft_tokens)
                 return draft_tokens
             logits = logits.contiguous()
             next_token = greedy_sample(logits)
@@ -1071,32 +1072,36 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 next_token.shape
             )
             if envs.VLLM_ECHO_ENABLED:
-                self._echo_store_logits(logits)
+                self._echo_store_log_probs(logits, next_token)
             return next_token + bias
         else:
             logits = self.model.compute_logits(hidden_states)
             draft_tokens = greedy_sample(logits)
             if envs.VLLM_ECHO_ENABLED:
-                self._echo_store_logits(logits)
+                self._echo_store_log_probs(logits, draft_tokens)
             return draft_tokens
 
-    def _echo_store_logits(self, logits: torch.Tensor):
-        """Copy logits to pre-allocated buffer using NPU copy_.
+    def _echo_store_log_probs(self, logits: torch.Tensor, draft_tokens: torch.Tensor):
+        """Compute per-draft-token log probs using a fused Triton kernel.
 
-        Only copy_ is used (no log_softmax/logsumexp/gather) so the
-        graph pool does not allocate large [N, V] intermediate tensors.
-        The pruning code (outside the graph) computes log_softmax +
-        gather from this buffer.
+        The kernel computes logits[i, draft_tokens[i]] - logsumexp(logits[i])
+        in chunks over V, without materializing [N, V] intermediate tensors.
+        This avoids both graph pool overhead (logsumexp intermediates) and
+        default pool overhead (logits buffer). Only a tiny [N] float32
+        buffer is needed.
         """
-        if not hasattr(self, "_echo_logits_buffer"):
-            self._echo_logits_buffer = torch.empty(
+        if not hasattr(self, "_echo_log_probs_buffer"):
+            self._echo_log_probs_buffer = torch.empty(
                 self.vllm_config.scheduler_config.max_num_seqs
                 * (1 + self.num_speculative_tokens),
-                logits.shape[-1],
-                dtype=logits.dtype,
+                dtype=torch.float32,
                 device=logits.device,
             )
-        self._echo_logits_buffer[: logits.shape[0]].copy_(logits)
+        fused_gather_logsumexp(
+            logits,
+            draft_tokens,
+            self._echo_log_probs_buffer,
+        )
 
     def _run_merged_draft(
         self,
@@ -1216,7 +1221,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     )
                 draft_token_ids = logits.argmax(dim=-1)
                 if envs.VLLM_ECHO_ENABLED:
-                    self._echo_store_logits(logits)
+                    self._echo_store_log_probs(logits, draft_token_ids)
         else:
             logits = self.model.compute_logits(sample_hidden_states)
             if lmhead_tp_enable():
@@ -1229,7 +1234,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 )
             draft_token_ids = logits.argmax(dim=-1)
             if envs.VLLM_ECHO_ENABLED:
-                self._echo_store_logits(logits)
+                self._echo_store_log_probs(logits, draft_token_ids)
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:

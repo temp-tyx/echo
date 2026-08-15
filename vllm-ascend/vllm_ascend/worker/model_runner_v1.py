@@ -1892,7 +1892,7 @@ class NPUModelRunner(GPUModelRunner):
         if drafter is None:
             return
         if drafter.method == "dflash":
-            if not hasattr(drafter, "_echo_logits_buffer"):
+            if not hasattr(drafter, "_echo_log_probs_buffer"):
                 return
         else:
             if not hasattr(drafter, "_echo_logits_list") or not drafter._echo_logits_list:
@@ -1931,20 +1931,18 @@ class NPUModelRunner(GPUModelRunner):
         draft_token_ids = draft_token_ids.index_select(0, idx_tensor)  # [actual_bs, total_steps]
         if drafter.method == "dflash":
             # === DFlash 2D 路径 ===
-            # Read logits from buffer (copied via copy_ in graph).
-            # Compute log_softmax + gather here (outside graph, eager)
-            # to avoid large [N, V] intermediates in graph pool.
+            # Read pre-computed log probs from tiny buffer (populated
+            # during drafter forward via fused Triton kernel).
             original_bs = self._draft_token_ids.shape[0]
-            tokens_per_req = drafter._echo_logits_buffer.shape[0] // original_bs if original_bs > 0 else total_steps
-            buffer_size = original_bs * tokens_per_req
-            logits_flat = drafter._echo_logits_buffer[:buffer_size]
+            buffer_size = original_bs * total_steps
+            draft_log_probs_flat = drafter._echo_log_probs_buffer[:buffer_size]
 
             # Debug: check buffer for NaN per req
             for idx in sched_indices:
-                start = idx * tokens_per_req
-                end = min(start + tokens_per_req, buffer_size)
+                start = idx * total_steps
+                end = min(start + total_steps, buffer_size)
                 if end > start:
-                    buf_slice = logits_flat[start:end]
+                    buf_slice = draft_log_probs_flat[start:end]
                     has_nan = torch.isnan(buf_slice).any().item()
                     req_id = req_ids_drafter[idx] if idx < len(req_ids_drafter) else "?"
                     draft_slice = self._draft_token_ids[idx]
@@ -1952,26 +1950,18 @@ class NPUModelRunner(GPUModelRunner):
                         "[ECHO_DBG] prune req idx=%s req_id=%s: "
                         "buf_nan=%s buf[:3]=%s draft[:3]=%s",
                         idx, req_id, has_nan,
-                        buf_slice[0, :3].tolist() if buf_slice.dim() > 1 else buf_slice[:3].tolist(),
-                        draft_slice[:3].tolist(),
+                        buf_slice[:3].tolist(), draft_slice[:3].tolist(),
                     )
 
-            # Select scheduled reqs' rows
+            # Filter to scheduled reqs
             selected_indices = []
             for idx in idx_tensor:
-                start = idx * tokens_per_req
+                start = idx * total_steps
                 selected_indices.append(
-                    torch.arange(start, start + tokens_per_req, device=draft_token_ids.device)
+                    torch.arange(start, start + total_steps, device=draft_token_ids.device)
                 )
             selected_indices = torch.cat(selected_indices)
-            selected_logits = logits_flat[selected_indices]  # [actual_bs*T, V]
-
-            # Compute log_probs outside graph (eager, default pool)
-            log_probs = F.log_softmax(selected_logits, dim=-1)
-            step_tokens_flat = draft_token_ids.reshape(-1)  # [actual_bs*T]
-            step_log_probs_flat = log_probs.gather(
-                1, step_tokens_flat.unsqueeze(-1)
-            ).squeeze(-1)
+            step_log_probs_flat = draft_log_probs_flat[selected_indices]
 
             cond_log_probs = step_log_probs_flat.view(actual_bs, total_steps)
 
