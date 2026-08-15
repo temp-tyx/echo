@@ -51,8 +51,7 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.parallel_state import get_lmhead_tp_group
 from vllm_ascend.models.llama_eagle3_vwn import Eagle3VwnLlamaForCausalLM
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
-from vllm_ascend.ops.triton.echo_prune import fused_gather_logsumexp
-from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
+
 from vllm_ascend.utils import check_gdn_layer, enable_sp, lmhead_tp_enable, shared_expert_dp_enabled
 from vllm_ascend.worker.utils import copy_snapshot_to_gpu
 
@@ -1082,13 +1081,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             return draft_tokens
 
     def _echo_store_log_probs(self, logits: torch.Tensor, draft_tokens: torch.Tensor):
-        """Compute per-draft-token log probs using a fused Triton kernel.
+        """Compute per-draft-token log probs using fused AscendC kernel.
 
-        The kernel computes logits[i, draft_tokens[i]] - logsumexp(logits[i])
-        in chunks over V, without materializing [N, V] intermediate tensors.
-        This avoids both graph pool overhead (logsumexp intermediates) and
-        default pool overhead (logits buffer). Only a tiny [N] float32
-        buffer is needed.
+        Computes logits[i, draft_tokens[i]] - logsumexp(logits[i])
+        without materializing [N, V] intermediate tensors.
         """
         if not hasattr(self, "_echo_log_probs_buffer"):
             self._echo_log_probs_buffer = torch.empty(
@@ -1097,11 +1093,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 dtype=torch.float32,
                 device=logits.device,
             )
-        fused_gather_logsumexp(
-            logits,
-            draft_tokens,
-            self._echo_log_probs_buffer,
-        )
+        output = torch.ops._C_ascend.npu_fused_gather_logsumexp(logits, draft_tokens)
+        self._echo_log_probs_buffer[:output.shape[0]].copy_(output)
 
     def _run_merged_draft(
         self,

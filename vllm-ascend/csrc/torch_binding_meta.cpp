@@ -808,6 +808,14 @@ std::tuple<at::Tensor, at::Tensor> npu_fused_gdn_gating_meta(
     return std::make_tuple(g, beta_output);
 }
 
+at::Tensor npu_fused_gather_logsumexp_meta(
+    const at::Tensor& logits,
+    const at::Tensor& draft_tokens)
+{
+    int64_t numRows = logits.size(0);
+    return at::empty_symint({numRows}, logits.options().dtype(c10::kFloat));
+}
+
 std::vector<at::Tensor> moe_grouped_matmul_meta(
     at::Tensor x,
     at::Tensor weight,
@@ -1876,6 +1884,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("store_kv_block", &vllm_ascend::meta::store_kv_block);
     // npu_fused_gdn_gating
     ops.impl("npu_fused_gdn_gating", &vllm_ascend::meta::npu_fused_gdn_gating_meta);
+    // npu_fused_gather_logsumexp
+    ops.impl("npu_fused_gather_logsumexp", &vllm_ascend::meta::npu_fused_gather_logsumexp_meta);
 }
 }
 #endif
