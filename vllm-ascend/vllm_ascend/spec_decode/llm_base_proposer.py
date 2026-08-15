@@ -51,6 +51,7 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.parallel_state import get_lmhead_tp_group
 from vllm_ascend.models.llama_eagle3_vwn import Eagle3VwnLlamaForCausalLM
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
+from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 
 from vllm_ascend.utils import check_gdn_layer, enable_sp, lmhead_tp_enable, shared_expert_dp_enabled
 from vllm_ascend.worker.utils import copy_snapshot_to_gpu
@@ -1093,6 +1094,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 dtype=torch.float32,
                 device=logits.device,
             )
+        if not hasattr(self, "_echo_log_call_count"):
+            self._echo_log_call_count = 0
+        self._echo_log_call_count += 1
+        if self._echo_log_call_count <= 10:
+            print(f"[ECHO_LOG_PROBS] call#{self._echo_log_call_count} "
+                  f"logits={logits.shape} draft_tokens={draft_tokens.shape}", flush=True)
         output = torch.ops._C_ascend.npu_fused_gather_logsumexp(logits, draft_tokens)
         self._echo_log_probs_buffer[:output.shape[0]].copy_(output)
 

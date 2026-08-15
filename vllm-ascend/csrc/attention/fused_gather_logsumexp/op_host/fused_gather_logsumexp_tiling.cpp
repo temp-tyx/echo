@@ -28,6 +28,7 @@ constexpr uint64_t TILING_KEY_BF16 = 1;
 constexpr uint64_t TILING_KEY_FP16 = 2;
 constexpr size_t INPUT_INDEX_LOGITS = 0;
 constexpr uint32_t BLOCK_V = 4096;
+constexpr uint32_t TILE_N = 8;
 
 } // namespace
 
@@ -71,7 +72,10 @@ ge::graphStatus FusedGatherLogsumexpTilingFunc(gert::TilingContext *context)
         tilingKey = TILING_KEY_FP16;
     }
 
-    uint32_t blockDim = static_cast<uint32_t>(numRows);
+    // blockDim = number of cores = min(numTiles, aivNum)
+    // Each core processes tiles in round-robin
+    uint32_t numTiles = (static_cast<uint32_t>(numRows) + TILE_N - 1) / TILE_N;
+    uint32_t blockDim = numTiles;
     if (blockDim > aivNum) {
         blockDim = aivNum;
     }
