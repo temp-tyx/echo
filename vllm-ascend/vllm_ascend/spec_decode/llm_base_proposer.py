@@ -1063,7 +1063,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if not hasattr(self.model, "draft_id_to_target_id") or self.model.draft_id_to_target_id is None:
                 draft_tokens = greedy_sample(logits)
                 if envs.VLLM_ECHO_ENABLED:
-                    self._echo_store_log_probs(logits, draft_tokens)
+                    self._echo_store_logits(logits)
                 return draft_tokens
             logits = logits.contiguous()
             next_token = greedy_sample(logits)
@@ -1071,35 +1071,32 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 next_token.shape
             )
             if envs.VLLM_ECHO_ENABLED:
-                self._echo_store_log_probs(logits, next_token)
+                self._echo_store_logits(logits)
             return next_token + bias
         else:
             logits = self.model.compute_logits(hidden_states)
             draft_tokens = greedy_sample(logits)
             if envs.VLLM_ECHO_ENABLED:
-                self._echo_store_log_probs(logits, draft_tokens)
+                self._echo_store_logits(logits)
             return draft_tokens
 
-    def _echo_store_log_probs(self, logits: torch.Tensor, draft_tokens: torch.Tensor):
-        """Compute per-draft-token log probs using NPU ops and store in tiny buffer.
+    def _echo_store_logits(self, logits: torch.Tensor):
+        """Copy logits to pre-allocated buffer using NPU copy_.
 
-        Uses gather + logsumexp + subtract (all NPU ops) to avoid
-        materializing [N, V] intermediate in graph pool. Only the
-        gathered log probs [N] (a few hundred bytes) are stored.
+        Only copy_ is used (no log_softmax/logsumexp/gather) so the
+        graph pool does not allocate large [N, V] intermediate tensors.
+        The pruning code (outside the graph) computes log_softmax +
+        gather from this buffer.
         """
-        if not hasattr(self, "_echo_log_probs_buffer"):
-            self._echo_log_probs_buffer = torch.empty(
+        if not hasattr(self, "_echo_logits_buffer"):
+            self._echo_logits_buffer = torch.empty(
                 self.vllm_config.scheduler_config.max_num_seqs
-                * self.num_speculative_tokens,
+                * (1 + self.num_speculative_tokens),
+                logits.shape[-1],
                 dtype=logits.dtype,
                 device=logits.device,
             )
-        draft_logits = logits.gather(1, draft_tokens.view(-1, 1)).squeeze(-1)
-        lse = torch.logsumexp(logits, dim=-1)
-        draft_log_probs = draft_logits - lse
-        self._echo_log_probs_buffer[: draft_log_probs.shape[0]].copy_(
-            draft_log_probs
-        )
+        self._echo_logits_buffer[: logits.shape[0]].copy_(logits)
 
     def _run_merged_draft(
         self,
@@ -1219,7 +1216,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     )
                 draft_token_ids = logits.argmax(dim=-1)
                 if envs.VLLM_ECHO_ENABLED:
-                    self._echo_store_log_probs(logits, draft_token_ids)
+                    self._echo_store_logits(logits)
         else:
             logits = self.model.compute_logits(sample_hidden_states)
             if lmhead_tp_enable():
@@ -1232,7 +1229,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 )
             draft_token_ids = logits.argmax(dim=-1)
             if envs.VLLM_ECHO_ENABLED:
-                self._echo_store_log_probs(logits, draft_token_ids)
+                self._echo_store_logits(logits)
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
