@@ -13,12 +13,17 @@
  *
  * Online softmax: iterate V in chunks of BLOCK_V, accumulating
  * max_val and sum_exp without materializing an [N, V] intermediate.
+ *
+ * Patterns borrowed from rms_norm_dynamic_quant:
+ *   - ReduceMaxInplace / ReduceSumInplace (Max+repeat -> WholeReduceMax)
+ *   - V<->S event sync around GetValue
+ *   - Duplicate + vector Exp/Ln for scalar math (no <cmath>)
+ *   - DataCopyPad with empty pad params {}
  */
 
 #ifndef FUSED_GATHER_LOGSUMEXP_KERNEL_H
 #define FUSED_GATHER_LOGSUMEXP_KERNEL_H
 
-#include <cmath>
 #include <type_traits>
 
 #include "kernel_operator.h"
@@ -29,13 +34,13 @@ namespace FusedGatherLogsumexp {
 using namespace AscendC;
 
 constexpr uint32_t BYTES_PER_BLOCK = 32;
-constexpr uint32_t FP32_PER_BLOCK  = BYTES_PER_BLOCK / sizeof(float);    // 8
-constexpr uint32_t ELEM_PER_REP_FP32 = 64;                               // 64 fp32 per vector repeat
-constexpr uint32_t BLOCK_V = 4096;                                        // chunk size for V iteration
+constexpr uint32_t FP32_PER_BLOCK  = BYTES_PER_BLOCK / sizeof(float);  // 8
+constexpr uint32_t ELEM_PER_REP_FP32 = 64;
+constexpr uint32_t BLOCK_V = 4096;
 constexpr float NEG_INF_VAL = -1e30f;
 
 template <typename T>
-__aicore__ inline T CeilDiv(T a, T b) { return (a + b - 1) / b; }
+__aicore__ inline T CeilDivT(T a, T b) { return (a + b - 1) / b; }
 
 template <typename InDtype>
 class KernelFusedGatherLogsumexp {
@@ -52,17 +57,18 @@ public:
         vocabSize_  = tiling->vocabSize;
         blockV_     = tiling->blockV;
 
-        const uint64_t logitsElem = static_cast<uint64_t>(numRows_) * vocabSize_;
-        logitsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ InDtype *>(logitsGm), logitsElem);
+        logitsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ InDtype *>(logitsGm),
+                                  static_cast<uint64_t>(numRows_) * vocabSize_);
         draftTokensGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(draftTokensGm), numRows_);
         outputGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(outputGm), numRows_);
 
-        uint32_t alignedBlockV = AlignUp<uint32_t>(blockV_, static_cast<uint32_t>(BYTES_PER_BLOCK / sizeof(InDtype)));
-
-        pipe_->InitBuffer(inQue_, 1, alignedBlockV * sizeof(InDtype));
+        pipe_->InitBuffer(inQue_, 1, blockV_ * sizeof(InDtype));
         pipe_->InitBuffer(fp32Buf_, blockV_ * sizeof(float));
         pipe_->InitBuffer(reduceBuf_, blockV_ * sizeof(float));
-        pipe_->InitBuffer(outBuf_, FP32_PER_BLOCK * sizeof(float));
+        pipe_->InitBuffer(scalarBuf_, FP32_PER_BLOCK * sizeof(float));
+        pipe_->InitBuffer(draftBuf_, FP32_PER_BLOCK * sizeof(InDtype));
+        pipe_->InitBuffer(draftFp32Buf_, FP32_PER_BLOCK * sizeof(float));
+        pipe_->InitBuffer(outQue_, 1, FP32_PER_BLOCK * sizeof(float));
     }
 
     __aicore__ inline void Process()
@@ -77,17 +83,29 @@ public:
     }
 
 private:
-    /*!
-     * \brief In-place max reduction of `count` fp32 elements to a single value at [0].
-     * Uses element-wise Max with repeat to reduce to 64 elements,
-     * then WholeReduceMax for the final 64 -> 1.
-     * Supports count in [64, 255*64].
-     */
+    // ---- helpers: event sync (from rms_norm_dynamic_quant) ----
+
+    __aicore__ inline void SyncVS()
+    {
+        event_t eventVS = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::V_S));
+        SetFlag<HardEvent::V_S>(eventVS);
+        WaitFlag<HardEvent::V_S>(eventVS);
+    }
+
+    __aicore__ inline void SyncSV()
+    {
+        event_t eventSV = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::S_V));
+        SetFlag<HardEvent::S_V>(eventSV);
+        WaitFlag<HardEvent::S_V>(eventSV);
+    }
+
+    // ---- helpers: reduction (from rms_norm_dynamic_quant) ----
+
     __aicore__ inline void ReduceMaxInplace(const LocalTensor<float>& buf, uint32_t count)
     {
-        uint32_t repsFp32  = count >> 6;       // count / 64
-        uint32_t offset    = repsFp32 << 6;    // repsFp32 * 64
-        uint32_t remsFp32  = count & 0x3f;     // count % 64
+        uint32_t repsFp32 = count >> 6;
+        uint32_t offset   = repsFp32 << 6;
+        uint32_t remsFp32 = count & 0x3f;
 
         if (repsFp32 > 1) {
             Max(buf, buf[ELEM_PER_REP_FP32], buf, ELEM_PER_REP_FP32, repsFp32 - 1, {1, 1, 1, 0, 8, 0});
@@ -102,14 +120,11 @@ private:
         PipeBarrier<PIPE_V>();
     }
 
-    /*!
-     * \brief In-place sum reduction of `count` fp32 elements to a single value at [0].
-     */
     __aicore__ inline void ReduceSumInplace(const LocalTensor<float>& buf, uint32_t count)
     {
-        uint32_t repsFp32  = count >> 6;
-        uint32_t offset    = repsFp32 << 6;
-        uint32_t remsFp32  = count & 0x3f;
+        uint32_t repsFp32 = count >> 6;
+        uint32_t offset   = repsFp32 << 6;
+        uint32_t remsFp32 = count & 0x3f;
 
         if (repsFp32 > 1) {
             Add(buf, buf[ELEM_PER_REP_FP32], buf, ELEM_PER_REP_FP32, repsFp32 - 1, {1, 1, 1, 0, 8, 0});
@@ -124,105 +139,131 @@ private:
         PipeBarrier<PIPE_V>();
     }
 
+    // ---- helpers: scalar math via vector ops on small buffer ----
+
+    __aicore__ inline float ScalarExp(float val)
+    {
+        LocalTensor<float> buf = scalarBuf_.Get<float>();
+        Duplicate(buf, val, FP32_PER_BLOCK);
+        PipeBarrier<PIPE_V>();
+        Exp(buf, buf, FP32_PER_BLOCK);
+        PipeBarrier<PIPE_V>();
+        SyncVS();
+        return buf.GetValue(0);
+    }
+
+    __aicore__ inline float ScalarLog(float val)
+    {
+        LocalTensor<float> buf = scalarBuf_.Get<float>();
+        Duplicate(buf, val, FP32_PER_BLOCK);
+        PipeBarrier<PIPE_V>();
+        Ln(buf, buf, FP32_PER_BLOCK);
+        PipeBarrier<PIPE_V>();
+        SyncVS();
+        return buf.GetValue(0);
+    }
+
+    // ---- main per-row processing ----
+
     __aicore__ inline void ProcessOneRow(uint32_t row)
     {
-        // 1. Read draft_token index from GM.
+        // 1. Read draft_token from GM (GlobalTensor::GetValue, no sync needed).
         int64_t draftTok = draftTokensGm_.GetValue(row);
 
-        // 2. Online softmax: accumulate max_val and sum_exp over V in chunks.
-        float maxVal  = NEG_INF_VAL;
-        float sumExp  = 0.0f;
+        // 2. Online softmax: accumulate maxVal and sumExp over V in chunks.
+        float maxVal = NEG_INF_VAL;
+        float sumExp = 0.0f;
 
-        const uint32_t numChunks = CeilDiv<uint32_t>(vocabSize_, blockV_);
+        const uint32_t numChunks = CeilDivT<uint32_t>(vocabSize_, blockV_);
 
         for (uint32_t chunk = 0; chunk < numChunks; ++chunk) {
-            uint32_t vStart  = chunk * blockV_;
-            uint32_t vCount  = (vStart + blockV_ <= vocabSize_) ? blockV_ : (vocabSize_ - vStart);
-            uint32_t padCount = blockV_ - vCount;
+            uint32_t vStart = chunk * blockV_;
+            uint32_t vCount = (vStart + blockV_ <= vocabSize_) ? blockV_ : (vocabSize_ - vStart);
 
             // --- Load chunk from GM to UB ---
             LocalTensor<InDtype> logitChunk = inQue_.template AllocTensor<InDtype>();
-
-            if (padCount > 0) {
-                DataCopyExtParams copyParams{1, static_cast<uint32_t>(vCount * sizeof(InDtype)), 0, 0, 0};
-                DataCopyPadExtParams<InDtype> padParams{true, 0, static_cast<int32_t>(padCount),
-                                                        static_cast<InDtype>(-std::numeric_limits<float>::infinity())};
-                DataCopyPad(logitChunk, logitsGm_[static_cast<uint64_t>(row) * vocabSize_ + vStart],
-                            copyParams, padParams);
-            } else {
-                DataCopyExtParams copyParams{1, static_cast<uint32_t>(blockV_ * sizeof(InDtype)), 0, 0, 0};
-                DataCopyPadExtParams<InDtype> padParams{false, 0, 0, static_cast<InDtype>(0)};
-                DataCopyPad(logitChunk, logitsGm_[static_cast<uint64_t>(row) * vocabSize_ + vStart],
-                            copyParams, padParams);
-            }
-
+            DataCopyExtParams copyParams{
+                1,
+                static_cast<uint32_t>(vCount * sizeof(InDtype)),
+                0, 0, 0
+            };
+            DataCopyPad(logitChunk,
+                        logitsGm_[static_cast<uint64_t>(row) * vocabSize_ + vStart],
+                        copyParams, {});
             inQue_.template EnQue<InDtype>(logitChunk);
             logitChunk = inQue_.template DeQue<InDtype>();
 
-            // --- Cast bf16/fp16 -> fp32 ---
+            // --- Cast bf16/fp16 -> fp32 (all BLOCK_V, padding will be garbage) ---
             LocalTensor<float> fp32Chunk = fp32Buf_.Get<float>();
             Cast(fp32Chunk, logitChunk, RoundMode::CAST_NONE, blockV_);
             PipeBarrier<PIPE_V>();
-
             inQue_.FreeTensor(logitChunk);
+
+            // --- Fill padding with -INF (for last chunk) ---
+            if (vCount < blockV_) {
+                Duplicate(fp32Chunk[vCount], NEG_INF_VAL, blockV_ - vCount);
+                PipeBarrier<PIPE_V>();
+            }
 
             // --- Find chunk max (copy to reduceBuf, reduce in-place) ---
             LocalTensor<float> reduceBuf = reduceBuf_.Get<float>();
             Adds(reduceBuf, fp32Chunk, 0.0f, blockV_);
             PipeBarrier<PIPE_V>();
             ReduceMaxInplace(reduceBuf, blockV_);
+            SyncVS();
             float chunkMax = reduceBuf.GetValue(0);
 
-            // --- Update global max and rescale sum_exp ---
+            // --- Update global max and rescale sumExp ---
             float newMax = (chunkMax > maxVal) ? chunkMax : maxVal;
-            float rescale = std::exp(maxVal - newMax);
+            float rescale = ScalarExp(maxVal - newMax);
             sumExp = sumExp * rescale;
 
-            // --- Shift chunk: fp32Chunk -= newMax ---
-            Subs(fp32Chunk, fp32Chunk, newMax, blockV_);
+            // --- Shift chunk: fp32Chunk -= newMax (Adds with negative) ---
+            Adds(fp32Chunk, fp32Chunk, -newMax, blockV_);
             PipeBarrier<PIPE_V>();
 
             // --- Exp: fp32Chunk = exp(fp32Chunk) ---
             Exp(fp32Chunk, fp32Chunk, blockV_);
             PipeBarrier<PIPE_V>();
 
-            // --- Sum chunk (in-place, we don't need exp values after) ---
+            // --- Sum chunk (in-place) ---
             ReduceSumInplace(fp32Chunk, blockV_);
+            SyncVS();
             float chunkSum = fp32Chunk.GetValue(0);
 
             sumExp += chunkSum;
             maxVal = newMax;
         }
 
-        // 3. Compute lse = maxVal + log(sumExp).
-        float lse = maxVal + std::log(sumExp);
+        // 3. lse = maxVal + log(sumExp)
+        float lse = maxVal + ScalarLog(sumExp);
 
-        // 4. Read draft_logit from GM (single element).
-        InDtype draftLogitRaw = logitsGm_.GetValue(static_cast<uint64_t>(row) * vocabSize_ + draftTok);
-        float draftLogit = ToFloat(draftLogitRaw);
+        // 4. Read draft_logit from GM via DataCopyPad + Cast + GetValue.
+        LocalTensor<InDtype> draftBuf = draftBuf_.Get<InDtype>();
+        DataCopyExtParams draftCopy{
+            1,
+            static_cast<uint32_t>(sizeof(InDtype)),
+            0, 0, 0
+        };
+        DataCopyPad(draftBuf,
+                    logitsGm_[static_cast<uint64_t>(row) * vocabSize_ + draftTok],
+                    draftCopy, {});
+        LocalTensor<float> draftFp32 = draftFp32Buf_.Get<float>();
+        Cast(draftFp32, draftBuf, RoundMode::CAST_NONE, FP32_PER_BLOCK);
+        PipeBarrier<PIPE_V>();
+        SyncVS();
+        float draftLogit = draftFp32.GetValue(0);
 
         // 5. Compute and write output.
         float result = draftLogit - lse;
 
-        LocalTensor<float> outBuf = outBuf_.Get<float>();
-        outBuf.SetValue(0, result);
-        PipeBarrier<PIPE_V>();
-
+        LocalTensor<float> outBuf = outQue_.template AllocTensor<float>();
+        Duplicate(outBuf, result, FP32_PER_BLOCK);
+        outQue_.template EnQue<float>(outBuf);
+        outBuf = outQue_.template DeQue<float>();
         DataCopyParams outParams{1, static_cast<uint16_t>(sizeof(float)), 0, 0};
         DataCopyPad(outputGm_[row], outBuf, outParams);
-    }
-
-    /*!
-     * \brief Convert bf16/fp16 scalar to float.
-     */
-    __aicore__ inline float ToFloat(bfloat16_t val)
-    {
-        return val.toFloat();
-    }
-
-    __aicore__ inline float ToFloat(half val)
-    {
-        return val.toFloat();
+        outQue_.FreeTensor(outBuf);
     }
 
 private:
@@ -230,12 +271,16 @@ private:
 
     GlobalTensor<InDtype>  logitsGm_;
     GlobalTensor<int64_t>  draftTokensGm_;
-    GlobalTensor<float>    outputGm_;
+    GlobalTensor<float>     outputGm_;
 
-    TQue<QuePosition::VECIN, 1>  inQue_;
-    TBuf<TPosition::VECCALC>     fp32Buf_;
-    TBuf<TPosition::VECCALC>     reduceBuf_;
-    TBuf<TPosition::VECCALC>     outBuf_;
+    TQue<QuePosition::VECIN, 1>   inQue_;
+    TQue<QuePosition::VECOUT, 1>  outQue_;
+
+    TBuf<TPosition::VECCALC>  fp32Buf_;
+    TBuf<TPosition::VECCALC>  reduceBuf_;
+    TBuf<TPosition::VECCALC>  scalarBuf_;
+    TBuf<TPosition::VECCALC>  draftBuf_;
+    TBuf<TPosition::VECCALC>  draftFp32Buf_;
 
     uint32_t numRows_{0};
     uint32_t vocabSize_{0};
