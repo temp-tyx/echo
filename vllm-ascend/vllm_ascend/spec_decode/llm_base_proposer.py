@@ -1094,12 +1094,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 dtype=torch.float32,
                 device=logits.device,
             )
-        if not hasattr(self, "_echo_log_call_count"):
-            self._echo_log_call_count = 0
-        self._echo_log_call_count += 1
-        if self._echo_log_call_count <= 10:
-            print(f"[ECHO_LOG_PROBS] call#{self._echo_log_call_count} "
-                  f"logits={logits.shape} draft_tokens={draft_tokens.shape}", flush=True)
         output = torch.ops._C_ascend.npu_fused_gather_logsumexp(logits, draft_tokens)
         self._echo_log_probs_buffer[:output.shape[0]].copy_(output)
 

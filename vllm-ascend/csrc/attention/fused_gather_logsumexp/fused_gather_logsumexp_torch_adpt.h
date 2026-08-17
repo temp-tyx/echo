@@ -7,21 +7,7 @@
 #ifndef FUSED_GATHER_LOGSUMEXP_TORCH_ADPT_H
 #define FUSED_GATHER_LOGSUMEXP_TORCH_ADPT_H
 
-#include <cstdio>
-
 namespace vllm_ascend {
-
-inline void log_fused_gather_logsumexp(const at::Tensor& logits, const at::Tensor& draft_tokens)
-{
-    static int call_count = 0;
-    if (call_count < 10) {
-        printf("[fused_gather_logsumexp] call#%d logits=[%ld,%ld] dtype=%d draft_tokens=[%ld] dtype=%d\n",
-               call_count,
-               logits.size(0), logits.size(1), static_cast<int>(logits.scalar_type()),
-               draft_tokens.size(0), static_cast<int>(draft_tokens.scalar_type()));
-        call_count++;
-    }
-}
 
 at::Tensor npu_fused_gather_logsumexp(
     const at::Tensor& logits,
@@ -34,8 +20,6 @@ at::Tensor npu_fused_gather_logsumexp(
                 logits.size(0), " draft_tokens.size(0)=", draft_tokens.size(0));
     TORCH_CHECK(draft_tokens.scalar_type() == at::kLong,
                 "draft_tokens must be int64, got ", draft_tokens.scalar_type());
-
-    log_fused_gather_logsumexp(logits, draft_tokens);
 
     int64_t numRows = logits.size(0);
 
