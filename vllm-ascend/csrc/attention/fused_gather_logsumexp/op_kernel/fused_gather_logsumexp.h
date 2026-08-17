@@ -76,7 +76,7 @@ public:
         //   rowMaxBuf:    8*4       = 32B   (row max after across-chunk reduce)
         //   rowSumBuf:    8*4       = 32B   (row sum after across-chunk reduce)
         //   draftInBuf:   8*8       = 32B   (for DataCopyPad draft_token int64)
-        //   draftLogitBuf: 8*2      = 16B   (for DataCopyPad draft_logit bf16)
+        //   draftLogitBuf: 8*32      = 256B  (for DataCopyPad draft_logit, 32B per element)
         //   draftFp32Buf: 8*4       = 32B   (for Cast draft_logit to fp32)
         //   outQue:        8*4       = 32B   (UB→GM queue, depth=1)
         // Total: ~196KB < 256KB
@@ -88,8 +88,8 @@ public:
         pipe_->InitBuffer(rowMaxBuf_, TILE_N * sizeof(float));
         pipe_->InitBuffer(rowSumBuf_, TILE_N * sizeof(float));
         pipe_->InitBuffer(draftInBuf_, FP32_PER_BLOCK * sizeof(int64_t));
-        pipe_->InitBuffer(draftLogitBuf_, FP32_PER_BLOCK * sizeof(InDtype));
-        pipe_->InitBuffer(draftFp32Buf_, FP32_PER_BLOCK * sizeof(float));
+        pipe_->InitBuffer(draftLogitBuf_, TILE_N * BYTES_PER_BLOCK);
+        pipe_->InitBuffer(draftFp32Buf_, TILE_N * BYTES_PER_BLOCK);
         pipe_->InitBuffer(outQue_, 1, TILE_N * sizeof(float));
     }
 
@@ -363,24 +363,30 @@ private:
             }
 
             // Load draft logits via DataCopyPad per row (no GlobalTensor::GetValue)
+            // Each element placed 32B apart to satisfy DMA 32-byte alignment
             LocalTensor<InDtype> draftLogitRaw = draftLogitBuf_.Get<InDtype>();
+            uint32_t elemStride = BYTES_PER_BLOCK / sizeof(InDtype);  // bf16: 16, fp16: 16
             for (uint32_t i = 0; i < rowCount; ++i) {
                 uint32_t row = rowStart + i;
                 uint64_t offset = static_cast<uint64_t>(row) * vocabSize_ + draftTok[i];
                 DataCopyExtParams cp{1, static_cast<uint32_t>(sizeof(InDtype)), 0, 0, 0};
-                DataCopyPad(draftLogitRaw[i], logitsGm_[offset], cp, {});
+                DataCopyPad(draftLogitRaw[i * elemStride], logitsGm_[offset], cp, {});
             }
 
-            // Cast draft logits to fp32 (Cast API, no manual bit manipulation)
+            // Cast draft logits to fp32 — need to gather from 32B-spaced positions
+            // Cast each element individually (32B-aligned positions), then pack contiguously
             LocalTensor<float> draftFp32 = draftFp32Buf_.Get<float>();
-            Cast(draftFp32, draftLogitRaw, RoundMode::CAST_NONE, FP32_PER_BLOCK);
-            PipeBarrier<PIPE_V>();
+            uint32_t fp32Stride = BYTES_PER_BLOCK / sizeof(float);  // 8
+            for (uint32_t i = 0; i < rowCount; ++i) {
+                Cast(draftFp32[i * fp32Stride], draftLogitRaw[i * elemStride], RoundMode::CAST_NONE, 1);
+                PipeBarrier<PIPE_V>();
+            }
 
             // V->S sync: read draft logits as scalars
             SyncVS();
             float draftLogit[TILE_N];
             for (uint32_t i = 0; i < TILE_N; ++i) {
-                draftLogit[i] = (i < rowCount) ? draftFp32.GetValue(i) : 0.0f;
+                draftLogit[i] = (i < rowCount) ? draftFp32.GetValue(i * fp32Stride) : 0.0f;
             }
 
             // result[i] = draftLogit[i] - lse[i]  (C++ scalar math)
