@@ -16,17 +16,13 @@
  *   Pass 2: per-row sum(exp(x-max)) (same chunking, subtract max via Adds scalar)
  *   Final: lse = max + log(sum), gather draft logit, subtract, write
  *
- * Sync: 3 per tile (V->S after pass1, V->S after pass2, S->V before output).
- * Total for 512 rows: 64 tiles * 3 = 192 syncs (vs old 93,696).
- *
- * Patterns from rms_norm_dynamic_quant:
- *   - ReduceMaxInplace/ReduceSumInplace (Max+repeat -> WholeReduceMax)
- *   - V->S SetFlag/WaitFlag before GetValue
- *   - S->V SetFlag/WaitFlag after SetValue
- *   - PipeBarrier<PIPE_V> after vector ops
- *
- * Patterns from recurrent_gated_delta_rule:
- *   - GlobalTensor::GetValue for index lookup (no sync for GM read)
+ * Compliant with AscendC coding guidelines:
+ *   - No GlobalTensor::GetValue (uses DataCopyPad for GM reads)
+ *   - No std::/cmath math (uses Ln vector op for log)
+ *   - No manual bit manipulation (uses Cast API for dtype conversion)
+ *   - DataCopyPad for all GM↔UB transfers
+ *   - DataCopyPadExtParams for padding handling
+ *   - Batched DataCopyPad (blockCount=rowCount) for multi-row loading
  */
 
 #ifndef FUSED_GATHER_LOGSUMEXP_KERNEL_H
@@ -73,15 +69,16 @@ public:
         outputGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(outputGm), numRows_);
 
         // UB budget (TILE_N=8, BLOCK_V=4096, bf16):
-        //   inQue:      8*4096*2  =  64KB
-        //   fp32Buf:    8*4096*4  = 128KB
-        //   maxBuf:     61*8*4   ~ 2KB
-        //   sumBuf:     61*8*4   ~ 2KB
-        //   rowMaxBuf:  8*4       = 32B
-        //   rowSumBuf:  8*4       = 32B
-        //   lseBuf:     8*4       = 32B
-        //   draftFp32:  8*4       = 32B
-        //   outQue:     8*4       = 32B
+        //   inQue:        8*4096*2  =  64KB  (GM→UB queue, depth=1)
+        //   fp32Buf:      8*4096*4  = 128KB  (fp32 compute buffer)
+        //   maxBuf:       61*8*4   ~ 2KB   (chunk max per row)
+        //   sumBuf:       61*8*4   ~ 2KB   (chunk sum per row)
+        //   rowMaxBuf:    8*4       = 32B   (row max after across-chunk reduce)
+        //   rowSumBuf:    8*4       = 32B   (row sum after across-chunk reduce)
+        //   draftInBuf:   8*8       = 32B   (for DataCopyPad draft_token int64)
+        //   draftLogitBuf: 8*2      = 16B   (for DataCopyPad draft_logit bf16)
+        //   draftFp32Buf: 8*4       = 32B   (for Cast draft_logit to fp32)
+        //   outQue:        8*4       = 32B   (UB→GM queue, depth=1)
         // Total: ~196KB < 256KB
 
         pipe_->InitBuffer(inQue_, 1, TILE_N * blockV_ * sizeof(InDtype));
@@ -90,8 +87,9 @@ public:
         pipe_->InitBuffer(sumBuf_, numChunks_ * TILE_N * sizeof(float));
         pipe_->InitBuffer(rowMaxBuf_, TILE_N * sizeof(float));
         pipe_->InitBuffer(rowSumBuf_, TILE_N * sizeof(float));
-        pipe_->InitBuffer(lseBuf_, TILE_N * sizeof(float));
-        pipe_->InitBuffer(draftFp32Buf_, TILE_N * sizeof(float));
+        pipe_->InitBuffer(draftInBuf_, FP32_PER_BLOCK * sizeof(int64_t));
+        pipe_->InitBuffer(draftLogitBuf_, FP32_PER_BLOCK * sizeof(InDtype));
+        pipe_->InitBuffer(draftFp32Buf_, FP32_PER_BLOCK * sizeof(float));
         pipe_->InitBuffer(outQue_, 1, TILE_N * sizeof(float));
     }
 
@@ -111,7 +109,7 @@ public:
     }
 
 private:
-    // ---- event sync helpers (from rms_norm_dynamic_quant) ----
+    // ---- event sync helpers ----
 
     __aicore__ inline void SyncVS()
     {
@@ -167,6 +165,30 @@ private:
         PipeBarrier<PIPE_V>();
     }
 
+    // ---- batched GM→UB load using DataCopyPad with blockCount ----
+
+    __aicore__ inline void LoadChunk(
+        const LocalTensor<InDtype>& dst,
+        uint32_t rowStart, uint32_t rowCount,
+        uint32_t vStart, uint32_t vCount)
+    {
+        // Batched load: blockCount=rowCount, each block is vCount elements
+        // GM stride between rows = vocabSize * sizeof(InDtype) (in bytes)
+        // UB stride between rows = blockV * sizeof(InDtype) / 32 (in 32B blocks)
+        uint32_t dstStrideBlocks = (blockV_ * sizeof(InDtype)) / BYTES_PER_BLOCK;
+
+        DataCopyExtParams copyParams{
+            static_cast<uint16_t>(rowCount),                           // blockCount
+            static_cast<uint32_t>(vCount * sizeof(InDtype)),          // blockLen (bytes)
+            static_cast<uint32_t>(vocabSize_ * sizeof(InDtype)),      // srcStride (GM, bytes)
+            dstStrideBlocks,                                          // dstStride (UB, 32B blocks)
+            0
+        };
+        DataCopyPadExtParams<InDtype> padParams{false, 0, 0, static_cast<InDtype>(0)};
+        DataCopyPad(dst, logitsGm_[static_cast<uint64_t>(rowStart) * vocabSize_ + vStart],
+                    copyParams, padParams);
+    }
+
     // ---- main tile processing ----
 
     __aicore__ inline void ProcessTile(uint32_t rowStart, uint32_t rowCount)
@@ -179,14 +201,9 @@ private:
                 uint32_t vStart = chunk * blockV_;
                 uint32_t vCount = (vStart + blockV_ <= vocabSize_) ? blockV_ : (vocabSize_ - vStart);
 
-                // Load [rowCount, vCount] from GM (per row, contiguous)
+                // Batched load [rowCount, vCount] from GM
                 LocalTensor<InDtype> logitChunk = inQue_.template AllocTensor<InDtype>();
-                for (uint32_t i = 0; i < rowCount; ++i) {
-                    DataCopyExtParams cp{1, static_cast<uint32_t>(vCount * sizeof(InDtype)), 0, 0, 0};
-                    DataCopyPad(logitChunk[i * blockV_],
-                                logitsGm_[static_cast<uint64_t>(rowStart + i) * vocabSize_ + vStart],
-                                cp, {});
-                }
+                LoadChunk(logitChunk, rowStart, rowCount, vStart, vCount);
                 inQue_.template EnQue<InDtype>(logitChunk);
                 logitChunk = inQue_.template DeQue<InDtype>();
 
@@ -208,7 +225,6 @@ private:
                 for (uint32_t i = 0; i < rowCount; ++i) {
                     ReduceMaxInplace(fp32Chunk[i * blockV_], blockV_);
                     // fp32Chunk[i*blockV_ + 0] = per-row max for this chunk
-
                     // Store to maxBuf[chunk * TILE_N + i]
                     Adds(maxBuf[chunk * TILE_N + i], fp32Chunk[i * blockV_], 0.0f, 1);
                 }
@@ -222,9 +238,6 @@ private:
             LocalTensor<float> rowMax = rowMaxBuf_.Get<float>();
 
             if (numChunks_ > 1) {
-                // Max with repeat: [numChunks, TILE_N] -> [TILE_N]
-                // src layout: [chunk0: 0..TILE_N-1, chunk1: TILE_N..2*TILE_N-1, ...]
-                // dst: [TILE_N] = max across all chunks per row
                 Max(rowMax, maxBuf[TILE_N], maxBuf, TILE_N, numChunks_ - 1, {1, 1, 1, 0, 1, 0});
                 PipeBarrier<PIPE_V>();
             } else {
@@ -251,14 +264,9 @@ private:
                 uint32_t vStart = chunk * blockV_;
                 uint32_t vCount = (vStart + blockV_ <= vocabSize_) ? blockV_ : (vocabSize_ - vStart);
 
-                // Load [rowCount, vCount] from GM
+                // Batched load [rowCount, vCount] from GM
                 LocalTensor<InDtype> logitChunk = inQue_.template AllocTensor<InDtype>();
-                for (uint32_t i = 0; i < rowCount; ++i) {
-                    DataCopyExtParams cp{1, static_cast<uint32_t>(vCount * sizeof(InDtype)), 0, 0, 0};
-                    DataCopyPad(logitChunk[i * blockV_],
-                                logitsGm_[static_cast<uint64_t>(rowStart + i) * vocabSize_ + vStart],
-                                cp, {});
-                }
+                LoadChunk(logitChunk, rowStart, rowCount, vStart, vCount);
                 inQue_.template EnQue<InDtype>(logitChunk);
                 logitChunk = inQue_.template DeQue<InDtype>();
 
@@ -277,7 +285,6 @@ private:
                 }
 
                 // Subtract rowMax per row: Adds(fp32Chunk, fp32Chunk, -rowMax[i], BLOCK_V)
-                // rowMax[i] is C++ scalar from GetValue, no sync needed for Adds
                 for (uint32_t i = 0; i < rowCount; ++i) {
                     Adds(fp32Chunk[i * blockV_], fp32Chunk[i * blockV_], -rowMax[i], blockV_);
                 }
@@ -322,25 +329,58 @@ private:
 
         // ===== Final: lse, gather draft logit, compute result =====
         {
-            // lse[i] = rowMax[i] + log(rowSum[i])  (pure C++ scalar math)
+            // lse = rowMax + log(rowSum) — batched vector ops, 1 sync
+            LocalTensor<float> rowMax = rowMaxBuf_.Get<float>();
+            LocalTensor<float> rowSum = rowSumBuf_.Get<float>();
+            Ln(rowSum, rowSum, TILE_N);           // log(sum)
+            PipeBarrier<PIPE_V>();
+            Add(rowSum, rowSum, rowMax, TILE_N);  // lse = max + log(sum)
+            PipeBarrier<PIPE_V>();
+            SyncVS();
             float lse[TILE_N];
             for (uint32_t i = 0; i < TILE_N; ++i) {
-                lse[i] = rowMax[i] + logf(rowSum[i]);
+                lse[i] = rowSum.GetValue(i);
             }
 
-            // Gather draft logit: logits[rowStart+i, draft_tokens[rowStart+i]]
-            // Use GlobalTensor::GetValue (like recurrent_gated_delta_rule, no sync for GM read)
+            // Gather draft tokens: DataCopyPad from GM (no GlobalTensor::GetValue)
+            LocalTensor<int64_t> draftTokBuf = draftInBuf_.Get<int64_t>();
+            DataCopyExtParams tokCp{
+                static_cast<uint16_t>(rowCount),
+                static_cast<uint32_t>(sizeof(int64_t)),
+                0, 0, 0
+            };
+            DataCopyPad(draftTokBuf, draftTokensGm_[rowStart], tokCp, {});
+
+            // MTE2->S sync: read draft tokens as scalars
+            {
+                event_t ev = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_S));
+                SetFlag<HardEvent::MTE2_S>(ev);
+                WaitFlag<HardEvent::MTE2_S>(ev);
+            }
+            int64_t draftTok[TILE_N];
+            for (uint32_t i = 0; i < rowCount; ++i) {
+                draftTok[i] = draftTokBuf.GetValue(i);
+            }
+
+            // Load draft logits via DataCopyPad per row (no GlobalTensor::GetValue)
+            LocalTensor<InDtype> draftLogitRaw = draftLogitBuf_.Get<InDtype>();
+            for (uint32_t i = 0; i < rowCount; ++i) {
+                uint32_t row = rowStart + i;
+                uint64_t offset = static_cast<uint64_t>(row) * vocabSize_ + draftTok[i];
+                DataCopyExtParams cp{1, static_cast<uint32_t>(sizeof(InDtype)), 0, 0, 0};
+                DataCopyPad(draftLogitRaw[i], logitsGm_[offset], cp, {});
+            }
+
+            // Cast draft logits to fp32 (Cast API, no manual bit manipulation)
+            LocalTensor<float> draftFp32 = draftFp32Buf_.Get<float>();
+            Cast(draftFp32, draftLogitRaw, RoundMode::CAST_NONE, FP32_PER_BLOCK);
+            PipeBarrier<PIPE_V>();
+
+            // V->S sync: read draft logits as scalars
+            SyncVS();
             float draftLogit[TILE_N];
             for (uint32_t i = 0; i < TILE_N; ++i) {
-                if (i < rowCount) {
-                    uint32_t row = rowStart + i;
-                    int64_t draftTok = draftTokensGm_.GetValue(row);
-                    InDtype rawVal = logitsGm_.GetValue(
-                        static_cast<uint64_t>(row) * vocabSize_ + draftTok);
-                    draftLogit[i] = Bf16ToFloat(rawVal);
-                } else {
-                    draftLogit[i] = 0.0f;
-                }
+                draftLogit[i] = (i < rowCount) ? draftFp32.GetValue(i) : 0.0f;
             }
 
             // result[i] = draftLogit[i] - lse[i]  (C++ scalar math)
@@ -349,62 +389,19 @@ private:
                 outBuf.SetValue(i, draftLogit[i] - lse[i]);
             }
 
-            // S->V sync: ensure SetValue is visible before DataCopyPad (1 sync per tile)
+            // S->V sync: ensure SetValue is visible before DataCopyPad
             SyncSV();
 
-            // Write to GM
+            // Write to GM using DataCopyExtParams
             outQue_.template EnQue<float>(outBuf);
             outBuf = outQue_.template DeQue<float>();
-            DataCopyParams outParams{
+            DataCopyExtParams outParams{
                 static_cast<uint16_t>(rowCount),
-                static_cast<uint16_t>(sizeof(float)),
-                0, 0
+                static_cast<uint32_t>(sizeof(float)),
+                0, 0, 0
             };
             DataCopyPad(outputGm_[rowStart], outBuf, outParams);
             outQue_.FreeTensor(outBuf);
-        }
-    }
-
-    /*!
-     * \brief Convert bfloat16_t to float via bit manipulation.
-     * bf16 is the top 16 bits of float32, so just zero-extend.
-     */
-    __aicore__ inline float Bf16ToFloat(bfloat16_t val)
-    {
-        union { bfloat16_t bf; uint16_t u; } bu;
-        bu.bf = val;
-        union { uint32_t u; float f; } uf;
-        uf.u = static_cast<uint32_t>(bu.u) << 16;
-        return uf.f;
-    }
-
-    __aicore__ inline float Bf16ToFloat(half val)
-    {
-        union { half h; uint16_t u; } hu;
-        hu.h = val;
-        uint16_t bits = hu.u;
-        uint32_t sign = static_cast<uint32_t>(bits & 0x8000) << 16;
-        uint32_t exp  = static_cast<uint32_t>(bits & 0x7C00) >> 10;
-        uint32_t mant = static_cast<uint32_t>(bits & 0x03FF) << 13;
-
-        if (exp == 0) {
-            if (mant == 0) { return sign ? -0.0f : 0.0f; }
-            exp = 1;
-            while ((mant & 0x00400000) == 0) { mant <<= 1; exp--; }
-            mant &= 0x007FFFFF;
-            exp = (127 - 15 + exp) << 23;
-            union { uint32_t u; float f; } r;
-            r.u = sign | exp | mant;
-            return r.f;
-        } else if (exp == 0x1F) {
-            union { uint32_t u; float f; } r;
-            r.u = sign | 0x7F800000 | mant;
-            return r.f;
-        } else {
-            exp = (exp - 15 + 127) << 23;
-            union { uint32_t u; float f; } r;
-            r.u = sign | exp | mant;
-            return r.f;
         }
     }
 
@@ -423,7 +420,8 @@ private:
     TBuf<TPosition::VECCALC>  sumBuf_;
     TBuf<TPosition::VECCALC>  rowMaxBuf_;
     TBuf<TPosition::VECCALC>  rowSumBuf_;
-    TBuf<TPosition::VECCALC>  lseBuf_;
+    TBuf<TPosition::VECCALC>  draftInBuf_;
+    TBuf<TPosition::VECCALC>  draftLogitBuf_;
     TBuf<TPosition::VECCALC>  draftFp32Buf_;
 
     uint32_t numRows_{0};
