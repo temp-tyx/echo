@@ -165,28 +165,21 @@ private:
         PipeBarrier<PIPE_V>();
     }
 
-    // ---- batched GM→UB load using DataCopyPad with blockCount ----
+    // ---- per-row GM→UB load using DataCopyPad ----
 
     __aicore__ inline void LoadChunk(
         const LocalTensor<InDtype>& dst,
         uint32_t rowStart, uint32_t rowCount,
         uint32_t vStart, uint32_t vCount)
     {
-        // Batched load: blockCount=rowCount, each block is vCount elements
-        // GM stride between rows = vocabSize * sizeof(InDtype) (in bytes)
-        // UB stride between rows = blockV * sizeof(InDtype) / 32 (in 32B blocks)
-        uint32_t dstStrideBlocks = (blockV_ * sizeof(InDtype)) / BYTES_PER_BLOCK;
-
-        DataCopyExtParams copyParams{
-            static_cast<uint16_t>(rowCount),                           // blockCount
-            static_cast<uint32_t>(vCount * sizeof(InDtype)),          // blockLen (bytes)
-            static_cast<uint32_t>(vocabSize_ * sizeof(InDtype)),      // srcStride (GM, bytes)
-            dstStrideBlocks,                                          // dstStride (UB, 32B blocks)
-            0
-        };
-        DataCopyPadExtParams<InDtype> padParams{false, 0, 0, static_cast<InDtype>(0)};
-        DataCopyPad(dst, logitsGm_[static_cast<uint64_t>(rowStart) * vocabSize_ + vStart],
-                    copyParams, padParams);
+        // Per-row DataCopyPad: blockCount=1, avoids dstStride ambiguity
+        for (uint32_t i = 0; i < rowCount; ++i) {
+            DataCopyExtParams cp{1, static_cast<uint32_t>(vCount * sizeof(InDtype)), 0, 0, 0};
+            DataCopyPadExtParams<InDtype> pad{false, 0, 0, static_cast<InDtype>(0)};
+            DataCopyPad(dst[i * blockV_],
+                        logitsGm_[static_cast<uint64_t>(rowStart + i) * vocabSize_ + vStart],
+                        cp, pad);
+        }
     }
 
     // ---- main tile processing ----
