@@ -13,83 +13,56 @@ ECHO speculative decoding on Ascend NPU (910B). Target model runs in wildcard FU
 ### Working
 - Eager + PIECEWISE mode: correct output + speedup (6.8s E2E)
 - k_max=16, bs=2: FULL graph verified correct output
-- `fused_gather_logsumexp` AscendC kernel: compiled, installed, standalone test passes (correct output on NPU)
-- Meta registered: `Meta OK: torch.Size([4]) torch.float32`
-- Op exists in `torch.ops._C_ascend` namespace
-- `aclnnFusedGatherLogsumexp` symbol present in `libcust_opapi.so`
+- Wildcard graph dispatch, NaN fixes, mixed batch handling all working
 
-### Three Open Problems
+### Current Approach: In-place Softmax (Phase 5)
 
-## Problem 1: Capture is Very Slow (~1min vs 11s baseline)
+**Root cause of OOM identified**: The drafter's matmul produces logits [N, V]. Computing `logsumexp(logits)` or `softmax(logits)` creates a **second [N, V] tensor** in the graph pool (~480MB for [512, 248320] * 4 bytes). This is the actual source of OOM, not the fused_gather_logsumexp kernel's output (2KB).
 
-**Symptom**: After adding `fused_gather_logsumexp` op and recompiling, every graph capture takes ~1 minute instead of ~11s. This affects ALL captures (not just the first one).
+**New solution**: Do `softmax_(-1)` in-place on the logits tensor, overwriting it with probabilities. Then `gather(draft_tokens)` + `log()` produces only [N] tensors.
 
-**Key observation**: The user commented out `_echo_store_log_probs` (the only call site for the op), but capture is still slow. This means the op is NOT being called during capture, yet capture is slow.
+```
+Flow:
+  matmul → logits [N, V]
+  → greedy_sample(logits) → draft_tokens [N]  (uses original logits, argmax)
+  → logits.softmax_(-1)   → in-place, NO new [N, V] allocation
+  → logits.gather(draft_tokens) → probs [N]  (tiny)
+  → torch.log(probs) → log_probs [N]  (tiny)
+  → copy to _echo_log_probs_buffer
+```
 
-**Timeline**:
-- Before `pip install` with new op: capture ~11s (32 captures, ~5.5 min total)
-- After `pip install` with new op: capture ~1min per capture (32 captures, ~32 min total)
+Math: `log(softmax(logits)[draft_tokens])` = `logits[draft_tokens] - logsumexp(logits)` = `log_softmax(logits)[draft_tokens]` ✓
 
-**What `pip install` does**:
-1. Runs `build_aclnn.sh` which recompiles ALL CANN custom ops (not just our new one) and installs to `vllm_ascend/_cann_ops_custom/`
-2. Compiles `vllm_ascend_C.so` (Python extension with op registration + Meta)
+Code change: `_echo_store_log_probs` in `llm_base_proposer.py` (~line 1084):
+```python
+def _echo_store_log_probs(self, logits, draft_tokens):
+    logits.softmax_(-1)
+    probs = logits.gather(1, draft_tokens.unsqueeze(1)).squeeze(1)
+    self._echo_log_probs_buffer[:probs.shape[0]].copy_(torch.log(probs))
+```
 
-**What we changed**:
-- `csrc/attention/fused_gather_logsumexp/` - new AscendC kernel (11 files)
-- `csrc/build_aclnn.sh` - added `fused_gather_logsumexp` to `CUSTOM_OPS_ARRAY` for both ascend910b and ascend910_93
-- `csrc/torch_binding.cpp` - added `ops.def` + `ops.impl` for the op
-- `csrc/torch_binding_meta.cpp` - added Meta implementation
-- `csrc/CMakeLists.txt` - added to `OP_LIST` and `OP_DIR_LIST`
-- `vllm_ascend/spec_decode/llm_base_proposer.py` - changed `_echo_store_log_probs` to use the new op (currently commented out)
+**Why in-place is safe**: All 5 call sites of `_echo_store_log_probs` are immediately followed by `return` — logits is never used after.
 
-**Possible causes** (need investigation):
-1. **Op registration affects ACL graph capture**: Having a new registered op with Meta might cause the ACL graph framework to do extra work per capture (checking, tracing, or initializing the op)
-2. **CANN ops recompilation changed something**: `build_aclnn.sh` recompiles all ops. Even though the compiler is deterministic, the package structure or library loading might differ
-3. **`libcust_opapi.so` is larger**: Adding our op makes the library bigger, which might affect loading or symbol lookup
-4. **Environment variable changes**: `build_aclnn.sh` sources `setenv.bash` which might change CANN configuration
+**Key question**: Does `softmax_(-1)` truly operate in-place on NPU (no [N, V] intermediate in graph pool)?
+- If yes → OOM solved, no custom kernel needed
+- If no → Need fused matmul_softmax kernel (Phase 5 Plan B)
 
-**Suggested experiment to isolate**:
-1. Comment out op registration in `torch_binding.cpp` and `torch_binding_meta.cpp`
-2. Run only `pip install -e . --no-build-isolation` (recompiles `vllm_ascend_C.so` only, no `build_aclnn.sh`)
-3. Test capture speed
-   - If fast (~11s) → op registration is the cause
-   - If still slow → CANN ops recompilation is the cause
+### AscendC Kernel Status (fused_gather_logsumexp)
 
-## Problem 2: OOM on 2nd Request
+The AscendC kernel was written and compiled, but has multiple issues:
+- UB out of bounds errors ("VEC instruction error: the ub address out of bounds")
+- Buffer count exceeds 910B limit (8 buffers, we had 10)
+- `dstStride` semantics ambiguous in DataCopyPad (stride vs gap)
+- Capture becomes very slow (~1min vs 11s) when op is registered
 
-**Symptom**: With `gpu_memory_utilization=0.9`, the first request succeeds but the second request OOMs.
+**Current status**: Abandoned in favor of in-place softmax approach. The kernel code and registration are still in the codebase but not called.
 
-**Root cause analysis**:
-- Capture memory = same as ECHO OFF (verified: 25775/26276 MB for both)
-- The OOM is NOT from our op (output is [N] float32 = 2KB)
-- The OOM is NOT from GDN (ECHO ON and OFF both have 248MB GDN contiguous allocation)
-- The OOM is likely from **graph replay failure → eager fallback → memory fragmentation**
-  - First request's eager execution creates small allocations
-  - After free, memory is fragmented
-  - Second request needs 248MB contiguous for GDN → fails despite sufficient total free memory
+### Open Problems
 
-**But**: If capture is slow (Problem 1), the graph capture might also be failing or the graph replay might not work, causing eager fallback.
-
-**Connection to Problem 1**: If we fix the capture slowness (and ensure graph replay works), the OOM might be resolved automatically.
-
-## Problem 3: Op Not Going Through Graph (Print Appears During Serving)
-
-**Symptom**: Added print in `_echo_store_log_probs`. During serving (not capture), the print appears, meaning Python code runs during serving = graph replay fails or op is outside graph capture scope.
-
-**Investigation**:
-- `recurrent_gated_delta_rule` has `SetFlag`/`WaitFlag` and `GlobalTensor::GetValue`, and it goes through graph fine. So sync is NOT the issue.
-- `_echo_store_log_probs` is called from `_run_merged_draft`, which is called from `dummy_run`'s `with set_ascend_forward_context(...)` block. This IS inside the graph capture scope.
-- The op has Meta registered (verified working).
-- The op's kernel works on NPU (verified with standalone test).
-
-**Possible causes**:
-1. Graph capture fails silently when our op is called → entire graph falls back to eager
-2. The op is captured but graph replay fails → falls back to eager
-3. The `copy_` after the op (`self._echo_log_probs_buffer[:output.shape[0]].copy_(output)`) might cause issues
-
-**Suggested experiment**: Add the op call (uncomment `_echo_store_log_probs`), check if:
-- `[ECHO_LOG_PROBS]` print appears during "Capturing CUDA graphs" phase (expected) or during serving (problem)
-- Any error in capture/replay logs
+1. **Verify in-place softmax works**: Does `softmax_(-1)` avoid [N, V] graph pool allocation? Check `[GRAPH_POOL]` logs.
+2. **If in-place doesn't work**: Write fused matmul_softmax kernel (Plan B).
+3. **NPU idle bubbles**: Profiling shows large NPU idle gaps during serving. Need to identify sync points (`.item()` calls, CPU-side processing between drafter and target).
+4. **E2E performance**: Baseline (ECHO OFF) is 6.6s. Best ECHO ON result was 8.8s (slower). Need graph to work + eliminate idle bubbles.
 
 ## Architecture: How ECHO Works
 
@@ -101,11 +74,13 @@ ECHO speculative decoding on Ascend NPU (910B). Target model runs in wildcard FU
 │  Drafter (FULL graph for pure decode)                 │
 │  1. precompute_and_store_context_kv (cross-attn)     │
 │  2. model forward (graph captured)                   │
-│  3. logits = lm_head(hidden_states)                  │
-│  4. draft_tokens = argmax(logits)                    │
-│  5. _echo_store_log_probs(logits, draft_tokens)      │
-│     → torch.ops._C_ascend.npu_fused_gather_logsumexp │
-│     → copy to _echo_log_probs_buffer                  │
+│  3. logits = lm_head(hidden_states)  [N, V]         │
+│  4. draft_tokens = greedy_sample(logits)  [N]        │
+│  5. _echo_store_log_probs(logits, draft_tokens):     │
+│     → logits.softmax_(-1)  (IN-PLACE, no new [N,V]) │
+│     → gather(draft_tokens) → probs [N]              │
+│     → log(probs) → log_probs [N]                    │
+│     → copy to _echo_log_probs_buffer                 │
 │  6. return draft_tokens                              │
 ├─────────────────────────────────────────────────────┤
 │  Target (wildcard FULL graph)                        │
@@ -119,71 +94,23 @@ ECHO speculative decoding on Ascend NPU (910B). Target model runs in wildcard FU
 
 | File | Role |
 |------|------|
-| `csrc/attention/fused_gather_logsumexp/` | AscendC kernel (two-pass, TILE_N=8 batch, 3 syncs/tile) |
-| `csrc/torch_binding.cpp` | Op registration (def + NPU impl) |
-| `csrc/torch_binding_meta.cpp` | Meta registration (for ACL graph capture) |
-| `csrc/build_aclnn.sh` | CANN ops build script (CUSTOM_OPS list) |
-| `vllm_ascend/spec_decode/llm_base_proposer.py` | `_echo_store_log_probs` (~line 1084), `propose_draft_token_ids` (~line 780) |
+| `vllm_ascend/spec_decode/llm_base_proposer.py` | `_echo_store_log_probs` (~line 1084, in-place softmax + gather + log), `propose_draft_token_ids` (~line 780), `compute_draft_token_ids` (~line 1061) |
 | `vllm_ascend/spec_decode/dflash_proposer.py` | `dummy_run` (~line 153), `build_model_inputs_first_pass` (~line 253) |
 | `vllm_ascend/worker/model_runner_v1.py` | `_echo_prune_drafts` (~line 1878), `execute_model` (~line 2429) |
 | `vllm_ascend/patch/platform/patch_echo_cudagraph.py` | ECHO wildcard graph registration + dispatch |
 | `vllm_ascend/compilation/acl_graph.py` | ACLGraphWrapper (capture/replay, line 65) |
+| `csrc/attention/fused_gather_logsumexp/` | AscendC kernel (abandoned, still in codebase but not called) |
 
-## Kernel Design (Current - Two-Pass + TILE_N)
+## Abandoned: AscendC fused_gather_logsumexp Kernel
 
-```
-For each tile of TILE_N=8 rows:
+The AscendC kernel approach was abandoned due to multiple issues:
+1. **UB out of bounds**: "VEC instruction error: the ub address out of bounds" — buffer alignment and count issues
+2. **Buffer count limit**: 910B limits to 8 InitBuffer calls, we had 10
+3. **DataCopyPad stride ambiguity**: `dstStride` is stride vs gap — documentation and examples are contradictory
+4. **Capture slowdown**: Registering the op caused capture to slow from 11s to ~1min (root cause unclear)
+5. **Graph replay failure**: Op not going through graph (print appears during serving)
 
-Pass 1 (find per-row max):
-  For each V chunk (BLOCK_V=4096):
-    - DataCopyPad [8 rows, 4096 cols] from GM to UB
-    - Cast bf16→fp32 (batch 32768 elements)
-    - Fill padding with -INF (last chunk only)
-    - ReduceMaxInplace per row (8 calls, each 4096 elements)
-    - Store chunk max to maxBuf
-  ReduceMax across chunks → rowMaxBuf [8]
-  SyncVS → GetValue × 8 → rowMax[] (C++ scalars)
-
-Pass 2 (compute sum(exp(x - max))):
-  For each V chunk:
-    - DataCopyPad, Cast, fill padding
-    - Adds(buf, buf, -rowMax[i], 4096) per row (scalar broadcast, no sync)
-    - Exp (batch 32768 elements)
-    - ReduceSumInplace per row
-    - Store chunk sum to sumBuf
-  ReduceSum across chunks → rowSumBuf [8]
-  SyncVS → GetValue × 8 → rowSum[] (C++ scalars)
-
-Final:
-  lse[i] = rowMax[i] + logf(rowSum[i])  (C++ scalar math)
-  draftTok = draftTokensGm.GetValue(row)  (GM read, no sync)
-  draftLogit = Bf16ToFloat(logitsGm.GetValue(offset))  (GM read + bit convert)
-  result[i] = draftLogit - lse[i]  (C++ scalar math)
-  SetValue(outBuf, result[i])  (scalar→UB)
-  SyncSV
-  DataCopyPad(outBuf → GM)  (write output)
-```
-
-- Sync count: 3 per tile (SyncVS, SyncVS, SyncSV)
-- Total for 512 rows: 64 tiles × 3 = 192 syncs (old version: 93,696 syncs)
-- UB budget: ~196KB < 256KB
-- No `GlobalTensor::GetValue` except for draftToken/draftLogit (like recurrent_gated_delta_rule)
-
-## What to Investigate (Priority Order)
-
-1. **Why is capture slow?** (Problem 1)
-   - Do the isolation experiment: comment out op registration in torch_binding.cpp/meta.cpp, recompile only vllm_ascend_C.so, test
-   - Check if `build_aclnn.sh` recompilation changed existing op binaries
-   - Profile capture to find the slow step
-
-2. **Why doesn't op go through graph?** (Problem 3)
-   - Uncomment `_echo_store_log_probs`, check when print appears (capture vs serving)
-   - Check ACL graph logs for capture/replay errors
-   - Compare with recurrent_gated_delta_rule (which works in graph)
-
-3. **Why OOM on 2nd request?** (Problem 2)
-   - Likely resolved once Problems 1&3 are fixed (graph replay works → no eager fallback → no fragmentation)
-   - If still OOM after fixing 1&3: investigate memory fragmentation in default pool
+The kernel code remains in `csrc/attention/fused_gather_logsumexp/` but is not called.
 
 ---
 
@@ -316,9 +243,24 @@ Final:
 - User confirmed: before compiling the op, capture was 11s
 - **Not yet resolved** - need isolation experiment
 
-### Phase 4: Current Open Problems (see above)
+### Phase 4: AscendC Kernel Attempt (Abandoned)
 
-### Summary of Solutions Applied
+Tried writing AscendC `fused_gather_logsumexp` kernel to avoid [N, V] intermediate. Multiple iterations (online softmax → two-pass + TILE_N → skill-compliant version). All failed with:
+- UB out of bounds errors
+- Buffer count exceeding 910B limit (8 max)
+- DataCopyPad stride ambiguity
+- Capture slowdown when op registered
+- Graph replay failure
+
+### Phase 5: In-place Softmax (Current)
+
+**Root cause identified**: OOM is from the second [N, V] allocation (softmax/logsumexp intermediate), not from the kernel output.
+
+**Solution**: `logits.softmax_(-1)` in-place → `gather` → `log()`. No [N, V] intermediate. No custom kernel needed.
+
+**Status**: Code changed, pending verification that `softmax_(-1)` is truly in-place on NPU.
+
+### Summary of Solutions
 
 | Problem | Solution | Status |
 |---------|----------|--------|
@@ -326,10 +268,11 @@ Final:
 | NaN from num_context mismatch | Use `num_context` (runtime) not `num_input_tokens` (capture-time) | ✅ Fixed |
 | Mixed batch bakes wrong num_context | `uniform_decode = num_context <= num_tokens` (conditional) | ✅ Fixed |
 | ECHO returns FULL for mixed batch | `draft_valid_modes = {NONE}` for mixed batch | ✅ Fixed |
-| 880MB graph pool (logsumexp) | AscendC fused kernel (no [N,V] intermediate) | ✅ Kernel compiled |
-| 240MB buffer OOM | Replaced by fused kernel (2KB output) | ✅ Eliminated |
-| Triton not graph-capturable | Replaced by AscendC op with Meta | ✅ Replaced |
-| Online softmax 93K syncs | Two-pass + TILE_N batch (192 syncs) | ✅ Redesigned |
-| Capture slow (~1min) | Unknown - need isolation | ❌ Open |
-| OOM on 2nd request | Likely: graph replay fails → eager fallback → fragmentation | ❌ Open |
-| Op not going through graph | Unknown - Meta works, kernel works, but print appears during serving | ❌ Open |
+| 880MB graph pool (logsumexp) | In-place softmax_(-1) + gather + log | 🔄 Testing |
+| 240MB buffer OOM | Eliminated (in-place approach) | ✅ Eliminated |
+| Triton not graph-capturable | Eliminated (no custom kernel) | ✅ Eliminated |
+| AscendC kernel issues | Abandoned, replaced by in-place softmax | ❌ Abandoned |
+| Capture slow (~1min) | May be resolved (no op registration needed) | ❌ Pending |
+| OOM on 2nd request | Should be resolved if softmax_(-1) is truly in-place | ❌ Pending |
+| NPU idle bubbles | Need to identify sync points | ❌ Pending |
+| E2E 8.8s vs 6.6s baseline | Need graph working + no idle bubbles | ❌ Pending |

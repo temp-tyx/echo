@@ -1082,10 +1082,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             return draft_tokens
 
     def _echo_store_log_probs(self, logits: torch.Tensor, draft_tokens: torch.Tensor):
-        """Compute per-draft-token log probs using fused AscendC kernel.
+        """Compute per-draft-token log probs via in-place softmax + gather + log.
 
-        Computes logits[i, draft_tokens[i]] - logsumexp(logits[i])
-        without materializing [N, V] intermediate tensors.
+        Replaces fused_gather_logsumexp to avoid [N, V] intermediate.
+        logits is overwritten in-place by softmax — safe because logits
+        is not used after this call in any code path.
         """
         if not hasattr(self, "_echo_log_probs_buffer"):
             self._echo_log_probs_buffer = torch.empty(
@@ -1094,8 +1095,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 dtype=torch.float32,
                 device=logits.device,
             )
-        output = torch.ops._C_ascend.npu_fused_gather_logsumexp(logits, draft_tokens)
-        self._echo_log_probs_buffer[:output.shape[0]].copy_(output)
+        logits.softmax_(-1)
+        probs = logits.gather(1, draft_tokens.unsqueeze(1)).squeeze(1)
+        self._echo_log_probs_buffer[:probs.shape[0]].copy_(torch.log(probs))
 
     def _run_merged_draft(
         self,
